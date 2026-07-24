@@ -2014,10 +2014,21 @@ def compute_policy_loss_my(
         if tau <= 0.0:
             raise ValueError(f"policy-loss tau must be positive, got {tau}")
         discount_chunk_size = int(config.policy_loss.get("chunk_size", 128))
+        
+        delta_old = old_log_prob - ref_log_prob
+        delta_new = log_prob.detach() - ref_log_prob
+        delta_old_mean = torch.sum(delta_old * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
+        delta_new_mean = torch.sum(delta_new * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
+        delta_old_std = torch.sqrt(torch.sum((delta_old - delta_old_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
+        delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
+        
+        delta_old = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
+        delta_new = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
+         
         token_deltas = torch.stack(
             (
-                torch.exp(old_log_prob) - torch.exp(ref_log_prob),
-                torch.exp(log_prob.detach()) - torch.exp(old_log_prob),
+                delta_old,
+                delta_new,
             )
         )
         delta_old, delta_new = _discounted_future_sum(
@@ -2027,14 +2038,13 @@ def compute_policy_loss_my(
             chunk_size=discount_chunk_size,
         ).unbind(0)
 
-        I_old = torch.sigmoid(delta_old * 5.0)
-        I_new = torch.sigmoid(delta_new * 10.0)
+        I_old = torch.sigmoid(delta_old)
+        I_new = torch.sigmoid(delta_new)
         I_old_high_ratio = ((I_old >= 0.95) * response_mask).sum() / response_mask.sum()
         I_new_high_ratio = ((I_new >= 0.95) * response_mask).sum() / response_mask.sum()
         I_old_low_ratio = ((I_old <= 0.05) * response_mask).sum() / response_mask.sum()
         I_new_low_ratio = ((I_new <= 0.05) * response_mask).sum() / response_mask.sum()
         
-
         normalized_entropy = entropy / (entropy * response_mask).max(dim=-1, keepdim=True)[0]
         coeff = (I_old + I_new) / 2.0
         w = (coeff * normalized_entropy) / tau

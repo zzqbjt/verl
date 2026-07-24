@@ -74,7 +74,7 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy."""
     policy_loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-    policy_loss_needs_ref = policy_loss_mode in {"ours", "my", "my_future"}
+    policy_loss_needs_ref = policy_loss_mode in {"dgpo", "ours", "my", "my_future"}
     kl_loss_needs_ref = (
         config.actor_rollout_ref.actor.use_kl_loss
         and float(config.actor_rollout_ref.actor.get("kl_loss_coef", 0.0)) != 0.0

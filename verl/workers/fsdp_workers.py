@@ -1124,6 +1124,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
+        return_topk_logits = data.meta_info.pop("return_topk_logits", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
@@ -1136,7 +1137,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         calculate_entropy = not is_lora
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+                outputs = self.actor.compute_log_prob(
+                    data=data,
+                    calculate_entropy=calculate_entropy,
+                    return_topk_logits=return_topk_logits,
+                )
             if not is_lora:
                 tensors = {"old_log_probs": outputs["log_probs"]}
             else:
@@ -1145,6 +1150,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["entropys"] = outputs["entropys"]
             if "sum_pi_squared" in outputs:
                 tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            if return_topk_logits:
+                key_prefix = "ref_" if is_lora else ""
+                tensors[f"{key_prefix}logits"] = outputs["logits"]
+                tensors[f"{key_prefix}logits_indices"] = outputs["logits_indices"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1220,9 +1229,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+        return_topk_logits = loss_mode == "dgpo"
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
+            data.meta_info["return_topk_logits"] = return_topk_logits
             return self.compute_log_prob(data)
         assert self._is_ref
         # else:
@@ -1236,10 +1248,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            outputs = self.ref_policy.compute_log_prob(
+                data=data,
+                calculate_entropy=False,
+                return_topk_logits=return_topk_logits,
+            )
             tensors = {"ref_log_prob": outputs["log_probs"]}
-            # tensors["ref_logits"] = outputs["logits"]
-            # tensors["ref_logits_indices"] = outputs["logits_indices"]
+            if return_topk_logits:
+                tensors["ref_logits"] = outputs["logits"]
+                tensors["ref_logits_indices"] = outputs["logits_indices"]
             output = DataProto.from_dict(tensors=tensors)
         output = output.to("cpu")
 

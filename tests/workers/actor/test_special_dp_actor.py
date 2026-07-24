@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -22,7 +24,7 @@ from transformers import AutoModelForCausalLM, Qwen3Config
 from verl import DataProto
 from verl.utils.device import get_device_name
 from verl.workers.actor.dp_actor import DataParallelPPOActor
-from verl.workers.config import FSDPActorConfig, OptimizerConfig
+from verl.workers.config import FSDPActorConfig, OptimizerConfig, PolicyLossConfig
 
 
 class MockTransformerModel(nn.Module):
@@ -205,6 +207,32 @@ class TestDataParallelPPOActor(unittest.TestCase):
         self.assertEqual(log_probs.shape, (batch_size, response_length))
         self.assertTrue(torch.all(torch.isfinite(log_probs)))
         self.assertIsNone(entropys)
+        self.assertNotIn("logits", outputs)
+        self.assertNotIn("logits_indices", outputs)
+
+    def test_compute_log_prob_with_topk_logits(self):
+        """Top-k logits are returned only when requested by losses such as DGPO."""
+        original_use_remove_padding = self.actor.use_remove_padding
+        try:
+            for use_remove_padding in (False, True):
+                with self.subTest(use_remove_padding=use_remove_padding):
+                    self.actor.use_remove_padding = use_remove_padding
+                    data = self._create_test_data_for_compute_log_prob()
+                    outputs = self.actor.compute_log_prob(
+                        data,
+                        calculate_entropy=False,
+                        return_topk_logits=True,
+                    )
+
+                    batch_size, response_length = data.batch["responses"].shape
+                    expected_topk = min(100, self.mock_model.vocab_size)
+                    self.assertEqual(outputs["logits"].shape, (batch_size, response_length, expected_topk))
+                    self.assertEqual(outputs["logits_indices"].shape, outputs["logits"].shape)
+                    self.assertFalse(outputs["logits"].requires_grad)
+                    self.assertTrue(torch.all(outputs["logits_indices"] >= 0))
+                    self.assertTrue(torch.all(outputs["logits_indices"] < self.mock_model.vocab_size))
+        finally:
+            self.actor.use_remove_padding = original_use_remove_padding
 
     def test_update_policy(self):
         """Test update_policy method"""
@@ -229,6 +257,39 @@ class TestDataParallelPPOActor(unittest.TestCase):
             else:
                 self.assertIsInstance(metrics[key], (float, int))
                 self.assertTrue(torch.isfinite(torch.tensor(metrics[key])))
+
+    def test_update_policy_with_dgpo(self):
+        """DGPO requests current top-k logits and consumes reference top-k logits."""
+        self.config = replace(
+            self.config,
+            policy_loss=PolicyLossConfig(loss_mode="dgpo"),
+            calculate_entropy=False,
+            entropy_coeff=0.0,
+        )
+        self.actor.config = self.config
+        data = self._create_test_data_for_update_policy()
+        ref_data = data.select(batch_keys=["responses", "input_ids", "attention_mask", "position_ids"])
+        ref_data.meta_info.update(
+            {
+                "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
+                "temperature": data.meta_info["temperature"],
+                "use_dynamic_bsz": False,
+            }
+        )
+        with patch("verl.utils.torch_functional.FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE", False):
+            ref_outputs = self.actor.compute_log_prob(
+                ref_data,
+                calculate_entropy=False,
+                return_topk_logits=True,
+            )
+            data.batch["ref_logits"] = ref_outputs["logits"]
+            data.batch["ref_logits_indices"] = ref_outputs["logits_indices"]
+
+            metrics = self.actor.update_policy(data)
+
+        self.assertIn("actor/intersection_ratio", metrics)
+        self.assertIn("actor/hellinger_dist/mean", metrics)
+        self.assertTrue(torch.isfinite(torch.tensor(metrics["actor/pg_loss"])))
 
     def test_dataparallelppoactor_initialization(self):
         """Test DataParallelPPOActor initialization"""
