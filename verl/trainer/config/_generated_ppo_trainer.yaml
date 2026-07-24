@@ -78,6 +78,27 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+      gamma: 0.99
+      tau: 0.5
+    delimiter: '
+
+
+      '
+    delimiter_step_marker_filter: false
+    delimiter_step_marker_lookahead: 10
+    delimiter_fallback_min_tokens: 0
+    delimiter_max_steps_per_response: 0
+    delimiter_step_marker_patterns:
+    - (?i)\bStep\s*\d+\b
+    - \b\d+\.\s
+    - (?i)^(?:[#*_]+[ \t]+)*[#*_]*[ \t]*(?:First|Firstly|Second|Secondly|Third|Thirdly|Next|Then|Finally|Similarly)\b
+    answer_prefix: 'Answer: '
+    step_interval: 1
+    answer_log_prob_batch_size: 16
+    answer_log_prob_use_dynamic_bsz: null
+    answer_log_prob_max_token_len_per_gpu: null
+    answer_log_prob_num_wrong_answers: 1
+    answer_log_prob_ema_alpha: 1.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

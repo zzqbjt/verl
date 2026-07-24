@@ -210,7 +210,33 @@ def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool
     return partitions
 
 
-def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, equal_size: bool):
+def heap_partition(seqlen_list: list[int], k_partitions: int) -> list[list[int]]:
+    """Balance items with the longest-processing-time heap heuristic.
+
+    Unlike :func:`karmarkar_karp`, this keeps only one heap entry per
+    partition, avoiding Karmarkar-Karp's O(n * k) state allocation.
+    """
+    assert len(seqlen_list) >= k_partitions, f"{len(seqlen_list)} < {k_partitions}"
+    partitions = [[] for _ in range(k_partitions)]
+    partition_heap = [(0, partition_idx) for partition_idx in range(k_partitions)]
+    heapq.heapify(partition_heap)
+
+    for value, item_idx in sorted(
+        ((value, item_idx) for item_idx, value in enumerate(seqlen_list)),
+        reverse=True,
+    ):
+        partition_sum, partition_idx = heapq.heappop(partition_heap)
+        partitions[partition_idx].append(item_idx)
+        heapq.heappush(partition_heap, (partition_sum + value, partition_idx))
+    return partitions
+
+
+def get_seqlen_balanced_partitions(
+    seqlen_list: list[int],
+    k_partitions: int,
+    equal_size: bool,
+    use_karmarkar_karp: bool = True,
+):
     """
     Calculates partitions of indices from seqlen_list such that the sum of sequence lengths
     in each partition is balanced. Uses the Karmarkar-Karp differencing method.
@@ -250,7 +276,11 @@ def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, eq
         assert seen_idx == set(range(len(seqlen_list)))
         return sorted_partitions
 
-    partitions = karmarkar_karp(seqlen_list=seqlen_list, k_partitions=k_partitions, equal_size=equal_size)
+    if use_karmarkar_karp:
+        partitions = karmarkar_karp(seqlen_list=seqlen_list, k_partitions=k_partitions, equal_size=equal_size)
+    else:
+        assert not equal_size, "heap partitioning does not support equal_size=True"
+        partitions = heap_partition(seqlen_list=seqlen_list, k_partitions=k_partitions)
     return _check_and_sort_partitions(partitions)
 
 
@@ -354,6 +384,7 @@ def rearrange_micro_batches(
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
     force_group_size=1,
+    use_karmarkar_karp=True,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -367,6 +398,8 @@ def rearrange_micro_batches(
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
         force_group_size (int, optional): force consecutive samples to be in the same micro-batch (for RM training).
+        use_karmarkar_karp (bool, optional): use Karmarkar-Karp partitioning. When false, use the
+            heap heuristic, which is suitable when the number of micro-batches is large.
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -419,7 +452,12 @@ def rearrange_micro_batches(
         group_workloads = workloads_per_sample_grouped.sum(dim=1).cpu().tolist()
 
         # Partition groups instead of individual samples
-        micro_bsz_group_idx = get_seqlen_balanced_partitions(group_workloads, num_micro_batches, equal_size=False)
+        micro_bsz_group_idx = get_seqlen_balanced_partitions(
+            group_workloads,
+            num_micro_batches,
+            equal_size=False,
+            use_karmarkar_karp=use_karmarkar_karp,
+        )
 
         # Convert group indices back to sample indices
         micro_bsz_idx = []
@@ -435,7 +473,12 @@ def rearrange_micro_batches(
         # Original logic for force_group_size == 1
         # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
         workloads = calculate_workload(seq_len_effective).cpu().tolist()
-        micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
+        micro_bsz_idx = get_seqlen_balanced_partitions(
+            workloads,
+            num_micro_batches,
+            equal_size=False,
+            use_karmarkar_karp=use_karmarkar_karp,
+        )
 
     if use_dynamic_bsz_balance:
         # Use the sum of squared sequence lengths to approximate attention computation workload
@@ -494,6 +537,7 @@ def prepare_dynamic_batch(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    use_karmarkar_karp=True,
 ) -> tuple[list[DataProto], list[list[int]]]:
     """
     Prepare a batch for dynamic batching.
@@ -501,6 +545,7 @@ def prepare_dynamic_batch(
     Args:
         data (DataProto): The input data.
         max_token_len (int): The maximum token length for dynamic batching.
+        use_karmarkar_karp (bool): Whether to use Karmarkar-Karp instead of heap partitioning.
 
     Returns:
         Tuple[List[DataProto], List[List[int]]]: A tuple containing a list of DataProto objects
@@ -514,6 +559,7 @@ def prepare_dynamic_batch(
         same_micro_num_in_dp=same_micro_num_in_dp,
         min_num_micro_batch=min_num_micro_batch,
         use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+        use_karmarkar_karp=use_karmarkar_karp,
     )
     micro_batches = []
     for i, batch_idx in enumerate(batch_idx_list):

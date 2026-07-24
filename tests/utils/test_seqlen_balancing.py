@@ -22,6 +22,7 @@ from verl.utils.model import create_random_mask
 from verl.utils.seqlen_balancing import (
     ceildiv,
     get_reverse_idx,
+    heap_partition,
     prepare_dynamic_batch,
     rearrange_micro_batches,
     restore_dynamic_batch,
@@ -59,6 +60,37 @@ def test_dynamic_batch():
     input_ids = torch.cat([micro_batch.batch["input_ids"] for micro_batch in micro_batches], dim=0)
     input_ids = restore_dynamic_batch(input_ids, micro_bsz_idx_lst)
     torch.testing.assert_close(input_ids, dataproto.batch["input_ids"])
+
+
+def test_dynamic_batch_heap_partition():
+    input_ids = torch.randint(low=0, high=10, size=(20, 100))
+    attention_mask = create_random_mask(
+        input_ids=input_ids,
+        max_ratio_of_left_padding=0.1,
+        max_ratio_of_valid_token=0.9,
+        min_ratio_of_valid_token=0.5,
+    )
+    dataproto = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask})
+
+    micro_batches, batch_idx_list = prepare_dynamic_batch(
+        dataproto,
+        max_token_len=300,
+        use_karmarkar_karp=False,
+    )
+
+    restored = restore_dynamic_batch(
+        torch.cat([micro_batch.batch["input_ids"] for micro_batch in micro_batches], dim=0),
+        batch_idx_list,
+    )
+    torch.testing.assert_close(restored, dataproto.batch["input_ids"])
+
+
+def test_heap_partition_scales_to_many_partitions():
+    partitions = heap_partition(list(range(1, 10_001)), k_partitions=8_000)
+
+    assert len(partitions) == 8_000
+    assert all(partitions)
+    assert sorted(item_idx for partition in partitions for item_idx in partition) == list(range(10_000))
 
 
 def _worker(rank, world_size, init_method, max_token_len, use_same_dp, min_mb):

@@ -57,7 +57,7 @@ from verl.utils.device import (
     set_expandable_segments,
 )
 from verl.utils.flops_counter import FlopsCounter
-from verl.utils.fs import copy_to_local
+from verl.utils.fs import copy_to_local, exists, is_non_local
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -364,7 +364,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
-        assert role in ["actor", "ref"]
+        assert role in ["actor", "ref", "answer_teacher"]
 
         # TiledMLP requires FSDP2 for correct gradient computation
         if use_tiled_mlp and self.config.actor.strategy == "fsdp":
@@ -545,8 +545,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
 
-        # Apply QAT before FSDP wrapping (actor only)
-        if role == "actor" and self._qat_enabled:
+        # Apply identical QAT transforms to the actor and its EMA teacher before FSDP wrapping.
+        if role in {"actor", "answer_teacher"} and self._qat_enabled:
             actor_module = apply_qat(actor_module, self.qat_config)
             enable_qat_fuse(actor_module)
             if self.qat_config.mode == "w4a4":
@@ -920,8 +920,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            self.answer_teacher_module_fsdp = None
+            if float(actor_cfg.answer_log_prob_ema_alpha) < 1.0:
+                self.answer_teacher_module_fsdp = self._build_model_optimizer(
+                    model_path=local_path,
+                    fsdp_config=fsdp_config,
+                    optim_config=None,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    use_fused_kernels=use_fused_kernels,
+                    enable_gradient_checkpointing=False,
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                    use_liger=self.config.model.get("use_liger", False),
+                    role="answer_teacher",
+                    enable_activation_offload=False,
+                    use_prefix_grouper=self.config.actor.get("use_prefix_grouper", False),
+                    use_tiled_mlp=use_tiled_mlp,
+                    tiled_mlp_shards=tiled_mlp_shards,
+                )[0]
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                answer_teacher_module=self.answer_teacher_module_fsdp,
             )
 
         if self._is_rollout:
@@ -1143,6 +1164,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_answer_log_prob")
+    def compute_answer_log_prob(self, data: DataProto):
+        assert self._is_actor
+        actor_config = self.config.actor
+        use_answer_teacher = self.actor.has_answer_teacher
+        if self._is_offload_param and not use_answer_teacher:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data.meta_info["micro_batch_size"] = actor_config.answer_log_prob_batch_size
+        data.meta_info["max_token_len"] = (
+            actor_config.answer_log_prob_max_token_len_per_gpu or actor_config.ppo_max_token_len_per_gpu
+        )
+        data.meta_info["use_dynamic_bsz"] = (
+            actor_config.answer_log_prob_use_dynamic_bsz
+            if actor_config.answer_log_prob_use_dynamic_bsz is not None
+            else actor_config.use_dynamic_bsz
+        )
+        data.meta_info["answer_log_prob_num_wrong_answers"] = actor_config.get(
+            "answer_log_prob_num_wrong_answers", 1
+        )
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["delimiter"] = actor_config.delimiter
+        data.meta_info["delimiter_step_marker_filter"] = actor_config.delimiter_step_marker_filter
+        data.meta_info["delimiter_step_marker_lookahead"] = actor_config.delimiter_step_marker_lookahead
+        data.meta_info["delimiter_fallback_min_tokens"] = actor_config.delimiter_fallback_min_tokens
+        data.meta_info["delimiter_max_steps_per_response"] = actor_config.delimiter_max_steps_per_response
+        data.meta_info["delimiter_step_marker_patterns"] = actor_config.delimiter_step_marker_patterns
+        data.meta_info["answer_prefix"] = actor_config.answer_prefix
+        data.meta_info["step_interval"] = actor_config.step_interval
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0)
+
+        try:
+            with self.ulysses_sharding_manager:
+                outputs = self.actor.compute_answer_log_prob(data=data, tokenizer=self.tokenizer)
+                output = DataProto.from_dict(
+                    tensors={
+                        "answer_log_prob": outputs["log_probs"].float(),
+                        "answer_step_end_mask": outputs["step_mask"],
+                    },
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
+
+            output = output.to("cpu")
+
+            if not use_answer_teacher and self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                self.actor.actor_module._handle.reshard(True)
+        finally:
+            if self._is_offload_param and not use_answer_teacher:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload model during compute_answer_log_prob", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
@@ -1162,8 +1237,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
             outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
-
+            tensors = {"ref_log_prob": outputs["log_probs"]}
+            # tensors["ref_logits"] = outputs["logits"]
+            # tensors["ref_logits_indices"] = outputs["logits_indices"]
+            output = DataProto.from_dict(tensors=tensors)
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -1189,6 +1266,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
+        answer_teacher_state = self.actor.answer_teacher_state_dict()
+        if answer_teacher_state is not None:
+            answer_teacher_path = os.path.join(
+                local_path,
+                f"answer_teacher_world_size_{self.world_size}_rank_{self.rank}.pt",
+            )
+            torch.save(answer_teacher_state, answer_teacher_path)
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -1246,6 +1330,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+
+        if self._is_actor:
+            answer_teacher_state = None
+            answer_teacher_path = os.path.join(
+                local_path,
+                f"answer_teacher_world_size_{self.world_size}_rank_{self.rank}.pt",
+            )
+            if self.actor.has_answer_teacher and exists(answer_teacher_path):
+                local_answer_teacher_path = copy_to_local(answer_teacher_path)
+                answer_teacher_state = torch.load(local_answer_teacher_path, map_location="cpu", weights_only=False)
+                if del_local_after_load and is_non_local(answer_teacher_path):
+                    os.remove(local_answer_teacher_path)
+            self.actor.load_answer_teacher_state_dict(answer_teacher_state)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

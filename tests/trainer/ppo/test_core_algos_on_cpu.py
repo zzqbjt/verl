@@ -18,6 +18,7 @@ import unittest
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
@@ -26,6 +27,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
+    compute_vinfo_outcome_advantage,
     get_adv_estimator_fn,
     register_adv_est,
 )
@@ -197,6 +199,73 @@ def test_multi_turn_compute_gae_advantage_return():
     print(f" [CORRECT] \n\n{adv1=}, \n\n{ret1=}")
 
 
+@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
+def test_discounted_future_sum(gamma: float):
+    values = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0],
+            [-1.0, 0.5, 2.0, -3.0, 4.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+        ]
+    )
+    expected = torch.zeros_like(values)
+    for batch_idx in range(values.shape[0]):
+        for token_idx in range(values.shape[1]):
+            for future_idx in range(token_idx, values.shape[1]):
+                expected[batch_idx, token_idx] += (
+                    gamma ** (future_idx - token_idx)
+                    * values[batch_idx, future_idx]
+                    * response_mask[batch_idx, future_idx]
+                )
+    expected *= response_mask
+
+    actual = verl.trainer.ppo.core_algos._discounted_future_sum(
+        values,
+        response_mask,
+        gamma=gamma,
+        chunk_size=2,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("gamma", [-0.1, 1.1])
+def test_discounted_future_sum_rejects_invalid_gamma(gamma: float):
+    values = torch.ones(1, 2)
+    with pytest.raises(ValueError, match=r"gamma must be in \[0, 1\]"):
+        verl.trainer.ppo.core_algos._discounted_future_sum(values, values, gamma=gamma)
+
+
+def test_compute_policy_loss_my_rejects_nonpositive_tau():
+    config = OmegaConf.create(
+        {
+            "clip_ratio": 0.2,
+            "clip_ratio_low": 0.2,
+            "clip_ratio_high": 0.2,
+            "clip_ratio_c": 3.0,
+            "policy_loss": {"gamma": 0.99, "tau": 0.0, "chunk_size": 2},
+        }
+    )
+    zeros = torch.zeros(1, 2)
+    ones = torch.ones(1, 2)
+
+    with pytest.raises(ValueError, match="tau must be positive"):
+        verl.trainer.ppo.core_algos.compute_policy_loss_my(
+            old_log_prob=zeros,
+            log_prob=zeros,
+            ref_log_prob=zeros,
+            entropy=ones,
+            advantages=ones,
+            response_mask=ones,
+            config=config,
+        )
+
+
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:
     """Create a numpy index array ensuring each group has at least 2 samples."""
     assert num_groups * 2 <= batch_size, "batch_size must allow >=2 samples per group"
@@ -311,6 +380,31 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_vinfo_returns_unmodified_grpo_advantage_and_weights():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.float32)
+    token_level_rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    index = np.array([0, 0])
+    answer_log_prob = torch.tensor([[0.0, 0.2, 0.4, 0.6], [0.0, -0.2, -0.4, -0.6]])
+    answer_step_end_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.bool)
+
+    expected_advantages, expected_returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    advantages, returns, w = compute_vinfo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        answer_log_prob=answer_log_prob,
+        answer_step_end_mask=answer_step_end_mask,
+    )
+
+    assert torch.equal(advantages, expected_advantages)
+    assert torch.equal(returns, expected_returns)
+    assert w.shape == advantages.shape
 
 
 if __name__ == "__main__":

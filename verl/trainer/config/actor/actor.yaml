@@ -75,6 +75,55 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Discount factor for current-and-future token sums in the "my" loss
+  gamma: 0.99
+
+  # Temperature divisor for token weights in the "my" loss
+  tau: 0.5
+
+# Step delimiter used to split a response into reasoning steps
+delimiter: "\n\n"
+
+# Whether delimiters must be followed by a strong step marker to count as boundaries
+delimiter_step_marker_filter: false
+
+# Token lookahead window after each delimiter for finding step markers
+delimiter_step_marker_lookahead: 10
+
+# Minimum token interval for delimiter fallback; non-positive values disable fallback
+delimiter_fallback_min_tokens: 0
+
+# Maximum selected boundaries per response; non-positive values disable the cap
+delimiter_max_steps_per_response: 0
+
+# Regex patterns searched within the decoded lookahead window after a delimiter
+delimiter_step_marker_patterns:
+
+  - "(?i)\\bStep\\s*\\d+\\b"
+  - "\\b\\d+\\.\\s"
+  - "(?i)^(?:[#*_]+[ \\t]+)*[#*_]*[ \\t]*(?:First|Firstly|Second|Secondly|Third|Thirdly|Next|Then|Finally|Similarly)\\b"
+
+# Prefix prepended to the ground-truth answer string
+answer_prefix: "Answer: "
+
+# Compute answer log probability every N selected steps, always including the final step
+step_interval: 1
+
+# Local per-GPU micro batch size for answer log probability inference
+answer_log_prob_batch_size: 16
+
+# Whether to use dynamic batching for answer log probability inference; null follows actor.use_dynamic_bsz
+answer_log_prob_use_dynamic_bsz: null
+
+# Max tokens per GPU for answer log probability inference; null follows actor.ppo_max_token_len_per_gpu
+answer_log_prob_max_token_len_per_gpu: null
+
+# Number of distinct wrong answers sampled per prompt for answer-log-prob margins; 0 scores only the ground truth.
+answer_log_prob_num_wrong_answers: 1
+
+# EMA update rate for the answer-log-prob teacher; 1.0 uses the current actor (the previous behavior)
+answer_log_prob_ema_alpha: 1.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -258,4 +307,3 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
-

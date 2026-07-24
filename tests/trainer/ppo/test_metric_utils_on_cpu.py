@@ -348,6 +348,13 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
 
+    def test_compute_data_metrics_with_answer_step_end_mask(self):
+        self.batch.batch["answer_step_end_mask"] = torch.tensor([[0, 1], [1, 1]], dtype=torch.bool)
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["actor/answer_step_count_mean"], 1.5)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""

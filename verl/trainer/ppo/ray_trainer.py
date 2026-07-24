@@ -187,6 +187,21 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator in (AdvantageEstimator.V_INFO, AdvantageEstimator.V_INFO.value):
+        grpo_calculation_mask = data.batch["response_mask"]
+        if "answer_log_prob" not in data.batch or "answer_step_end_mask" not in data.batch:
+            raise ValueError("v_info requires answer_log_prob and answer_step_end_mask in data.batch.")
+        advantages, returns, vinfo_weights = core_algos.compute_vinfo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            answer_log_prob=data.batch["answer_log_prob"],
+            answer_step_end_mask=data.batch["answer_step_end_mask"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.batch["vinfo_weights"] = vinfo_weights
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1117,6 +1132,7 @@ class RayPPOTrainer:
                 output = self.actor_rollout_wg.compute_log_prob(batch_td)
             else:
                 output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+
             # gather output
             log_probs = tu.get(output, "log_probs")
             # step 4. No padding to padding
@@ -1159,6 +1175,11 @@ class RayPPOTrainer:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
+
+    def _compute_answer_log_prob(self, batch: DataProto) -> DataProto:
+        if self.use_legacy_worker_impl == "disable":
+            raise NotImplementedError("compute_answer_log_prob is not implemented for the new worker API yet.")
+        return self.actor_rollout_wg.compute_answer_log_prob(batch)
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1403,6 +1424,7 @@ class RayPPOTrainer:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
+                            batch.batch['entropys'] = entropys.detach()
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
@@ -1439,6 +1461,14 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                    if self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.V_INFO,
+                        AdvantageEstimator.V_INFO.value,
+                    ):
+                        with marked_timer("answer_log_prob", timing_raw, color="blue"):
+                            answer_log_prob = self._compute_answer_log_prob(batch)
+                            batch = batch.union(answer_log_prob)
 
                     # compute values
                     if self.use_critic:

@@ -80,6 +80,8 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        gamma (float): Discount factor for current-and-future token sums in the my loss.
+        tau (float): Temperature divisor for token weights in the my loss.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -89,6 +91,17 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    gamma: float = 0.99
+    tau: float = 0.5
+    future_kl_start: str = "exclude_current"
+    future_kl_window: int = -1 # -1 indicate no window
+    future_kl_average: bool = True
+    future_kl_clip_ratio: float = 0.0
+    decay_rate: float = 128.0
+    chunk_size: int = 128
+    future_kl_clip_high_only: bool = False
+    future_kl_filter_extreme: bool = False
+    safety_thresh: float = 3.0
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
@@ -152,6 +165,28 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    delimiter: str = "\n\n"
+    delimiter_step_marker_filter: bool = False
+    delimiter_step_marker_lookahead: int = 10
+    delimiter_fallback_min_tokens: int = 0
+    delimiter_max_steps_per_response: int = 0
+    delimiter_step_marker_patterns: list[str] = field(
+        default_factory=lambda: [
+            r"(?i)\bStep\s*\d+\b",
+            r"\b\d+\.\s",
+            (
+                r"(?i)^(?:[#*_]+[ \t]+)*[#*_]*[ \t]*"
+                r"(?:First|Firstly|Second|Secondly|Third|Thirdly|Next|Then|Finally|Similarly)\b"
+            ),
+        ]
+    )
+    answer_prefix: str = "Answer: "
+    step_interval: int = 1
+    answer_log_prob_batch_size: int = 16
+    answer_log_prob_use_dynamic_bsz: Optional[bool] = None
+    answer_log_prob_max_token_len_per_gpu: Optional[int] = None
+    answer_log_prob_num_wrong_answers: int = 1
+    answer_log_prob_ema_alpha: float = 1.0
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
@@ -208,6 +243,11 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if not 0.0 <= self.answer_log_prob_ema_alpha <= 1.0:
+            raise ValueError(
+                "answer_log_prob_ema_alpha must be in [0, 1], "
+                f"got {self.answer_log_prob_ema_alpha}."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

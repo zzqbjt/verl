@@ -73,7 +73,17 @@ def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
-    return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+    policy_loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+    policy_loss_needs_ref = policy_loss_mode in {"ours", "my", "my_future"}
+    kl_loss_needs_ref = (
+        config.actor_rollout_ref.actor.use_kl_loss
+        and float(config.actor_rollout_ref.actor.get("kl_loss_coef", 0.0)) != 0.0
+    )
+    return (
+        config.algorithm.use_kl_in_reward
+        or kl_loss_needs_ref
+        or policy_loss_needs_ref
+    )
 
 
 def need_reward_model(
