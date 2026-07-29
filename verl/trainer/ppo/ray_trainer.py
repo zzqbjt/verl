@@ -50,7 +50,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    use_ema_reference_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -295,6 +302,7 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
+        self.use_ema_reference_policy = use_ema_reference_policy(self.config)
 
         self.use_rm = need_reward_model(self.config)
 
@@ -803,7 +811,7 @@ class RayPPOTrainer:
             else:
                 self.critic_wg.init_model()
 
-        if self.use_reference_policy and not self.ref_in_actor:
+        if self.use_reference_policy and not self.ref_in_actor and not self.use_ema_reference_policy:
             if str(Role.RefPolicy) in all_wg:
                 self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
                 self.ref_policy_wg.init_model()
@@ -816,7 +824,7 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
-        if self.ref_in_actor:
+        if self.ref_in_actor or self.use_ema_reference_policy:
             self.ref_policy_wg = self.actor_rollout_wg
 
         # create reward loop manager

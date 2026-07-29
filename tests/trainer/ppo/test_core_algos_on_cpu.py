@@ -200,7 +200,7 @@ def test_multi_turn_compute_gae_advantage_return():
 
 
 @pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
-def test_discounted_future_sum(gamma: float):
+def test_discounted_future_mean(gamma: float):
     values = torch.tensor(
         [
             [1.0, 2.0, 3.0, 4.0, 5.0],
@@ -213,18 +213,18 @@ def test_discounted_future_sum(gamma: float):
             [1.0, 1.0, 1.0, 1.0, 1.0],
         ]
     )
-    expected = torch.zeros_like(values)
+    expected_sum = torch.zeros_like(values)
+    expected_weight = torch.zeros_like(values)
     for batch_idx in range(values.shape[0]):
         for token_idx in range(values.shape[1]):
             for future_idx in range(token_idx, values.shape[1]):
-                expected[batch_idx, token_idx] += (
-                    gamma ** (future_idx - token_idx)
-                    * values[batch_idx, future_idx]
-                    * response_mask[batch_idx, future_idx]
-                )
+                discount = gamma ** (future_idx - token_idx) * response_mask[batch_idx, future_idx]
+                expected_sum[batch_idx, token_idx] += discount * values[batch_idx, future_idx]
+                expected_weight[batch_idx, token_idx] += discount
+    expected = torch.where(expected_weight > 0, expected_sum / expected_weight, 0.0)
     expected *= response_mask
 
-    actual = verl.trainer.ppo.core_algos._discounted_future_sum(
+    actual = verl.trainer.ppo.core_algos._discounted_future_mean(
         values,
         response_mask,
         gamma=gamma,
@@ -235,10 +235,10 @@ def test_discounted_future_sum(gamma: float):
 
 
 @pytest.mark.parametrize("gamma", [-0.1, 1.1])
-def test_discounted_future_sum_rejects_invalid_gamma(gamma: float):
+def test_discounted_future_mean_rejects_invalid_gamma(gamma: float):
     values = torch.ones(1, 2)
     with pytest.raises(ValueError, match=r"gamma must be in \[0, 1\]"):
-        verl.trainer.ppo.core_algos._discounted_future_sum(values, values, gamma=gamma)
+        verl.trainer.ppo.core_algos._discounted_future_mean(values, values, gamma=gamma)
 
 
 def test_compute_policy_loss_my_rejects_nonpositive_tau():

@@ -1895,13 +1895,13 @@ def masked_percentile_rank(tensor, mask):
     return result
 
 
-def _discounted_future_sum(
+def _discounted_future_mean(
     values: torch.Tensor,
     response_mask: torch.Tensor,
     gamma: float,
     chunk_size: int = 128,
 ) -> torch.Tensor:
-    """Return the masked discounted sum from each token through the end of the response."""
+    """Return the masked discounted mean from each token through the end of the response."""
     if values.shape[-2:] != response_mask.shape:
         raise ValueError(
             f"values' last two dimensions {values.shape[-2:]} must match response_mask shape {response_mask.shape}"
@@ -1909,7 +1909,7 @@ def _discounted_future_sum(
     if not 0.0 <= gamma <= 1.0:
         raise ValueError(f"policy-loss gamma must be in [0, 1], got {gamma}")
     if chunk_size <= 0:
-        raise ValueError(f"discounted-sum chunk_size must be positive, got {chunk_size}")
+        raise ValueError(f"discounted-mean chunk_size must be positive, got {chunk_size}")
 
     response_length = values.shape[-1]
     if response_length == 0:
@@ -1918,10 +1918,14 @@ def _discounted_future_sum(
     # Compute in bounded blocks: this avoids both an O(T^2) full decay matrix and
     # one GPU kernel launch per response token.
     work_dtype = torch.float32 if values.dtype in (torch.float16, torch.bfloat16) else values.dtype
-    masked_values = values.to(work_dtype) * response_mask.to(work_dtype)
+    expanded_mask = torch.broadcast_to(response_mask.to(work_dtype), values.shape)
+    masked_values = values.to(work_dtype) * expanded_mask
     flat_values = masked_values.reshape(-1, response_length)
-    discounted = torch.empty_like(flat_values)
-    carry = torch.zeros(flat_values.shape[0], dtype=work_dtype, device=values.device)
+    flat_weights = expanded_mask.reshape(-1, response_length)
+    discounted_values = torch.empty_like(flat_values)
+    discounted_weights = torch.empty_like(flat_weights)
+    value_carry = torch.zeros(flat_values.shape[0], dtype=work_dtype, device=values.device)
+    weight_carry = torch.zeros(flat_weights.shape[0], dtype=work_dtype, device=values.device)
 
     block_size = min(chunk_size, response_length)
     positions = torch.arange(block_size, device=values.device)
@@ -1937,17 +1941,29 @@ def _discounted_future_sum(
         block_start = max(0, block_end - block_size)
         current_block_size = block_end - block_start
         block_values = flat_values[:, block_start:block_end]
-        block_discounted = block_values @ decay_matrix[:current_block_size, :current_block_size].T
+        block_weights = flat_weights[:, block_start:block_end]
+        block_decay_matrix = decay_matrix[:current_block_size, :current_block_size]
+        block_discounted_values = block_values @ block_decay_matrix.T
+        block_discounted_weights = block_weights @ block_decay_matrix.T
 
         if block_end < response_length:
             carry_powers = torch.arange(current_block_size, 0, -1, device=values.device)
-            block_discounted = block_discounted + carry.unsqueeze(-1) * torch.pow(gamma_tensor, carry_powers)
+            carry_decay = torch.pow(gamma_tensor, carry_powers)
+            block_discounted_values = block_discounted_values + value_carry.unsqueeze(-1) * carry_decay
+            block_discounted_weights = block_discounted_weights + weight_carry.unsqueeze(-1) * carry_decay
 
-        discounted[:, block_start:block_end] = block_discounted
-        carry = block_discounted[:, 0]
+        discounted_values[:, block_start:block_end] = block_discounted_values
+        discounted_weights[:, block_start:block_end] = block_discounted_weights
+        value_carry = block_discounted_values[:, 0]
+        weight_carry = block_discounted_weights[:, 0]
 
-    result = discounted.reshape(values.shape).to(values.dtype)
-    return result * response_mask.to(values.dtype)
+    discounted_mean = torch.where(
+        discounted_weights > 0,
+        discounted_values / discounted_weights,
+        torch.zeros_like(discounted_values),
+    )
+    result = discounted_mean.reshape(values.shape).to(values.dtype)
+    return result * expanded_mask.to(values.dtype)
 
 
 @register_policy_loss("my")  # type: ignore[arg-type]
@@ -2016,12 +2032,11 @@ def compute_policy_loss_my(
         discount_chunk_size = int(config.policy_loss.get("chunk_size", 128))
         
         delta_old = old_log_prob - ref_log_prob
-        delta_new = log_prob.detach() - ref_log_prob
+        delta_new = log_prob.detach() - old_log_prob
         delta_old_mean = torch.sum(delta_old * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
         delta_new_mean = torch.sum(delta_new * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
         delta_old_std = torch.sqrt(torch.sum((delta_old - delta_old_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
         delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
-        
         delta_old = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
         delta_new = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
          
@@ -2031,7 +2046,7 @@ def compute_policy_loss_my(
                 delta_new,
             )
         )
-        delta_old, delta_new = _discounted_future_sum(
+        delta_old, delta_new = _discounted_future_mean(
             token_deltas,
             response_mask,
             gamma=gamma,

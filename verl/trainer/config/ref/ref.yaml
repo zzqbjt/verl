@@ -1,6 +1,9 @@
 # Number of rollouts per update (mirrors actor rollout_n)
 rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
 
+# EMA update rate for a dynamic reference policy; null keeps the original fixed reference policy
+ema_alpha: null
+
 # actor_rollout_ref.ref: FSDP config same as actor. For models larger than 7B, it’s recommended to turn on offload for ref by default
 strategy: ${actor_rollout_ref.actor.strategy}
 

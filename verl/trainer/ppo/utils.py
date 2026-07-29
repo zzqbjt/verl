@@ -69,6 +69,11 @@ class Role(Enum):
         return role
 
 
+def use_ema_reference_policy(config: DictConfig) -> bool:
+    """Whether the reference policy is an EMA copy colocated with the actor."""
+    return config.actor_rollout_ref.ref.get("ema_alpha", None) is not None
+
+
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:

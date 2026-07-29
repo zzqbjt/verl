@@ -187,6 +187,7 @@ actor_rollout_ref:
       forward_only: true
       dtype: bfloat16
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+    ema_alpha: null
     strategy: torchtitan
     use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
     log_prob_micro_batch_size: null

@@ -364,7 +364,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
-        assert role in ["actor", "ref", "answer_teacher"]
+        assert role in ["actor", "ref", "answer_teacher", "ema_reference"]
 
         # TiledMLP requires FSDP2 for correct gradient computation
         if use_tiled_mlp and self.config.actor.strategy == "fsdp":
@@ -546,7 +546,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     print("[actor model] No vision tower found.")
 
         # Apply identical QAT transforms to the actor and its EMA teacher before FSDP wrapping.
-        if role in {"actor", "answer_teacher"} and self._qat_enabled:
+        if role in {"actor", "answer_teacher", "ema_reference"} and self._qat_enabled:
             actor_module = apply_qat(actor_module, self.qat_config)
             enable_qat_fuse(actor_module)
             if self.qat_config.mode == "w4a4":
@@ -920,6 +920,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            self.ema_reference_module_fsdp = None
+            ref_ema_alpha = self.config.ref.get("ema_alpha", None)
+            if ref_ema_alpha is not None:
+                self.ema_reference_module_fsdp = self._build_model_optimizer(
+                    model_path=local_path,
+                    fsdp_config=fsdp_config,
+                    optim_config=None,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    use_fused_kernels=use_fused_kernels,
+                    enable_gradient_checkpointing=False,
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                    use_liger=self.config.model.get("use_liger", False),
+                    role="ema_reference",
+                    enable_activation_offload=False,
+                    use_prefix_grouper=self.config.actor.get("use_prefix_grouper", False),
+                    use_tiled_mlp=use_tiled_mlp,
+                    tiled_mlp_shards=tiled_mlp_shards,
+                )[0]
             self.answer_teacher_module_fsdp = None
             if float(actor_cfg.answer_log_prob_ema_alpha) < 1.0:
                 self.answer_teacher_module_fsdp = self._build_model_optimizer(
@@ -943,6 +962,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer,
                 answer_teacher_module=self.answer_teacher_module_fsdp,
+                ema_reference_module=self.ema_reference_module_fsdp,
+                ref_ema_alpha=ref_ema_alpha,
             )
 
         if self._is_rollout:
@@ -1045,6 +1066,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            if self.actor.has_ema_reference:
+                metrics["actor/ref_ema_alpha"] = self.actor.ref_ema_alpha
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
@@ -1231,6 +1254,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_ref_log_prob(self, data: DataProto):
         loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
         return_topk_logits = loss_mode == "dgpo"
+        if self._is_actor and self.actor.has_ema_reference:
+            data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")
+                with self.actor._use_ema_reference():
+                    outputs = self.actor.compute_log_prob(
+                        data=data,
+                        calculate_entropy=False,
+                        return_topk_logits=return_topk_logits,
+                    )
+                tensors = {"ref_log_prob": outputs["log_probs"]}
+                if return_topk_logits:
+                    tensors["ref_logits"] = outputs["logits"]
+                    tensors["ref_logits_indices"] = outputs["logits_indices"]
+                output = DataProto.from_dict(tensors=tensors)
+            return output.to("cpu")
+
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
@@ -1290,6 +1334,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 f"answer_teacher_world_size_{self.world_size}_rank_{self.rank}.pt",
             )
             torch.save(answer_teacher_state, answer_teacher_path)
+        ema_reference_state = self.actor.ema_reference_state_dict()
+        if ema_reference_state is not None:
+            ema_reference_path = os.path.join(
+                local_path,
+                f"ema_reference_world_size_{self.world_size}_rank_{self.rank}.pt",
+            )
+            torch.save(ema_reference_state, ema_reference_path)
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -1360,6 +1411,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if del_local_after_load and is_non_local(answer_teacher_path):
                     os.remove(local_answer_teacher_path)
             self.actor.load_answer_teacher_state_dict(answer_teacher_state)
+
+            ema_reference_state = None
+            ema_reference_path = os.path.join(
+                local_path,
+                f"ema_reference_world_size_{self.world_size}_rank_{self.rank}.pt",
+            )
+            if self.actor.has_ema_reference and exists(ema_reference_path):
+                local_ema_reference_path = copy_to_local(ema_reference_path)
+                ema_reference_state = torch.load(local_ema_reference_path, map_location="cpu", weights_only=False)
+                if del_local_after_load and is_non_local(ema_reference_path):
+                    os.remove(local_ema_reference_path)
+            self.actor.load_ema_reference_state_dict(ema_reference_state)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
