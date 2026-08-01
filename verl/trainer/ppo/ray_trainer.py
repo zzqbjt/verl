@@ -200,6 +200,34 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator in (AdvantageEstimator.MY, AdvantageEstimator.MY.value):
+        required_batch_keys = ("old_log_probs", "ref_log_prob", "entropys")
+        missing_batch_keys = [key for key in required_batch_keys if key not in data.batch]
+        if missing_batch_keys:
+            raise ValueError(f"my advantage requires data.batch keys {missing_batch_keys}")
+        if "uid" not in data.non_tensor_batch:
+            raise ValueError("my advantage requires data.non_tensor_batch['uid']")
+
+        advantages, returns, w = core_algos.compute_my_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            old_log_prob=data.batch["old_log_probs"],
+            ref_log_prob=data.batch["ref_log_prob"],
+            entropy=data.batch["entropys"],
+            tau=0.5 if config is None else float(config.get("tau", 0.5)),
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+
+        valid_w = w[data.batch["response_mask"].bool()]
+        data.meta_info["my_advantage_metrics"] = {
+            "actor/w/max": valid_w.max().detach().item(),
+            "actor/w/min": valid_w.min().detach().item(),
+            "actor/w/std": valid_w.std().detach().item(),
+        }
     elif adv_estimator in (AdvantageEstimator.V_INFO, AdvantageEstimator.V_INFO.value):
         grpo_calculation_mask = data.batch["response_mask"]
         if "answer_log_prob" not in data.batch or "answer_step_end_mask" not in data.batch:
@@ -1666,6 +1694,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        metrics.update(batch.meta_info.pop("my_advantage_metrics", {}))
 
                         if self.use_ratio_value_critic:
                             metrics.update(self._update_ratio_value_critic(batch))

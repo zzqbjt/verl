@@ -81,6 +81,10 @@ def need_reference_policy(
         in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
         and critic_config.get("enable", None) is False
     )
+    my_advantage_needs_ref = config.algorithm.get("adv_estimator", None) in (
+        AdvantageEstimator.MY,
+        AdvantageEstimator.MY.value,
+    )
     kl_loss_needs_ref = (
         config.actor_rollout_ref.actor.use_kl_loss
         and float(config.actor_rollout_ref.actor.get("kl_loss_coef", 0.0)) != 0.0
@@ -90,6 +94,7 @@ def need_reference_policy(
         or kl_loss_needs_ref
         or policy_loss_needs_ref
         or critic_free_gae_needs_ref
+        or my_advantage_needs_ref
     )
 
 

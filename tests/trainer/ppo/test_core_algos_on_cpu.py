@@ -28,6 +28,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_vectorized_outcome_advantage,
     compute_length_adaptive_gae_advantage_return,
     compute_log_prob_values,
+    compute_my_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_vinfo_outcome_advantage,
@@ -482,6 +483,28 @@ def test_compute_policy_loss_my_rejects_nonpositive_tau():
             response_mask=ones,
             config=config,
         )
+
+
+def test_compute_my_outcome_advantage_returns_token_weights():
+    response_mask = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
+    token_level_rewards = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
+    old_log_prob = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    ref_log_prob = torch.zeros_like(old_log_prob)
+    entropy = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+
+    advantages, returns, w = compute_my_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=np.array(["group", "group"]),
+        old_log_prob=old_log_prob,
+        ref_log_prob=ref_log_prob,
+        entropy=entropy,
+    )
+
+    assert advantages.shape == returns.shape == w.shape == response_mask.shape
+    assert torch.equal(advantages, returns)
+    assert torch.isfinite(w[response_mask.bool()]).all()
+    assert w[response_mask.bool()].max() > w[response_mask.bool()].min()
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:

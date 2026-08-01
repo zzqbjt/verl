@@ -66,6 +66,10 @@ def test_standard_gae_does_not_need_reference_policy():
     assert not need_reference_policy(_make_gae_config(critic_enable=None))
 
 
+def test_my_advantage_needs_reference_policy():
+    assert need_reference_policy(_make_gae_config(critic_enable=False, adv_estimator="my"))
+
+
 def test_length_adaptive_gae_uses_standard_critic_by_default():
     config = _make_gae_config(critic_enable=None, adv_estimator="length_adaptive_gae")
     assert need_critic(config)

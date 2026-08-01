@@ -97,6 +97,7 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     LENGTH_ADAPTIVE_GAE = "length_adaptive_gae"
     GRPO = "grpo"
+    MY = "my"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -516,7 +517,7 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
-@register_adv_est("my")
+@register_adv_est(AdvantageEstimator.MY)
 def compute_my_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -528,7 +529,7 @@ def compute_my_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute entropy-weighted GRPO outcome advantages.
 
     The outcome advantage is computed in the same way as GRPO. Token weights
@@ -602,7 +603,7 @@ def compute_my_outcome_advantage(
 
         advantages = advantages * w
 
-    return advantages, advantages
+    return advantages, advantages, w
 
 
 def _compute_answer_advantage_weights(
