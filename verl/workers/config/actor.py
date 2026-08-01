@@ -123,7 +123,6 @@ class ActorConfig(BaseConfig):
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
-        ema_alpha (Optional[float]): EMA update rate when this config is used for a dynamic reference policy.
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
@@ -188,7 +187,6 @@ class ActorConfig(BaseConfig):
     answer_log_prob_max_token_len_per_gpu: Optional[int] = None
     answer_log_prob_num_wrong_answers: int = 1
     answer_log_prob_ema_alpha: float = 1.0
-    ema_alpha: Optional[float] = None
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
@@ -250,8 +248,6 @@ class ActorConfig(BaseConfig):
                 "answer_log_prob_ema_alpha must be in [0, 1], "
                 f"got {self.answer_log_prob_ema_alpha}."
             )
-        if self.ema_alpha is not None and not 0.0 <= self.ema_alpha <= 1.0:
-            raise ValueError(f"ema_alpha must be in [0, 1], got {self.ema_alpha}.")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

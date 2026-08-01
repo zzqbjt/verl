@@ -22,9 +22,12 @@ from omegaconf import OmegaConf
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    RatioValueCritic,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_length_adaptive_gae_advantage_return,
+    compute_log_prob_values,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_vinfo_outcome_advantage,
@@ -197,6 +200,221 @@ def test_multi_turn_compute_gae_advantage_return():
     assert torch.equal(adv1, adv2), f"{adv1=}, {adv2=}"
     assert torch.equal(ret1, ret2), f"{ret1=}, {ret2=}"
     print(f" [CORRECT] \n\n{adv1=}, \n\n{ret1=}")
+
+
+def test_length_adaptive_gae_matches_per_response_lambda():
+    rewards = torch.tensor([[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    values = torch.tensor([[0.2, 0.4, 0.0, 0.0], [0.1, 0.2, 0.3, 0.4]])
+    response_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
+
+    actual_advantages, actual_returns = compute_length_adaptive_gae_advantage_return(
+        token_level_rewards=rewards,
+        values=values,
+        response_mask=response_mask,
+        gamma=0.9,
+        alpha=1.0,
+    )
+    expected_advantages, expected_returns = compute_gae_advantage_return(
+        token_level_rewards=rewards,
+        values=values,
+        response_mask=response_mask,
+        gamma=0.9,
+        lam=torch.tensor([0.5, 0.75]),
+    )
+
+    torch.testing.assert_close(actual_advantages, expected_advantages)
+    torch.testing.assert_close(actual_returns, expected_returns)
+
+
+@pytest.mark.parametrize("alpha", [0.0, -1.0])
+def test_length_adaptive_gae_rejects_nonpositive_alpha(alpha):
+    ones = torch.ones(1, 2)
+    with pytest.raises(ValueError, match="alpha > 0"):
+        compute_length_adaptive_gae_advantage_return(
+            token_level_rewards=ones,
+            values=ones,
+            response_mask=ones,
+            gamma=1.0,
+            alpha=alpha,
+        )
+
+
+def test_length_adaptive_gae_clamps_scaled_length_to_one():
+    ones = torch.ones(1, 2)
+    actual = compute_length_adaptive_gae_advantage_return(
+        token_level_rewards=ones,
+        values=ones,
+        response_mask=ones,
+        gamma=1.0,
+        alpha=0.4,
+    )
+    expected = compute_gae_advantage_return(
+        token_level_rewards=ones,
+        values=ones,
+        response_mask=ones,
+        gamma=1.0,
+        lam=0.0,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_length_adaptive_gae_rejects_empty_response():
+    zeros = torch.zeros(1, 2)
+    with pytest.raises(ValueError, match="at least one valid token"):
+        compute_length_adaptive_gae_advantage_return(
+            token_level_rewards=zeros,
+            values=zeros,
+            response_mask=zeros,
+            gamma=1.0,
+            alpha=1.0,
+        )
+
+
+def test_compute_log_prob_values():
+    ratio = torch.tensor(
+        [
+            [0.2, 0.3, 0.4, 99.0],
+            [99.0, -0.1, 0.5, 0.2],
+            [0.7, -0.2, 0.1, 99.0],
+            [-0.4, 0.6, 0.3, 99.0],
+        ]
+    )
+    old_log_prob = ratio.clone().requires_grad_(True)
+    ref_log_prob = torch.zeros_like(ratio, requires_grad=True)
+    token_level_rewards = torch.tensor(
+        [
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0],
+        ]
+    )
+    group_ids = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
+
+    values, actual_target = compute_log_prob_values(
+        old_log_prob,
+        ref_log_prob,
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        a=torch.tensor(1.0),
+        b=torch.tensor(0.0),
+        group_ids=group_ids,
+    )
+
+    expected_values = torch.tensor(
+        [
+            [-1.0, torch.tanh(torch.tensor(0.2)), torch.tanh(torch.tensor(0.5)), 0.0],
+            [0.0, 1.0, torch.tanh(torch.tensor(-0.1)), torch.tanh(torch.tensor(0.4))],
+            [-1.0, torch.tanh(torch.tensor(0.7)), torch.tanh(torch.tensor(0.5)), 0.0],
+            [1.0, torch.tanh(torch.tensor(-0.4)), torch.tanh(torch.tensor(0.2)), 0.0],
+        ]
+    )
+    expected_target = token_level_rewards.sum(dim=-1, keepdim=True).expand_as(ratio)
+
+    torch.testing.assert_close(values, expected_values)
+    torch.testing.assert_close(actual_target, expected_target)
+
+
+def test_compute_log_prob_values_singleton_group_keeps_tanh_b_at_v0():
+    ratio = torch.tensor([[99.0, 0.4, 0.2]])
+    response_mask = torch.tensor([[0.0, 1.0, 1.0]])
+
+    values, _ = compute_log_prob_values(
+        old_log_prob=ratio,
+        ref_log_prob=torch.zeros_like(ratio),
+        token_level_rewards=torch.tensor([[0.0, 0.0, 1.0]]),
+        response_mask=response_mask,
+        a=torch.tensor(2.0),
+        b=torch.tensor(0.25),
+        group_ids=np.array(["singleton"], dtype=object),
+    )
+
+    expected = torch.tensor(
+        [[0.0, torch.tanh(torch.tensor(0.25)), torch.tanh(torch.tensor(1.05))]]
+    )
+    torch.testing.assert_close(values, expected)
+
+
+def test_ratio_value_critic_initialization():
+    critic = RatioValueCritic()
+
+    torch.testing.assert_close(critic.a, torch.tensor(1.0))
+    torch.testing.assert_close(critic.b, torch.tensor(0.0))
+
+
+def test_ratio_value_critic_adamw_update_reduces_masked_mse():
+    critic = RatioValueCritic()
+    optimizer = torch.optim.AdamW(critic.parameters(), lr=0.1, weight_decay=0.01)
+    ratio = torch.tensor([[-0.2, -0.1], [0.1, 0.2]])
+    old_log_prob = ratio - 1.0
+    ref_log_prob = torch.full_like(ratio, -1.0)
+    token_level_rewards = torch.tensor([[0.0, -1.0], [0.0, 1.0]])
+    response_mask = torch.ones_like(ratio)
+
+    loss_before, _, _ = critic.loss(
+        old_log_prob,
+        ref_log_prob,
+        token_level_rewards,
+        response_mask,
+        group_ids=np.array(["prompt", "prompt"], dtype=object),
+    )
+    optimizer.zero_grad()
+    loss_before.backward()
+    optimizer.step()
+    loss_after, _, _ = critic.loss(
+        old_log_prob,
+        ref_log_prob,
+        token_level_rewards,
+        response_mask,
+        group_ids=np.array(["prompt", "prompt"], dtype=object),
+    )
+
+    assert optimizer.param_groups[0]["weight_decay"] == 0.01
+    assert loss_after < loss_before
+
+
+def test_ratio_value_critic_loss_ignores_masked_tokens():
+    critic = RatioValueCritic()
+    old_log_prob = torch.tensor([[0.0, 0.0, 100.0], [0.0, 0.0, -100.0]])
+    ref_log_prob = torch.zeros_like(old_log_prob)
+    token_level_rewards = torch.tensor([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]])
+    response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
+
+    value_loss, values, target = critic.loss(
+        old_log_prob,
+        ref_log_prob,
+        token_level_rewards,
+        response_mask,
+        group_ids=np.array(["prompt", "prompt"], dtype=object),
+    )
+
+    # LOO V0 values are deliberately very different from their own targets.
+    # The loss is exactly 1 because only the second valid token participates.
+    torch.testing.assert_close(values, torch.tensor([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
+    torch.testing.assert_close(target, torch.tensor([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]]))
+    torch.testing.assert_close(value_loss, torch.tensor(1.0))
+
+
+def test_compute_log_prob_values_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="must have the same shape"):
+        compute_log_prob_values(
+            torch.zeros(2, 3),
+            torch.zeros(2, 4),
+            token_level_rewards=torch.zeros(2, 3),
+            response_mask=torch.ones(2, 3),
+            a=torch.tensor(1.0),
+            b=torch.tensor(0.0),
+        )
 
 
 @pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])

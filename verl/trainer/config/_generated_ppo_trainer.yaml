@@ -171,7 +171,6 @@ actor_rollout_ref:
       quantization_config_path: null
   ref:
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
-    ema_alpha: null
     strategy: ${actor_rollout_ref.actor.strategy}
     use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
     log_prob_micro_batch_size: null
@@ -665,8 +664,15 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
   lam: 1.0
+  length_adaptive_gae_alpha: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  ratio_value_critic:
+    a_init: 1.0
+    b_init: 0.0
+    lr: 0.01
+    weight_decay: 0.01
+    update_steps: 1
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

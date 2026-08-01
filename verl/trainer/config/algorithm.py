@@ -573,8 +573,12 @@ class AlgoConfig(BaseConfig):
     Args:
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
+        length_adaptive_gae_alpha (float): Scale in
+            ``lambda_i = 1 - 1 / max(alpha * response_length_i, 1)``.
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        ratio_value_critic (dict[str, Any]): Optimizer and initialization settings for the lightweight
+            prefix-ratio value critic used when GAE is enabled without the standard critic worker.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -601,8 +605,18 @@ class AlgoConfig(BaseConfig):
 
     gamma: float = 1.0
     lam: float = 1.0
+    length_adaptive_gae_alpha: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    ratio_value_critic: dict[str, Any] = field(
+        default_factory=lambda: {
+            "a_init": 1.0,
+            "b_init": 0.0,
+            "lr": 1e-2,
+            "weight_decay": 1e-2,
+            "update_steps": 1,
+        }
+    )
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

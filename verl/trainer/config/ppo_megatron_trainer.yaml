@@ -119,8 +119,27 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
   lam: 1.0
+  # Alpha for length-adaptive GAE: lambda_i = 1 - 1 / max(alpha * response_length_i, 1)
+  length_adaptive_gae_alpha: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: True
+  # Lightweight shifted-prefix-ratio value critic used by critic-free GAE variants
+  ratio_value_critic:
+
+    # Initial slope in tanh(a * prefix_ratio + b)
+    a_init: 1.0
+
+    # Initial bias in tanh(a * prefix_ratio + b)
+    b_init: 0.0
+
+    # AdamW learning rate
+    lr: 1e-2
+
+    # AdamW decoupled weight decay
+    weight_decay: 1e-2
+
+    # Number of optimizer steps per rollout batch
+    update_steps: 1
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence
   kl_ctrl:

@@ -59,8 +59,6 @@ class DataParallelPPOActor(BasePPOActor):
         actor_module (nn.Module): Actor or ref module
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
         answer_teacher_module (nn.Module, optional): Independent FSDP teacher used for answer scoring.
-        ema_reference_module (nn.Module, optional): Independent FSDP EMA reference policy.
-        ref_ema_alpha (float, optional): EMA update rate for ``ema_reference_module``.
     """
 
     def __init__(
@@ -69,15 +67,12 @@ class DataParallelPPOActor(BasePPOActor):
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
         answer_teacher_module: nn.Module | None = None,
-        ema_reference_module: nn.Module | None = None,
-        ref_ema_alpha: float | None = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.answer_teacher_module = answer_teacher_module
-        self.ema_reference_module = ema_reference_module
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -144,17 +139,6 @@ class DataParallelPPOActor(BasePPOActor):
             self.answer_teacher_module.eval()
             self._copy_actor_to_answer_teacher()
 
-        self.ref_ema_alpha = ref_ema_alpha
-        if self.ref_ema_alpha is not None and not 0.0 <= self.ref_ema_alpha <= 1.0:
-            raise ValueError(f"ref_ema_alpha must be in [0, 1], got {self.ref_ema_alpha}.")
-        if self.ref_ema_alpha is not None and self.ema_reference_module is None:
-            raise ValueError("An independent ema_reference_module is required when ref_ema_alpha is configured.")
-        if self.ema_reference_module is not None:
-            if self.ref_ema_alpha is None:
-                raise ValueError("ref_ema_alpha is required when ema_reference_module is provided.")
-            self.ema_reference_module.eval()
-            self._copy_actor_to_ema_reference()
-
         self._delimiter_token_id_cache = {}
 
     @staticmethod
@@ -171,14 +155,14 @@ class DataParallelPPOActor(BasePPOActor):
         target_tensors: dict[str, torch.Tensor],
     ) -> None:
         if source_tensors.keys() != target_tensors.keys():
-            raise RuntimeError("Source and target tensor names do not match.")
+            raise RuntimeError("Actor and answer teacher tensor names do not match.")
         for name, source_tensor in source_tensors.items():
             source_local_tensor = self._local_tensor(source_tensor).detach()
             target_local_tensor = self._local_tensor(target_tensors[name])
             if source_local_tensor.shape != target_local_tensor.shape:
                 raise RuntimeError(
-                    f"Source tensor {name!r} has shape {source_local_tensor.shape}, "
-                    f"but the target shard has shape {target_local_tensor.shape}."
+                    f"Actor tensor {name!r} has shape {source_local_tensor.shape}, "
+                    f"but the answer teacher shard has shape {target_local_tensor.shape}."
                 )
             target_local_tensor.copy_(
                 source_local_tensor.to(device=target_local_tensor.device, dtype=target_local_tensor.dtype)
@@ -284,107 +268,6 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self._copy_named_tensors(saved_buffers, dict(self.answer_teacher_module.named_buffers()))
 
-    @torch.no_grad()
-    def _copy_actor_to_ema_reference(self) -> None:
-        """Reset the EMA reference policy to exactly match the online actor."""
-        if self.ema_reference_module is None:
-            return
-        self._copy_named_tensors(
-            dict(self.actor_module.named_parameters()),
-            dict(self.ema_reference_module.named_parameters()),
-        )
-        self._copy_named_tensors(
-            dict(self.actor_module.named_buffers()),
-            dict(self.ema_reference_module.named_buffers()),
-        )
-
-    @torch.no_grad()
-    def update_ema_reference(self) -> None:
-        """Apply ``ref <- (1 - alpha) * ref + alpha * actor`` once."""
-        if self.ema_reference_module is None:
-            return
-
-        alpha = self.ref_ema_alpha
-        if alpha == 0.0:
-            return
-        actor_parameters = dict(self.actor_module.named_parameters())
-        reference_parameters = dict(self.ema_reference_module.named_parameters())
-        if actor_parameters.keys() != reference_parameters.keys():
-            raise RuntimeError("Actor and EMA reference parameter names do not match.")
-
-        for name, actor_parameter in actor_parameters.items():
-            if not actor_parameter.requires_grad:
-                continue
-            actor_local_parameter = self._local_tensor(actor_parameter).detach()
-            reference_local_parameter = self._local_tensor(reference_parameters[name])
-            actor_local_parameter = actor_local_parameter.to(
-                device=reference_local_parameter.device,
-                dtype=reference_local_parameter.dtype,
-            )
-            if reference_local_parameter.is_floating_point() or reference_local_parameter.is_complex():
-                reference_local_parameter.lerp_(actor_local_parameter, alpha)
-            else:
-                reference_local_parameter.copy_(actor_local_parameter)
-
-        # Copy buffers rather than averaging them. They are inference state, not theta.
-        self._copy_named_tensors(
-            dict(self.actor_module.named_buffers()),
-            dict(self.ema_reference_module.named_buffers()),
-        )
-
-    def ema_reference_state_dict(self) -> dict | None:
-        """Return the rank-local EMA reference state for checkpointing."""
-        if self.ema_reference_module is None:
-            return None
-        return {
-            "ema_alpha": self.ref_ema_alpha,
-            "parameters": {
-                name: self._local_tensor(parameter).detach().cpu()
-                for name, parameter in self.ema_reference_module.named_parameters()
-            },
-            "buffers": {
-                name: self._local_tensor(buffer).detach().cpu()
-                for name, buffer in self.ema_reference_module.named_buffers()
-            },
-        }
-
-    @property
-    def has_ema_reference(self) -> bool:
-        return self.ema_reference_module is not None
-
-    @torch.no_grad()
-    def load_ema_reference_state_dict(self, state_dict: dict | None) -> None:
-        """Restore the rank-local EMA reference, or reset it from the loaded actor."""
-        if self.ema_reference_module is None:
-            return
-        if state_dict is None:
-            self._copy_actor_to_ema_reference()
-            return
-
-        saved_parameters = state_dict.get("parameters", state_dict)
-        reference_parameters = dict(self.ema_reference_module.named_parameters())
-        if saved_parameters.keys() != reference_parameters.keys():
-            raise RuntimeError("EMA reference checkpoint parameters do not match the actor parameters.")
-        for name, saved_parameter in saved_parameters.items():
-            reference_parameter = self._local_tensor(reference_parameters[name])
-            if saved_parameter.shape != reference_parameter.shape:
-                raise RuntimeError(
-                    f"EMA reference checkpoint parameter {name!r} has shape {saved_parameter.shape}, "
-                    f"but the reference shard has shape {reference_parameter.shape}."
-                )
-            reference_parameter.copy_(
-                saved_parameter.to(dtype=reference_parameter.dtype, device=reference_parameter.device)
-            )
-
-        saved_buffers = state_dict.get("buffers")
-        if saved_buffers is None:
-            self._copy_named_tensors(
-                dict(self.actor_module.named_buffers()),
-                dict(self.ema_reference_module.named_buffers()),
-            )
-        else:
-            self._copy_named_tensors(saved_buffers, dict(self.ema_reference_module.named_buffers()))
-
     def _reshard_model_after_forward(self, model: nn.Module) -> None:
         if not torch.distributed.is_initialized():
             return
@@ -405,22 +288,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         actor_module = self.actor_module
         self.actor_module = self.answer_teacher_module
-        self.actor_module.eval()
-        try:
-            yield
-        finally:
-            self._reshard_model_after_forward(self.actor_module)
-            self.actor_module = actor_module
-
-    @contextmanager
-    def _use_ema_reference(self):
-        """Temporarily run forwards with the EMA reference, restoring the actor afterwards."""
-        if self.ema_reference_module is None:
-            yield
-            return
-
-        actor_module = self.actor_module
-        self.actor_module = self.ema_reference_module
         self.actor_module.eval()
         try:
             yield
@@ -2040,5 +1907,4 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         self.update_answer_teacher()
-        self.update_ema_reference()
         return metrics

@@ -96,8 +96,11 @@ class TestAlgoConfig(unittest.TestCase):
 
         self.assertEqual(config.gamma, 0.8)
         self.assertEqual(config.lam, 1.0)  # default value
+        self.assertEqual(config.length_adaptive_gae_alpha, 1.0)
         self.assertEqual(config.adv_estimator, "gae")  # default value
         self.assertTrue(config.norm_adv_by_std_in_grpo)  # default value
+        self.assertEqual(config.ratio_value_critic["a_init"], 1.0)
+        self.assertEqual(config.ratio_value_critic["weight_decay"], 1e-2)
         self.assertFalse(config.use_kl_in_reward)  # default value
         self.assertEqual(config.kl_penalty, "kl")  # default value
         self.assertFalse(config.use_pf_ppo)  # default value

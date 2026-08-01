@@ -26,7 +26,7 @@ from verl.experimental.dataset.sampler import AbstractSampler
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import need_critic, need_reference_policy, use_ema_reference_policy
+from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
@@ -262,7 +262,7 @@ class TaskRunner:
         if use_legacy_worker_impl == "disable":
             return
 
-        if need_reference_policy(config) and not use_ema_reference_policy(config):
+        if need_reference_policy(config):
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 

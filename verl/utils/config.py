@@ -150,22 +150,6 @@ def validate_config(
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
 
-    ref_ema_alpha = config.actor_rollout_ref.ref.get("ema_alpha", None)
-    if ref_ema_alpha is not None:
-        if not 0.0 <= float(ref_ema_alpha) <= 1.0:
-            raise ValueError(f"actor_rollout_ref.ref.ema_alpha must be in [0, 1], got {ref_ema_alpha}.")
-        if not use_reference_policy:
-            raise ValueError("ref.ema_alpha requires a loss or KL configuration that uses a reference policy.")
-        if actor_config.strategy not in {"fsdp", "fsdp2"}:
-            raise ValueError("ref.ema_alpha currently supports only the FSDP/FSDP2 actor strategy.")
-        if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
-            raise ValueError("ref.ema_alpha currently requires the legacy FSDP worker implementation.")
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        if lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None:
-            raise ValueError("ref.ema_alpha is not supported with LoRA because the EMA tracks full actor parameters.")
-
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:
             # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu

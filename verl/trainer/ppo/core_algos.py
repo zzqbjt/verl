@@ -95,6 +95,7 @@ class AdvantageEstimator(str, Enum):
     """
 
     GAE = "gae"
+    LENGTH_ADAPTIVE_GAE = "length_adaptive_gae"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
@@ -217,6 +218,143 @@ def get_kl_controller(kl_ctrl):
         raise NotImplementedError
 
 
+def compute_log_prob_values(
+    old_log_prob: torch.Tensor,
+    ref_log_prob: torch.Tensor,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_ids: Optional[np.ndarray] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate token-level values from shifted cumulative policy log-ratios.
+
+    For token ``t``, the value feature contains log-ratios from valid response
+    tokens strictly before ``t``:
+
+    ``prefix_ratio_t = sum_{k < t}(old_log_prob_k - ref_log_prob_k)``.
+
+    This right shift makes the feature a function of the state before the
+    current action. The first valid token is optionally overridden with a
+    leave-one-out mean reward from other responses that share its group id.
+    Each response's total reward is broadcast to its valid tokens as the
+    calibration target.
+
+    Args:
+        old_log_prob: Log probabilities from the behavior policy, with shape
+            ``(batch_size, response_length)``.
+        ref_log_prob: Log probabilities from the reference policy, with the same
+            shape as ``old_log_prob``.
+        token_level_rewards: Token rewards with the same shape.
+        response_mask: Valid response-token mask with the same shape.
+        a: Scalar slope parameter.
+        b: Scalar bias parameter.
+        group_ids: Optional response group ids. Responses with the same id are
+            assumed to share a prompt.
+
+    Returns:
+        Token-level values and their broadcast response-level targets.
+    """
+    if not (
+        old_log_prob.shape
+        == ref_log_prob.shape
+        == token_level_rewards.shape
+        == response_mask.shape
+    ):
+        raise ValueError(
+            "old_log_prob, ref_log_prob, token_level_rewards, and response_mask "
+            f"must have the same shape, got {old_log_prob.shape}, "
+            f"{ref_log_prob.shape}, {token_level_rewards.shape}, and {response_mask.shape}"
+        )
+
+    valid_mask = response_mask.bool()
+    ratio = (old_log_prob.detach().float() - ref_log_prob.detach().float()) * response_mask.float()
+    prefix_ratio = torch.cumsum(ratio, dim=-1) - ratio
+    sequence_target = token_level_rewards.detach().float().sum(dim=-1, keepdim=True)
+    target = sequence_target.expand_as(prefix_ratio)
+    values = torch.tanh(a * prefix_ratio + b) * response_mask
+
+    if group_ids is not None:
+        group_ids = np.asarray(group_ids, dtype=object)
+        if group_ids.ndim != 1 or len(group_ids) != values.shape[0]:
+            raise ValueError(
+                "group_ids must be one-dimensional with one id per response, "
+                f"got shape {group_ids.shape} for batch size {values.shape[0]}"
+            )
+
+        group_to_rows = defaultdict(list)
+        for row, group_id in enumerate(group_ids.tolist()):
+            group_to_rows[group_id].append(row)
+
+        sequence_rewards = sequence_target.squeeze(-1)
+        loo_values = torch.zeros_like(sequence_rewards)
+        has_group_peer = torch.zeros(values.shape[0], dtype=torch.bool, device=values.device)
+        for rows in group_to_rows.values():
+            if len(rows) <= 1:
+                continue
+            row_indices = torch.as_tensor(rows, dtype=torch.long, device=values.device)
+            group_rewards = sequence_rewards.index_select(0, row_indices)
+            group_loo_values = (group_rewards.sum() - group_rewards) / (len(rows) - 1)
+            loo_values.index_copy_(0, row_indices, group_loo_values)
+            has_group_peer[row_indices] = True
+
+        first_valid_mask = valid_mask & (valid_mask.long().cumsum(dim=-1) == 1)
+        loo_override_mask = first_valid_mask & has_group_peer.unsqueeze(-1)
+        values = torch.where(loo_override_mask, loo_values.unsqueeze(-1).to(values), values)
+
+    return values, target
+
+
+class RatioValueCritic(torch.nn.Module):
+    """A persistent two-parameter value model based on prefix policy log-ratios."""
+
+    def __init__(self, a_init: float = 1.0, b_init: float = 0.0):
+        super().__init__()
+        self.a = torch.nn.Parameter(torch.tensor(float(a_init), dtype=torch.float32))
+        self.b = torch.nn.Parameter(torch.tensor(float(b_init), dtype=torch.float32))
+
+    def forward(
+        self,
+        old_log_prob: torch.Tensor,
+        ref_log_prob: torch.Tensor,
+        token_level_rewards: torch.Tensor,
+        response_mask: torch.Tensor,
+        group_ids: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return compute_log_prob_values(
+            old_log_prob=old_log_prob,
+            ref_log_prob=ref_log_prob,
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            a=self.a,
+            b=self.b,
+            group_ids=group_ids,
+        )
+
+    def loss(
+        self,
+        old_log_prob: torch.Tensor,
+        ref_log_prob: torch.Tensor,
+        token_level_rewards: torch.Tensor,
+        response_mask: torch.Tensor,
+        group_ids: Optional[np.ndarray] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        values, target = self(
+            old_log_prob=old_log_prob,
+            ref_log_prob=ref_log_prob,
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            group_ids=group_ids,
+        )
+        response_valid_mask = response_mask.bool()
+        first_valid_mask = response_valid_mask & (response_valid_mask.long().cumsum(dim=-1) == 1)
+        loss_mask = response_valid_mask & ~first_valid_mask
+        if not torch.any(loss_mask):
+            raise ValueError("RatioValueCritic requires at least one valid non-initial response token")
+        value_loss = torch.mean((values[loss_mask].float() - target[loss_mask].float()).square())
+        return value_loss, values, target
+
+
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
@@ -266,6 +404,48 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
+def compute_length_adaptive_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GAE with one lambda value per response based on its valid length.
+
+    For response ``i`` with ``l_i`` valid response tokens:
+
+    ``lambda_i = 1 - 1 / max(alpha * l_i, 1)``.
+
+    The same ``lambda_i`` is used at every valid timestep of that response.
+    """
+    if alpha <= 0:
+        raise ValueError(f"length-adaptive GAE requires alpha > 0, got {alpha}")
+    if not (
+        token_level_rewards.shape == values.shape == response_mask.shape
+        and response_mask.ndim == 2
+    ):
+        raise ValueError(
+            "token_level_rewards, values, and response_mask must be rank-2 tensors with the same shape, "
+            f"got {token_level_rewards.shape}, {values.shape}, and {response_mask.shape}"
+        )
+
+    response_lengths = response_mask.bool().sum(dim=-1).float()
+    if torch.any(response_lengths == 0):
+        raise ValueError("length-adaptive GAE requires every response to contain at least one valid token")
+
+    scaled_lengths = (alpha * response_lengths).clamp_min(1.0)
+    lambda_per_response = 1.0 - scaled_lengths.reciprocal()
+    return compute_gae_advantage_return(
+        token_level_rewards=token_level_rewards,
+        values=values,
+        response_mask=response_mask,
+        gamma=gamma,
+        lam=lambda_per_response,
+    )
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
@@ -334,6 +514,95 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est("my")
+def compute_my_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    old_log_prob: torch.Tensor,
+    ref_log_prob: torch.Tensor,
+    entropy: torch.Tensor,
+    tau: float = 0.5,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute entropy-weighted GRPO outcome advantages.
+
+    The outcome advantage is computed in the same way as GRPO. Token weights
+    are derived from ``delta = old_log_prob - ref_log_prob``. Unlike
+    ``compute_policy_loss_my``, delta is normalized over all valid tokens in a
+    prompt group, and is not combined with a new-policy delta or a discounted
+    future mean.
+
+    For every valid token, the unnormalized weight is
+    ``delta * normalized_entropy / tau``. A response-level softmax then keeps
+    the average valid-token weight equal to one before it is applied to the
+    GRPO advantage.
+    """
+    del config  # Kept for compatibility with the advantage-estimator interface.
+
+    if tau <= 0.0:
+        raise ValueError(f"my advantage tau must be positive, got {tau}")
+    if not (
+        token_level_rewards.shape
+        == response_mask.shape
+        == old_log_prob.shape
+        == ref_log_prob.shape
+        == entropy.shape
+        and response_mask.ndim == 2
+    ):
+        raise ValueError(
+            "token_level_rewards, response_mask, old_log_prob, ref_log_prob, and entropy "
+            "must be rank-2 tensors with the same shape, got "
+            f"{token_level_rewards.shape}, {response_mask.shape}, {old_log_prob.shape}, "
+            f"{ref_log_prob.shape}, and {entropy.shape}"
+        )
+
+    valid_mask = response_mask.bool()
+    valid_count = valid_mask.sum(dim=-1, keepdim=True)
+    if torch.any(valid_count == 0):
+        raise ValueError("my advantage requires every response to contain at least one valid token")
+
+    advantages, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        epsilon=epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+
+    with torch.no_grad():
+        delta = old_log_prob - ref_log_prob
+        group_index = as_torch_index(index, device=delta.device)
+        if group_index.numel() != delta.shape[0]:
+            raise ValueError(
+                f"index length {group_index.numel()} does not match batch size {delta.shape[0]}"
+            )
+
+        token_group_index = group_index.unsqueeze(-1).expand_as(delta)
+        group_mean, group_std, _ = group_mean_std(
+            delta[valid_mask],
+            token_group_index[valid_mask],
+            eps=epsilon,
+            device=delta.device,
+        )
+        delta = (delta - group_mean[group_index].unsqueeze(-1).to(delta)) / (
+            group_std[group_index].unsqueeze(-1).to(delta) + epsilon
+        )
+
+        max_entropy = (entropy * response_mask).max(dim=-1, keepdim=True).values
+        normalized_entropy = entropy / max_entropy
+        I = torch.sigmoid(delta)
+        I_mean = torch.sum(response_mask * I, dim=-1, keepdim=True) / valid_count
+        normalized_entropy_mean = torch.sum(response_mask * normalized_entropy, dim=-1, keepdim=True) / valid_count
+        w = I / I_mean * normalized_entropy / normalized_entropy_mean
+
+        advantages = advantages * w
+
+    return advantages, advantages
 
 
 def _compute_answer_advantage_weights(
@@ -2039,6 +2308,9 @@ def compute_policy_loss_my(
         delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
         delta_old = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
         delta_new = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
+
+        # delta_old = 10 * (torch.exp(old_log_prob) - torch.exp(ref_log_prob))
+        # delta_new = 10 * (torch.exp(log_prob.detach()) - torch.exp(old_log_prob))
          
         token_deltas = torch.stack(
             (
@@ -2103,6 +2375,7 @@ def compute_policy_loss_my(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/w/max": w[response_mask.bool()].max().detach().item(),
         "actor/w/min": w[response_mask.bool()].min().detach().item(),
+        "actor/w/std": w[response_mask.bool()].std().detach().item(),
         "actor/I_old/std": I_old[response_mask.bool()].std().detach().item(),
         "actor/I_new/std": I_new[response_mask.bool()].std().detach().item(),
         "actor/I_old/high_ratio": I_old_high_ratio.detach().item(),

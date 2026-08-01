@@ -50,14 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import (
-    Role,
-    WorkerType,
-    need_critic,
-    need_reference_policy,
-    need_reward_model,
-    use_ema_reference_policy,
-)
+from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -164,15 +157,28 @@ def compute_advantage(
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
-        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
-        advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
-            gamma=gamma,
-            lam=lam,
-        )
+    if adv_estimator in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE):
+        if "values" not in data.batch:
+            raise ValueError(f"{adv_estimator} requires token-level values in data.batch['values']")
+        values = data.batch["values"]
+
+        if adv_estimator == AdvantageEstimator.LENGTH_ADAPTIVE_GAE:
+            alpha = 1.0 if config is None else float(config.get("length_adaptive_gae_alpha", 1.0))
+            advantages, returns = core_algos.compute_length_adaptive_gae_advantage_return(
+                token_level_rewards=data.batch["token_level_rewards"],
+                values=values,
+                response_mask=data.batch["response_mask"],
+                gamma=gamma,
+                alpha=alpha,
+            )
+        else:
+            advantages, returns = core_algos.compute_gae_advantage_return(
+                token_level_rewards=data.batch["token_level_rewards"],
+                values=values,
+                response_mask=data.batch["response_mask"],
+                gamma=gamma,
+                lam=lam,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         if config.get("use_pf_ppo", False):
@@ -302,11 +308,40 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
-        self.use_ema_reference_policy = use_ema_reference_policy(self.config)
 
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
+        self.use_ratio_value_critic = (
+            not self.use_critic
+            and self.config.algorithm.adv_estimator
+            in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
+        )
+        self.ratio_value_critic = None
+        self.ratio_value_critic_optimizer = None
+        self.ratio_value_critic_update_steps = 0
+        if self.use_ratio_value_critic:
+            ratio_critic_config = self.config.algorithm.get("ratio_value_critic", {})
+            learning_rate = float(ratio_critic_config.get("lr", 1e-2))
+            weight_decay = float(ratio_critic_config.get("weight_decay", 1e-2))
+            update_steps = int(ratio_critic_config.get("update_steps", 1))
+            if learning_rate <= 0.0:
+                raise ValueError(f"ratio_value_critic.lr must be positive, got {learning_rate}")
+            if weight_decay < 0.0:
+                raise ValueError(f"ratio_value_critic.weight_decay must be non-negative, got {weight_decay}")
+            if update_steps <= 0:
+                raise ValueError(f"ratio_value_critic.update_steps must be positive, got {update_steps}")
+
+            self.ratio_value_critic = core_algos.RatioValueCritic(
+                a_init=float(ratio_critic_config.get("a_init", 1.0)),
+                b_init=float(ratio_critic_config.get("b_init", 0.0)),
+            )
+            self.ratio_value_critic_optimizer = torch.optim.AdamW(
+                self.ratio_value_critic.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+            )
+            self.ratio_value_critic_update_steps = update_steps
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -811,7 +846,7 @@ class RayPPOTrainer:
             else:
                 self.critic_wg.init_model()
 
-        if self.use_reference_policy and not self.ref_in_actor and not self.use_ema_reference_policy:
+        if self.use_reference_policy and not self.ref_in_actor:
             if str(Role.RefPolicy) in all_wg:
                 self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
                 self.ref_policy_wg.init_model()
@@ -824,7 +859,7 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
-        if self.ref_in_actor or self.use_ema_reference_policy:
+        if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
         # create reward loop manager
@@ -923,6 +958,16 @@ class RayPPOTrainer:
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
+        if self.use_ratio_value_critic:
+            ratio_critic_local_path = os.path.join(local_global_step_folder, "ratio_value_critic.pt")
+            torch.save(
+                {
+                    "model": self.ratio_value_critic.state_dict(),
+                    "optimizer": self.ratio_value_critic_optimizer.state_dict(),
+                },
+                ratio_critic_local_path,
+            )
+
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
@@ -990,6 +1035,18 @@ class RayPPOTrainer:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        if self.use_ratio_value_critic:
+            ratio_critic_local_path = os.path.join(global_step_folder, "ratio_value_critic.pt")
+            if os.path.exists(ratio_critic_local_path):
+                ratio_critic_state = torch.load(ratio_critic_local_path, map_location="cpu", weights_only=False)
+                self.ratio_value_critic.load_state_dict(ratio_critic_state["model"])
+                self.ratio_value_critic_optimizer.load_state_dict(ratio_critic_state["optimizer"])
+            else:
+                print(
+                    f"Warning: No ratio value critic state found at {ratio_critic_local_path}; "
+                    "using configured initialization"
+                )
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -1256,6 +1313,82 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _move_ratio_value_critic(self, device: torch.device) -> None:
+        """Move the lightweight critic and its optimizer state to the batch device."""
+        if not self.use_ratio_value_critic:
+            return
+        current_device = self.ratio_value_critic.a.device
+        if current_device == device:
+            return
+
+        self.ratio_value_critic.to(device)
+        for state in self.ratio_value_critic_optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    def _compute_ratio_value_critic_values(self, batch: DataProto) -> torch.Tensor:
+        """Compute values with frozen parameters before the current critic update."""
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("The prefix-ratio value critic requires batch.non_tensor_batch['uid'] for LOO V0")
+        device = batch.batch["old_log_probs"].device
+        self._move_ratio_value_critic(device)
+        with torch.no_grad():
+            values, _ = self.ratio_value_critic(
+                old_log_prob=batch.batch["old_log_probs"],
+                ref_log_prob=batch.batch["ref_log_prob"],
+                token_level_rewards=batch.batch["token_level_rewards"],
+                response_mask=batch.batch["response_mask"],
+                group_ids=batch.non_tensor_batch["uid"],
+            )
+        return values.detach()
+
+    def _update_ratio_value_critic(self, batch: DataProto) -> dict[str, float]:
+        """Update the persistent two-parameter critic after GAE is computed."""
+        device = batch.batch["old_log_probs"].device
+        self._move_ratio_value_critic(device)
+
+        loss_before = None
+        grad_norm = torch.zeros((), device=device)
+        for _ in range(self.ratio_value_critic_update_steps):
+            self.ratio_value_critic_optimizer.zero_grad()
+            value_loss, _, _ = self.ratio_value_critic.loss(
+                old_log_prob=batch.batch["old_log_probs"],
+                ref_log_prob=batch.batch["ref_log_prob"],
+                token_level_rewards=batch.batch["token_level_rewards"],
+                response_mask=batch.batch["response_mask"],
+                group_ids=batch.non_tensor_batch["uid"],
+            )
+            if loss_before is None:
+                loss_before = value_loss.detach()
+            value_loss.backward()
+            grad_norm = torch.linalg.vector_norm(
+                torch.stack(
+                    [
+                        self.ratio_value_critic.a.grad.detach(),
+                        self.ratio_value_critic.b.grad.detach(),
+                    ]
+                )
+            )
+            self.ratio_value_critic_optimizer.step()
+
+        with torch.no_grad():
+            loss_after, _, _ = self.ratio_value_critic.loss(
+                old_log_prob=batch.batch["old_log_probs"],
+                ref_log_prob=batch.batch["ref_log_prob"],
+                token_level_rewards=batch.batch["token_level_rewards"],
+                response_mask=batch.batch["response_mask"],
+                group_ids=batch.non_tensor_batch["uid"],
+            )
+
+        return {
+            "critic/a": self.ratio_value_critic.a.detach().float().item(),
+            "critic/b": self.ratio_value_critic.b.detach().float().item(),
+            "critic/mse_before": loss_before.float().item(),
+            "critic/mse": loss_after.float().item(),
+            "critic/grad_norm": grad_norm.float().item(),
+        }
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1516,6 +1649,9 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
+                        if self.use_ratio_value_critic:
+                            batch.batch["values"] = self._compute_ratio_value_critic_values(batch)
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
@@ -1530,6 +1666,9 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        if self.use_ratio_value_critic:
+                            metrics.update(self._update_ratio_value_critic(batch))
 
                     # update critic
                     if self.use_critic:

@@ -69,17 +69,18 @@ class Role(Enum):
         return role
 
 
-def use_ema_reference_policy(config: DictConfig) -> bool:
-    """Whether the reference policy is an EMA copy colocated with the actor."""
-    return config.actor_rollout_ref.ref.get("ema_alpha", None) is not None
-
-
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
     policy_loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
     policy_loss_needs_ref = policy_loss_mode in {"dgpo", "ours", "my", "my_future"}
+    critic_config = config.get("critic", {})
+    critic_free_gae_needs_ref = (
+        config.algorithm.get("adv_estimator", None)
+        in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
+        and critic_config.get("enable", None) is False
+    )
     kl_loss_needs_ref = (
         config.actor_rollout_ref.actor.use_kl_loss
         and float(config.actor_rollout_ref.actor.get("kl_loss_coef", 0.0)) != 0.0
@@ -88,6 +89,7 @@ def need_reference_policy(
         config.algorithm.use_kl_in_reward
         or kl_loss_needs_ref
         or policy_loss_needs_ref
+        or critic_free_gae_needs_ref
     )
 
 
@@ -102,11 +104,12 @@ def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
     if config.critic.enable is not None:
         return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+    elif config.algorithm.adv_estimator in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE):
         return True
     else:
         warnings.warn(
-            "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",
+            "Disabled critic because the advantage estimator does not require GAE values. "
+            "If this is not intended, please set critic.enable=True",
             stacklevel=2,
         )
         return False
