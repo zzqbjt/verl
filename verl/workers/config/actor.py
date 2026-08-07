@@ -80,7 +80,6 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
-        gamma (float): Discount factor for current-and-future token sums in the my loss.
         tau (float): Temperature divisor for token weights in the my loss.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
@@ -91,7 +90,6 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
-    gamma: float = 0.99
     tau: float = 0.5
     future_kl_start: str = "exclude_current"
     future_kl_window: int = -1 # -1 indicate no window
@@ -123,6 +121,8 @@ class ActorConfig(BaseConfig):
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
+        medium_ema_alpha (float): Actor interpolation rate for the independent EMA medium policy.
+        save_medium_policy_checkpoint (bool): Whether to persist the EMA medium policy in actor checkpoints.
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
@@ -186,7 +186,8 @@ class ActorConfig(BaseConfig):
     answer_log_prob_use_dynamic_bsz: Optional[bool] = None
     answer_log_prob_max_token_len_per_gpu: Optional[int] = None
     answer_log_prob_num_wrong_answers: int = 1
-    answer_log_prob_ema_alpha: float = 1.0
+    medium_ema_alpha: float = 1.0
+    save_medium_policy_checkpoint: bool = True
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
@@ -243,10 +244,10 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
-        if not 0.0 <= self.answer_log_prob_ema_alpha <= 1.0:
+        if not 0.0 <= self.medium_ema_alpha <= 1.0:
             raise ValueError(
-                "answer_log_prob_ema_alpha must be in [0, 1], "
-                f"got {self.answer_log_prob_ema_alpha}."
+                "medium_ema_alpha must be in [0, 1], "
+                f"got {self.medium_ema_alpha}."
             )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):

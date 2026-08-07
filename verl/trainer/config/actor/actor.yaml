@@ -75,9 +75,6 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
-  # Discount factor for current-and-future token sums in the "my" loss
-  gamma: 0.99
-
   # Temperature divisor for token weights in the "my" loss
   tau: 0.5
 
@@ -121,8 +118,11 @@ answer_log_prob_max_token_len_per_gpu: null
 # Number of distinct wrong answers sampled per prompt for answer-log-prob margins; 0 scores only the ground truth.
 answer_log_prob_num_wrong_answers: 1
 
-# EMA update rate for the answer-log-prob teacher; 1.0 uses the current actor (the previous behavior)
-answer_log_prob_ema_alpha: 1.0
+# EMA update rate for the medium policy; 1.0 uses the current actor (the previous behavior)
+medium_ema_alpha: 1.0
+
+# Whether to persist the independent EMA medium policy alongside actor checkpoints
+save_medium_policy_checkpoint: true
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

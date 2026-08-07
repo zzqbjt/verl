@@ -182,6 +182,7 @@ class FSDPEngine(BaseEngine):
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
             trust_remote_code=self.model_config.trust_remote_code,
+            device_mesh=self.device_mesh,
         )
 
         self.to(

@@ -79,8 +79,9 @@ class FSDPModelMerger(BaseModelMerger):
         with open(config_path) as f:
             config = json.load(f)
 
-        # Extract world size from the config
-        world_size = config.get("world_size", None)
+        # Format v2 stores model/optimizer files by unique FSDP shard count;
+        # old checkpoints only contain the global world size.
+        world_size = config.get("shard_world_size", config.get("world_size"))
         if world_size is None:
             raise ValueError("World size not found in the config file.")
 

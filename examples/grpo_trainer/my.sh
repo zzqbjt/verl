@@ -9,7 +9,7 @@ num_gpus=2
 train_batch_size=128
 mini_batch_size=8
 group_size=8
-bs_per_gpu=$((mini_batch_size/num_gpus))
+bs_per_gpu=$((mini_batch_size/num_gpus*group_size/2))
 temperature=1.0
 val_top_p=0.7
 

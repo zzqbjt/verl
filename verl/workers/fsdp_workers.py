@@ -65,6 +65,7 @@ from verl.utils.fsdp_utils import (
     collect_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp_checkpoint_shard_info,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     get_shard_placement_fn,
@@ -364,7 +365,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
-        assert role in ["actor", "ref", "answer_teacher"]
+        assert role in ["actor", "ref", "medium_policy"]
 
         # TiledMLP requires FSDP2 for correct gradient computation
         if use_tiled_mlp and self.config.actor.strategy == "fsdp":
@@ -545,8 +546,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
 
-        # Apply identical QAT transforms to the actor and its EMA teacher before FSDP wrapping.
-        if role in {"actor", "answer_teacher"} and self._qat_enabled:
+        # Apply identical QAT transforms to the actor and its EMA medium policy before FSDP wrapping.
+        if role in {"actor", "medium_policy"} and self._qat_enabled:
             actor_module = apply_qat(actor_module, self.qat_config)
             enable_qat_fuse(actor_module)
             if self.qat_config.mode == "w4a4":
@@ -920,9 +921,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.answer_teacher_module_fsdp = None
-            if float(actor_cfg.answer_log_prob_ema_alpha) < 1.0:
-                self.answer_teacher_module_fsdp = self._build_model_optimizer(
+            self.medium_policy_module_fsdp = None
+            if float(actor_cfg.medium_ema_alpha) < 1.0:
+                self.medium_policy_module_fsdp = self._build_model_optimizer(
                     model_path=local_path,
                     fsdp_config=fsdp_config,
                     optim_config=None,
@@ -932,7 +933,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     enable_gradient_checkpointing=False,
                     trust_remote_code=self.config.model.get("trust_remote_code", False),
                     use_liger=self.config.model.get("use_liger", False),
-                    role="answer_teacher",
+                    role="medium_policy",
                     enable_activation_offload=False,
                     use_prefix_grouper=self.config.actor.get("use_prefix_grouper", False),
                     use_tiled_mlp=use_tiled_mlp,
@@ -942,7 +943,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_cfg,
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer,
-                answer_teacher_module=self.answer_teacher_module_fsdp,
+                medium_policy_module=self.medium_policy_module_fsdp,
             )
 
         if self._is_rollout:
@@ -997,6 +998,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
+                device_mesh=self.device_mesh,
             )
 
         if not self._is_actor and self._is_rollout:
@@ -1010,6 +1012,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 lr_scheduler=None,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
+                device_mesh=self.device_mesh,
             )
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
@@ -1173,12 +1176,40 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_medium_log_prob")
+    def compute_medium_log_prob(self, data: DataProto):
+        """Compute response-token log probabilities with the EMA medium policy."""
+        assert self._is_actor
+        if not self.actor.has_medium_policy:
+            raise ValueError(
+                "compute_medium_log_prob requires an EMA model; "
+                "set actor.medium_ema_alpha to a value in [0, 1)."
+            )
+
+        config_source = self.config.rollout
+        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+
+        with self.ulysses_sharding_manager:
+            with self.actor._use_medium_policy():
+                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            output = DataProto.from_dict(
+                tensors={"medium_log_prob": outputs["log_probs"].float()},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+
+        return output.to("cpu")
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_answer_log_prob")
     def compute_answer_log_prob(self, data: DataProto):
         assert self._is_actor
         actor_config = self.config.actor
-        use_answer_teacher = self.actor.has_answer_teacher
-        if self._is_offload_param and not use_answer_teacher:
+        use_medium_policy = self.actor.has_medium_policy
+        if self._is_offload_param and not use_medium_policy:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         data.meta_info["micro_batch_size"] = actor_config.answer_log_prob_batch_size
@@ -1217,10 +1248,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             output = output.to("cpu")
 
-            if not use_answer_teacher and self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            if not use_medium_policy and self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
                 self.actor.actor_module._handle.reshard(True)
         finally:
-            if self._is_offload_param and not use_answer_teacher:
+            if self._is_offload_param and not use_medium_policy:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
                 log_gpu_memory_usage("After offload model during compute_answer_log_prob", logger=logger)
 
@@ -1283,13 +1314,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
-        answer_teacher_state = self.actor.answer_teacher_state_dict()
-        if answer_teacher_state is not None:
-            answer_teacher_path = os.path.join(
-                local_path,
-                f"answer_teacher_world_size_{self.world_size}_rank_{self.rank}.pt",
+        if self.actor.has_medium_policy and self.actor.save_medium_policy_checkpoint:
+            medium_world_size, medium_rank, medium_writer_rank = get_fsdp_checkpoint_shard_info(
+                self.device_mesh, self.rank
             )
-            torch.save(answer_teacher_state, answer_teacher_path)
+            if self.rank == medium_writer_rank:
+                # Medium-policy buffers are copied from the online actor after
+                # restore, so only the EMA parameters need a separate checkpoint.
+                medium_policy_state = self.actor.medium_policy_state_dict(include_buffers=False)
+                medium_policy_state.update(
+                    {
+                        "format_version": 2,
+                        "shard_world_size": medium_world_size,
+                        "shard_rank": medium_rank,
+                    }
+                )
+                medium_policy_path = os.path.join(
+                    local_path,
+                    f"medium_policy_world_size_{medium_world_size}_rank_{medium_rank}.pt",
+                )
+                torch.save(medium_policy_state, medium_policy_path)
+                log_with_rank(
+                    f"Saved medium-policy shard to {os.path.abspath(medium_policy_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                )
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -1349,17 +1398,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         if self._is_actor:
-            answer_teacher_state = None
-            answer_teacher_path = os.path.join(
-                local_path,
-                f"answer_teacher_world_size_{self.world_size}_rank_{self.rank}.pt",
-            )
-            if self.actor.has_answer_teacher and exists(answer_teacher_path):
-                local_answer_teacher_path = copy_to_local(answer_teacher_path)
-                answer_teacher_state = torch.load(local_answer_teacher_path, map_location="cpu", weights_only=False)
-                if del_local_after_load and is_non_local(answer_teacher_path):
-                    os.remove(local_answer_teacher_path)
-            self.actor.load_answer_teacher_state_dict(answer_teacher_state)
+            medium_policy_state = None
+            if self.actor.has_medium_policy and self.actor.save_medium_policy_checkpoint:
+                local_medium_policy_path_to_delete = None
+                medium_world_size, medium_rank, _ = get_fsdp_checkpoint_shard_info(
+                    self.device_mesh, self.rank
+                )
+                # New checkpoints contain only one copy of each unique FSDP shard.
+                # Fall back to the old per-global-rank name for backward compatibility.
+                medium_policy_paths = [
+                    os.path.join(
+                        local_path,
+                        f"medium_policy_world_size_{medium_world_size}_rank_{medium_rank}.pt",
+                    ),
+                    os.path.join(
+                        local_path,
+                        f"medium_policy_world_size_{self.world_size}_rank_{self.rank}.pt",
+                    ),
+                ]
+                medium_policy_path = next(
+                    (path for path in dict.fromkeys(medium_policy_paths) if exists(path)),
+                    None,
+                )
+                if medium_policy_path:
+                    local_medium_policy_path = copy_to_local(medium_policy_path)
+                    medium_policy_state = torch.load(
+                        local_medium_policy_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    if del_local_after_load and is_non_local(medium_policy_path):
+                        local_medium_policy_path_to_delete = local_medium_policy_path
+                if del_local_after_load:
+                    # New-format replica ranks may share one cached shard path.
+                    # Wait until every rank has finished torch.load before removing it.
+                    dist.barrier()
+                    if local_medium_policy_path_to_delete is not None:
+                        try:
+                            os.remove(local_medium_policy_path_to_delete)
+                        except FileNotFoundError:
+                            pass
+            self.actor.load_medium_policy_state_dict(medium_policy_state)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1754,6 +1833,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             processing_class=self.processor if self.processor is not None else self.tokenizer,
             checkpoint_config=self.config.checkpoint,
             trust_remote_code=self.config.model.get("trust_remote_code", False),
+            device_mesh=self.device_mesh,
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))

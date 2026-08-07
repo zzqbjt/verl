@@ -418,48 +418,6 @@ def test_compute_log_prob_values_rejects_shape_mismatch():
         )
 
 
-@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
-def test_discounted_future_mean(gamma: float):
-    values = torch.tensor(
-        [
-            [1.0, 2.0, 3.0, 4.0, 5.0],
-            [-1.0, 0.5, 2.0, -3.0, 4.0],
-        ]
-    )
-    response_mask = torch.tensor(
-        [
-            [1.0, 1.0, 1.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0, 1.0, 1.0],
-        ]
-    )
-    expected_sum = torch.zeros_like(values)
-    expected_weight = torch.zeros_like(values)
-    for batch_idx in range(values.shape[0]):
-        for token_idx in range(values.shape[1]):
-            for future_idx in range(token_idx, values.shape[1]):
-                discount = gamma ** (future_idx - token_idx) * response_mask[batch_idx, future_idx]
-                expected_sum[batch_idx, token_idx] += discount * values[batch_idx, future_idx]
-                expected_weight[batch_idx, token_idx] += discount
-    expected = torch.where(expected_weight > 0, expected_sum / expected_weight, 0.0)
-    expected *= response_mask
-
-    actual = verl.trainer.ppo.core_algos._discounted_future_mean(
-        values,
-        response_mask,
-        gamma=gamma,
-        chunk_size=2,
-    )
-
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("gamma", [-0.1, 1.1])
-def test_discounted_future_mean_rejects_invalid_gamma(gamma: float):
-    values = torch.ones(1, 2)
-    with pytest.raises(ValueError, match=r"gamma must be in \[0, 1\]"):
-        verl.trainer.ppo.core_algos._discounted_future_mean(values, values, gamma=gamma)
-
-
 def test_compute_policy_loss_my_rejects_nonpositive_tau():
     config = OmegaConf.create(
         {
@@ -467,7 +425,7 @@ def test_compute_policy_loss_my_rejects_nonpositive_tau():
             "clip_ratio_low": 0.2,
             "clip_ratio_high": 0.2,
             "clip_ratio_c": 3.0,
-            "policy_loss": {"gamma": 0.99, "tau": 0.0, "chunk_size": 2},
+            "policy_loss": {"tau": 0.0},
         }
     )
     zeros = torch.zeros(1, 2)
@@ -485,19 +443,104 @@ def test_compute_policy_loss_my_rejects_nonpositive_tau():
         )
 
 
+def test_compute_policy_loss_my_does_not_require_discount_config():
+    config = OmegaConf.create(
+        {
+            "clip_ratio": 0.2,
+            "clip_ratio_low": 0.2,
+            "clip_ratio_high": 0.2,
+            "clip_ratio_c": 3.0,
+            "policy_loss": {"tau": 0.5},
+            "global_batch_info": {},
+        }
+    )
+    zeros = torch.zeros(2, 2)
+    ones = torch.ones(2, 2)
+
+    loss, metrics = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+        old_log_prob=zeros,
+        log_prob=zeros,
+        ref_log_prob=zeros,
+        entropy=ones,
+        advantages=ones,
+        response_mask=ones,
+        config=config,
+    )
+
+    assert torch.isfinite(loss)
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert metrics["actor/delta_old/mean"] == 0.0
+    assert metrics["actor/delta_old/std"] == 0.0
+    assert metrics["actor/delta_new/mean"] == 0.0
+    assert metrics["actor/delta_new/std"] == 0.0
+    assert metrics["actor/delta_old_delta_new/same_sign_ratio"] == 0.0
+    assert metrics["actor/w_coeff/pearson_corr"] == 0.0
+    assert metrics["actor/w_normalized_entropy/pearson_corr"] == 0.0
+
+
+def test_compute_policy_loss_my_reports_delta_and_pearson_metrics():
+    config = OmegaConf.create(
+        {
+            "clip_ratio": 0.2,
+            "clip_ratio_low": 0.2,
+            "clip_ratio_high": 0.2,
+            "clip_ratio_c": 3.0,
+            "policy_loss": {"tau": 0.5},
+            "global_batch_info": {},
+        }
+    )
+    ref_log_prob = torch.zeros(2, 2)
+    old_log_prob = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+    delta_new = torch.tensor([[0.05, -0.1], [0.2, -0.3]])
+    log_prob = old_log_prob + delta_new
+    entropy = torch.tensor([[1.0, 2.0], [3.0, 1.0]])
+    response_mask = torch.ones(2, 2)
+
+    _, metrics = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        ref_log_prob=ref_log_prob,
+        entropy=entropy,
+        advantages=torch.ones_like(response_mask),
+        response_mask=response_mask,
+        config=config,
+    )
+
+    delta_old = old_log_prob - ref_log_prob
+    coeff = (torch.sigmoid(3.5 * delta_old) + torch.sigmoid(3.5 * delta_new)) / 2.0
+    normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
+    w = torch.softmax(coeff * normalized_entropy / 0.5, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
+
+    assert metrics["actor/delta_old/mean"] == pytest.approx(delta_old.mean().item())
+    assert metrics["actor/delta_old/std"] == pytest.approx(delta_old.std(unbiased=False).item())
+    assert metrics["actor/delta_new/mean"] == pytest.approx(delta_new.mean().item())
+    assert metrics["actor/delta_new/std"] == pytest.approx(delta_new.std(unbiased=False).item())
+    assert metrics["actor/delta_old_delta_new/same_sign_ratio"] == pytest.approx(
+        ((delta_old * delta_new) > 0).float().mean().item()
+    )
+    assert metrics["actor/w_coeff/pearson_corr"] == pytest.approx(
+        torch.corrcoef(torch.stack((w.flatten(), coeff.flatten())))[0, 1].item()
+    )
+    assert metrics["actor/w_normalized_entropy/pearson_corr"] == pytest.approx(
+        torch.corrcoef(torch.stack((w.flatten(), normalized_entropy.flatten())))[0, 1].item()
+    )
+
+
 def test_compute_my_outcome_advantage_returns_token_weights():
     response_mask = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
     token_level_rewards = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
     old_log_prob = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     ref_log_prob = torch.zeros_like(old_log_prob)
+    medium_log_prob = torch.tensor([[0.5, 1.5], [1.0, 3.5]])
     entropy = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
 
-    advantages, returns, w = compute_my_outcome_advantage(
+    advantages, returns, w, metrics = compute_my_outcome_advantage(
         token_level_rewards=token_level_rewards,
         response_mask=response_mask,
         index=np.array(["group", "group"]),
         old_log_prob=old_log_prob,
         ref_log_prob=ref_log_prob,
+        medium_log_prob=medium_log_prob,
         entropy=entropy,
     )
 
@@ -505,6 +548,70 @@ def test_compute_my_outcome_advantage_returns_token_weights():
     assert torch.equal(advantages, returns)
     assert torch.isfinite(w[response_mask.bool()]).all()
     assert w[response_mask.bool()].max() > w[response_mask.bool()].min()
+
+    raw_actor_medium_delta = old_log_prob - medium_log_prob
+    actor_medium_delta = (raw_actor_medium_delta - raw_actor_medium_delta.mean()) / (
+        raw_actor_medium_delta.std() + 1e-6
+    )
+    raw_medium_ref_delta = medium_log_prob - ref_log_prob
+    medium_ref_delta = (raw_medium_ref_delta - raw_medium_ref_delta.mean()) / (
+        raw_medium_ref_delta.std() + 1e-6
+    )
+    expected_importance = (torch.tanh(actor_medium_delta) + torch.tanh(medium_ref_delta)) / 2.0
+    normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
+    expected_w = torch.softmax(expected_importance * normalized_entropy / 0.5, dim=-1) * response_mask.sum(
+        dim=-1, keepdim=True
+    )
+    torch.testing.assert_close(w, expected_w)
+
+    def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
+        return torch.corrcoef(torch.stack((x.flatten(), y.flatten())))[0, 1].item()
+
+    assert metrics == pytest.approx(
+        {
+            "actor/actor_medium_delta/mean": raw_actor_medium_delta.mean().item(),
+            "actor/actor_medium_delta/std": raw_actor_medium_delta.std(unbiased=False).item(),
+            "actor/medium_ref_delta/mean": raw_medium_ref_delta.mean().item(),
+            "actor/medium_ref_delta/std": raw_medium_ref_delta.std(unbiased=False).item(),
+            "actor/importance/mean": expected_importance.mean().item(),
+            "actor/importance/std": expected_importance.std(unbiased=False).item(),
+            "actor/actor_medium_delta_medium_ref_delta/pearson_corr": pearson_correlation(
+                raw_actor_medium_delta, raw_medium_ref_delta
+            ),
+            "actor/actor_medium_delta_medium_ref_delta/same_sign_ratio": (
+                (raw_actor_medium_delta * raw_medium_ref_delta) > 0
+            )
+            .float()
+            .mean()
+            .item(),
+            "actor/importance_normalized_entropy/pearson_corr": pearson_correlation(
+                expected_importance, normalized_entropy
+            ),
+            "actor/w_importance/pearson_corr": pearson_correlation(expected_w, expected_importance),
+            "actor/w_normalized_entropy/pearson_corr": pearson_correlation(expected_w, normalized_entropy),
+        }
+    )
+
+
+def test_compute_my_outcome_advantage_constant_inputs_have_finite_correlations():
+    response_mask = torch.ones(2, 2)
+    zeros = torch.zeros_like(response_mask)
+
+    _, _, w, metrics = compute_my_outcome_advantage(
+        token_level_rewards=zeros,
+        response_mask=response_mask,
+        index=np.array(["group", "group"]),
+        old_log_prob=zeros,
+        ref_log_prob=zeros,
+        medium_log_prob=zeros,
+        entropy=torch.ones_like(response_mask),
+    )
+
+    torch.testing.assert_close(w, torch.ones_like(w))
+    correlation_metrics = {key: value for key, value in metrics.items() if key.endswith("/pearson_corr")}
+    assert correlation_metrics
+    assert all(value == 0.0 for value in correlation_metrics.values())
+    assert metrics["actor/actor_medium_delta_medium_ref_delta/same_sign_ratio"] == 0.0
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:

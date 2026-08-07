@@ -58,7 +58,7 @@ class DataParallelPPOActor(BasePPOActor):
         config (ActorConfig): Actor config
         actor_module (nn.Module): Actor or ref module
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
-        answer_teacher_module (nn.Module, optional): Independent FSDP teacher used for answer scoring.
+        medium_policy_module (nn.Module, optional): Independent FSDP EMA policy used for medium scoring.
     """
 
     def __init__(
@@ -66,13 +66,13 @@ class DataParallelPPOActor(BasePPOActor):
         config: ActorConfig,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
-        answer_teacher_module: nn.Module | None = None,
+        medium_policy_module: nn.Module | None = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
-        self.answer_teacher_module = answer_teacher_module
+        self.medium_policy_module = medium_policy_module
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -123,21 +123,22 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
-        self.answer_log_prob_ema_alpha = float(self.config.get("answer_log_prob_ema_alpha", 1.0))
-        if not 0.0 <= self.answer_log_prob_ema_alpha <= 1.0:
+        self.medium_ema_alpha = float(self.config.get("medium_ema_alpha", 1.0))
+        self.save_medium_policy_checkpoint = bool(self.config.get("save_medium_policy_checkpoint", True))
+        if not 0.0 <= self.medium_ema_alpha <= 1.0:
             raise ValueError(
-                "answer_log_prob_ema_alpha must be in [0, 1], "
-                f"got {self.answer_log_prob_ema_alpha}."
+                "medium_ema_alpha must be in [0, 1], "
+                f"got {self.medium_ema_alpha}."
             )
         if (
             self.actor_optimizer is not None
-            and self.answer_log_prob_ema_alpha < 1.0
-            and self.answer_teacher_module is None
+            and self.medium_ema_alpha < 1.0
+            and self.medium_policy_module is None
         ):
-            raise ValueError("An independent answer_teacher_module is required when answer_log_prob_ema_alpha < 1.")
-        if self.answer_teacher_module is not None:
-            self.answer_teacher_module.eval()
-            self._copy_actor_to_answer_teacher()
+            raise ValueError("An independent medium_policy_module is required when medium_ema_alpha < 1.")
+        if self.medium_policy_module is not None:
+            self.medium_policy_module.eval()
+            self._copy_actor_to_medium_policy()
 
         self._delimiter_token_id_cache = {}
 
@@ -155,118 +156,127 @@ class DataParallelPPOActor(BasePPOActor):
         target_tensors: dict[str, torch.Tensor],
     ) -> None:
         if source_tensors.keys() != target_tensors.keys():
-            raise RuntimeError("Actor and answer teacher tensor names do not match.")
+            raise RuntimeError("Actor and medium-policy tensor names do not match.")
         for name, source_tensor in source_tensors.items():
             source_local_tensor = self._local_tensor(source_tensor).detach()
             target_local_tensor = self._local_tensor(target_tensors[name])
             if source_local_tensor.shape != target_local_tensor.shape:
                 raise RuntimeError(
                     f"Actor tensor {name!r} has shape {source_local_tensor.shape}, "
-                    f"but the answer teacher shard has shape {target_local_tensor.shape}."
+                    f"but the medium-policy shard has shape {target_local_tensor.shape}."
                 )
             target_local_tensor.copy_(
                 source_local_tensor.to(device=target_local_tensor.device, dtype=target_local_tensor.dtype)
             )
 
     @torch.no_grad()
-    def _copy_actor_to_answer_teacher(self) -> None:
-        """Reset the independent teacher to exactly match the online actor."""
-        if self.answer_teacher_module is None:
+    def _copy_actor_to_medium_policy(self) -> None:
+        """Reset the independent medium policy to exactly match the online actor."""
+        if self.medium_policy_module is None:
             return
         self._copy_named_tensors(
             dict(self.actor_module.named_parameters()),
-            dict(self.answer_teacher_module.named_parameters()),
+            dict(self.medium_policy_module.named_parameters()),
         )
         self._copy_named_tensors(
             dict(self.actor_module.named_buffers()),
-            dict(self.answer_teacher_module.named_buffers()),
+            dict(self.medium_policy_module.named_buffers()),
         )
 
     @torch.no_grad()
-    def update_answer_teacher(self) -> None:
-        """Apply ``teacher <- (1 - alpha) * teacher + alpha * actor`` once."""
-        if self.answer_teacher_module is None:
+    def update_medium_policy(self) -> None:
+        """Apply ``medium <- (1 - alpha) * medium + alpha * actor`` once."""
+        if self.medium_policy_module is None:
             return
 
-        alpha = self.answer_log_prob_ema_alpha
+        alpha = self.medium_ema_alpha
         if alpha == 0.0:
             return
         actor_parameters = dict(self.actor_module.named_parameters())
-        teacher_parameters = dict(self.answer_teacher_module.named_parameters())
-        if actor_parameters.keys() != teacher_parameters.keys():
-            raise RuntimeError("Actor and answer teacher parameter names do not match.")
+        medium_parameters = dict(self.medium_policy_module.named_parameters())
+        if actor_parameters.keys() != medium_parameters.keys():
+            raise RuntimeError("Actor and medium-policy parameter names do not match.")
 
         for name, actor_parameter in actor_parameters.items():
             if not actor_parameter.requires_grad:
                 continue
             actor_local_parameter = self._local_tensor(actor_parameter).detach()
-            teacher_local_parameter = self._local_tensor(teacher_parameters[name])
+            medium_local_parameter = self._local_tensor(medium_parameters[name])
             actor_local_parameter = actor_local_parameter.to(
-                device=teacher_local_parameter.device,
-                dtype=teacher_local_parameter.dtype,
+                device=medium_local_parameter.device,
+                dtype=medium_local_parameter.dtype,
             )
-            if teacher_local_parameter.is_floating_point() or teacher_local_parameter.is_complex():
-                teacher_local_parameter.lerp_(actor_local_parameter, alpha)
+            if medium_local_parameter.is_floating_point() or medium_local_parameter.is_complex():
+                medium_local_parameter.lerp_(actor_local_parameter, alpha)
             else:
-                teacher_local_parameter.copy_(actor_local_parameter)
+                medium_local_parameter.copy_(actor_local_parameter)
 
         # Buffers are not part of theta, but copying them keeps model-specific
         # inference state (for example QAT observers) coherent with the actor.
         self._copy_named_tensors(
             dict(self.actor_module.named_buffers()),
-            dict(self.answer_teacher_module.named_buffers()),
+            dict(self.medium_policy_module.named_buffers()),
         )
 
-    def answer_teacher_state_dict(self) -> dict | None:
-        """Return the rank-local EMA teacher state for checkpointing."""
-        if self.answer_teacher_module is None:
+    def medium_policy_state_dict(self, include_buffers: bool = True) -> dict | None:
+        """Return the rank-local EMA medium-policy state for checkpointing.
+
+        Buffers always track the online actor and are therefore optional: after
+        the actor checkpoint has been restored, ``load_medium_policy_state_dict``
+        can reconstruct them from that actor.  Omitting them is useful when one
+        parameter shard is shared by several HSDP/DDP replica ranks whose
+        runtime buffers are not necessarily identical.
+        """
+        if self.medium_policy_module is None:
             return None
-        return {
-            "ema_alpha": self.answer_log_prob_ema_alpha,
+        state_dict = {
+            "ema_alpha": self.medium_ema_alpha,
             "parameters": {
                 name: self._local_tensor(parameter).detach().cpu()
-                for name, parameter in self.answer_teacher_module.named_parameters()
-            },
-            "buffers": {
-                name: self._local_tensor(buffer).detach().cpu()
-                for name, buffer in self.answer_teacher_module.named_buffers()
+                for name, parameter in self.medium_policy_module.named_parameters()
             },
         }
+        if include_buffers:
+            state_dict["buffers"] = {
+                name: self._local_tensor(buffer).detach().cpu()
+                for name, buffer in self.medium_policy_module.named_buffers()
+            }
+        return state_dict
 
     @property
-    def has_answer_teacher(self) -> bool:
-        return self.answer_teacher_module is not None
+    def has_medium_policy(self) -> bool:
+        return self.medium_policy_module is not None
 
     @torch.no_grad()
-    def load_answer_teacher_state_dict(self, state_dict: dict | None) -> None:
-        """Restore the rank-local EMA teacher, or reset it from the actor for old checkpoints."""
-        if self.answer_teacher_module is None:
+    def load_medium_policy_state_dict(self, state_dict: dict | None) -> None:
+        """Restore the rank-local EMA medium policy, or reset it from the actor for old checkpoints."""
+        if self.medium_policy_module is None:
             return
         if state_dict is None:
-            self._copy_actor_to_answer_teacher()
+            self._copy_actor_to_medium_policy()
             return
 
         saved_parameters = state_dict.get("parameters", state_dict)
-        teacher_parameters = dict(self.answer_teacher_module.named_parameters())
-        if saved_parameters.keys() != teacher_parameters.keys():
-            raise RuntimeError("EMA teacher checkpoint parameters do not match the actor parameters.")
+        medium_parameters = dict(self.medium_policy_module.named_parameters())
+        if saved_parameters.keys() != medium_parameters.keys():
+            raise RuntimeError("EMA medium-policy checkpoint parameters do not match the actor parameters.")
         for name, saved_parameter in saved_parameters.items():
-            teacher_parameter = self._local_tensor(teacher_parameters[name])
-            if saved_parameter.shape != teacher_parameter.shape:
+            medium_parameter = self._local_tensor(medium_parameters[name])
+            if saved_parameter.shape != medium_parameter.shape:
                 raise RuntimeError(
-                    f"EMA teacher checkpoint parameter {name!r} has shape {saved_parameter.shape}, "
-                    f"but the actor shard has shape {teacher_parameter.shape}."
+                    f"EMA medium-policy checkpoint parameter {name!r} has shape {saved_parameter.shape}, "
+                    f"but the actor shard has shape {medium_parameter.shape}."
                 )
-            teacher_parameter.copy_(saved_parameter.to(dtype=teacher_parameter.dtype, device=teacher_parameter.device))
+            medium_parameter.copy_(saved_parameter.to(dtype=medium_parameter.dtype, device=medium_parameter.device))
 
         saved_buffers = state_dict.get("buffers")
         if saved_buffers is None:
             self._copy_named_tensors(
                 dict(self.actor_module.named_buffers()),
-                dict(self.answer_teacher_module.named_buffers()),
+                dict(self.medium_policy_module.named_buffers()),
             )
         else:
-            self._copy_named_tensors(saved_buffers, dict(self.answer_teacher_module.named_buffers()))
+            self._copy_named_tensors(saved_buffers, dict(self.medium_policy_module.named_buffers()))
 
     def _reshard_model_after_forward(self, model: nn.Module) -> None:
         if not torch.distributed.is_initialized():
@@ -280,14 +290,14 @@ class DataParallelPPOActor(BasePPOActor):
             model.reshard()
 
     @contextmanager
-    def _use_answer_teacher(self):
-        """Temporarily run forwards with the EMA teacher, restoring the actor afterwards."""
-        if self.answer_teacher_module is None:
+    def _use_medium_policy(self):
+        """Temporarily run forwards with the EMA medium policy, restoring the actor afterwards."""
+        if self.medium_policy_module is None:
             yield
             return
 
         actor_module = self.actor_module
-        self.actor_module = self.answer_teacher_module
+        self.actor_module = self.medium_policy_module
         self.actor_module.eval()
         try:
             yield
@@ -1615,7 +1625,7 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             micro_batch_indices = range(rank, padded_micro_batch_count, world_size)
 
-        with self._use_answer_teacher():
+        with self._use_medium_policy():
             for micro_batch_idx in micro_batch_indices:
                 is_dummy_micro_batch = (not replicated_compute) and micro_batch_idx >= global_micro_batch_count
                 micro_batch = dummy_micro_batch if is_dummy_micro_batch else micro_batches[micro_batch_idx]
@@ -1906,5 +1916,5 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
-        self.update_answer_teacher()
+        self.update_medium_policy()
         return metrics

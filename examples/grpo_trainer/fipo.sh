@@ -12,7 +12,6 @@ group_size=8
 bs_per_gpu=$((mini_batch_size/num_gpus))
 
 loss_mode=my
-gamma=${GAMMA:-0.99}
 tau=${TAU:-0.5}
 decay_rate=32.0
 chunk_size=128
@@ -47,7 +46,6 @@ ray job submit --address="http://127.0.0.1:8265" \
         actor_rollout_ref.actor.entropy_coeff=0 \
         actor_rollout_ref.actor.calculate_entropy=True \
         actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
-        actor_rollout_ref.actor.policy_loss.gamma=${gamma} \
         actor_rollout_ref.actor.policy_loss.tau=${tau} \
         +actor_rollout_ref.actor.policy_loss.decay_rate=${decay_rate} \
         +actor_rollout_ref.actor.policy_loss.chunk_size=${chunk_size} \

@@ -201,19 +201,20 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator in (AdvantageEstimator.MY, AdvantageEstimator.MY.value):
-        required_batch_keys = ("old_log_probs", "ref_log_prob", "entropys")
+        required_batch_keys = ("old_log_probs", "ref_log_prob", "medium_log_prob", "entropys")
         missing_batch_keys = [key for key in required_batch_keys if key not in data.batch]
         if missing_batch_keys:
             raise ValueError(f"my advantage requires data.batch keys {missing_batch_keys}")
         if "uid" not in data.non_tensor_batch:
             raise ValueError("my advantage requires data.non_tensor_batch['uid']")
 
-        advantages, returns, w = core_algos.compute_my_outcome_advantage(
+        advantages, returns, w, advantage_metrics = core_algos.compute_my_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
             old_log_prob=data.batch["old_log_probs"],
             ref_log_prob=data.batch["ref_log_prob"],
+            medium_log_prob=data.batch["medium_log_prob"],
             entropy=data.batch["entropys"],
             tau=0.5 if config is None else float(config.get("tau", 0.5)),
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
@@ -224,6 +225,7 @@ def compute_advantage(
 
         valid_w = w[data.batch["response_mask"].bool()]
         data.meta_info["my_advantage_metrics"] = {
+            **advantage_metrics,
             "actor/w/max": valid_w.max().detach().item(),
             "actor/w/min": valid_w.min().detach().item(),
             "actor/w/std": valid_w.std().detach().item(),
@@ -1274,6 +1276,11 @@ class RayPPOTrainer:
             raise NotImplementedError("compute_answer_log_prob is not implemented for the new worker API yet.")
         return self.actor_rollout_wg.compute_answer_log_prob(batch)
 
+    def _compute_medium_log_prob(self, batch: DataProto) -> DataProto:
+        if self.use_legacy_worker_impl == "disable":
+            raise NotImplementedError("EMA medium log-probability is not implemented for the new worker API yet.")
+        return self.actor_rollout_wg.compute_medium_log_prob(batch)
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1630,6 +1637,14 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                    if self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.MY,
+                        AdvantageEstimator.MY.value,
+                    ):
+                        with marked_timer("medium_log_prob", timing_raw, color="blue"):
+                            medium_log_prob = self._compute_medium_log_prob(batch)
+                            batch = batch.union(medium_log_prob)
 
                     if self.config.algorithm.adv_estimator in (
                         AdvantageEstimator.V_INFO,

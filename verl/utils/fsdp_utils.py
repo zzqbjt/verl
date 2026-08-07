@@ -572,6 +572,47 @@ def get_shard_placement_fn(fsdp_size):
     return shard_placement_fn
 
 
+def get_fsdp_checkpoint_shard_info(device_mesh: DeviceMesh, global_rank: int) -> tuple[int, int, int]:
+    """Return the non-redundant checkpoint shard coordinates for one rank.
+
+    A 2-D HSDP mesh contains replicas of the same FSDP shards.  For example,
+    ``[[0, 1], [2, 3]]`` has two unique FSDP shards even though four ranks are
+    participating.  In that case ranks 0/2 map to checkpoint shard 0, ranks
+    1/3 map to checkpoint shard 1, and only the first replica (ranks 0/1)
+    needs to write files.
+
+    Returns:
+        ``(fsdp_size, shard_rank, writer_rank)``.  ``writer_rank`` is the
+        global rank in the first replica group that owns ``shard_rank``.
+    """
+    mesh = device_mesh.mesh.detach().cpu()
+    mesh_dim_names = tuple(device_mesh.mesh_dim_names or ())
+    if "fsdp" in mesh_dim_names:
+        fsdp_axis = mesh_dim_names.index("fsdp")
+    elif mesh.ndim == 1:
+        fsdp_axis = 0
+    else:
+        raise ValueError(
+            "Cannot identify the FSDP dimension of device mesh "
+            f"shape={tuple(mesh.shape)}, dim_names={mesh_dim_names}."
+        )
+
+    coordinates = (mesh == global_rank).nonzero(as_tuple=False)
+    if coordinates.shape != (1, mesh.ndim):
+        raise ValueError(
+            f"Global rank {global_rank} must occur exactly once in device mesh, "
+            f"but found {coordinates.shape[0]} occurrences."
+        )
+    coordinate = coordinates[0].tolist()
+    shard_rank = int(coordinate[fsdp_axis])
+
+    writer_coordinate = [0] * mesh.ndim
+    writer_coordinate[fsdp_axis] = shard_rank
+    writer_rank = int(mesh[tuple(writer_coordinate)].item())
+    fsdp_size = int(mesh.shape[fsdp_axis])
+    return fsdp_size, shard_rank, writer_rank
+
+
 def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):
     """torch.nn.utils.clip_grad_norm_ cann't run on cpu parameter DTensor"""
     from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
