@@ -526,13 +526,18 @@ def test_compute_policy_loss_my_reports_delta_and_pearson_metrics():
     )
 
 
-def test_compute_my_outcome_advantage_returns_token_weights():
-    response_mask = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
-    token_level_rewards = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
-    old_log_prob = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+def test_compute_my_outcome_advantage_returns_shared_step_weights():
+    response_mask = torch.ones(2, 8)
+    token_level_rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0] * 8])
+    actor_medium_token_delta = torch.tensor(
+        [[0.0, 1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 9.0], [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]]
+    )
+    medium_log_prob = torch.tensor(
+        [[1.0, 2.0, 4.0, 4.0, 6.0, 8.0, 10.0, 12.0], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0]]
+    )
+    old_log_prob = medium_log_prob + actor_medium_token_delta
     ref_log_prob = torch.zeros_like(old_log_prob)
-    medium_log_prob = torch.tensor([[0.5, 1.5], [1.0, 3.5]])
-    entropy = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+    entropy = torch.tensor([[0.0, 9.0, 0.0, 8.0, 0.0, 7.0, 0.0, 0.0], [0.0, 0.0, 6.0, 0.0, 5.0, 0.0, 4.0, 0.0]])
 
     advantages, returns, w, metrics = compute_my_outcome_advantage(
         token_level_rewards=token_level_rewards,
@@ -542,27 +547,34 @@ def test_compute_my_outcome_advantage_returns_token_weights():
         ref_log_prob=ref_log_prob,
         medium_log_prob=medium_log_prob,
         entropy=entropy,
+        d=2.0,
+        d_min=1,
     )
 
     assert advantages.shape == returns.shape == w.shape == response_mask.shape
     assert torch.equal(advantages, returns)
     assert torch.isfinite(w[response_mask.bool()]).all()
-    assert w[response_mask.bool()].max() > w[response_mask.bool()].min()
-
-    raw_actor_medium_delta = old_log_prob - medium_log_prob
+    step_ids = torch.tensor([[0, 1, 1, 2, 2, 3, 3, 3], [4, 4, 5, 5, 6, 6, 7, 7]])
+    raw_actor_medium_delta = torch.tensor([0.0, 2.0, 3.0, 7.0, 3.0, 7.0, 11.0, 15.0])
+    raw_medium_ref_delta = torch.tensor([1.0, 3.0, 5.0, 10.0, 1.0, 5.0, 9.0, 13.0])
     actor_medium_delta = (raw_actor_medium_delta - raw_actor_medium_delta.mean()) / (
         raw_actor_medium_delta.std() + 1e-6
     )
-    raw_medium_ref_delta = medium_log_prob - ref_log_prob
     medium_ref_delta = (raw_medium_ref_delta - raw_medium_ref_delta.mean()) / (
         raw_medium_ref_delta.std() + 1e-6
     )
     expected_importance = (torch.tanh(actor_medium_delta) + torch.tanh(medium_ref_delta)) / 2.0
-    normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
-    expected_w = torch.softmax(expected_importance * normalized_entropy / 0.5, dim=-1) * response_mask.sum(
-        dim=-1, keepdim=True
+    expected_step_w = torch.cat(
+        (
+            torch.softmax(expected_importance[:4] / 0.5, dim=0) * 4,
+            torch.softmax(expected_importance[4:] / 0.5, dim=0) * 4,
+        )
     )
+    expected_w = expected_step_w[step_ids]
     torch.testing.assert_close(w, expected_w)
+    assert w[0, 1] == w[0, 2]
+    assert w[0, 5] == w[0, 6] == w[0, 7]
+    assert w[1, 0] == w[1, 1]
 
     def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
         return torch.corrcoef(torch.stack((x.flatten(), y.flatten())))[0, 1].item()
@@ -584,11 +596,10 @@ def test_compute_my_outcome_advantage_returns_token_weights():
             .float()
             .mean()
             .item(),
-            "actor/importance_normalized_entropy/pearson_corr": pearson_correlation(
-                expected_importance, normalized_entropy
-            ),
-            "actor/w_importance/pearson_corr": pearson_correlation(expected_w, expected_importance),
-            "actor/w_normalized_entropy/pearson_corr": pearson_correlation(expected_w, normalized_entropy),
+            "actor/w/max": expected_step_w.max().item(),
+            "actor/w/min": expected_step_w.min().item(),
+            "actor/w/std": expected_step_w.std(unbiased=False).item(),
+            "actor/entropy_local_maxima_count/mean": 3.0,
         }
     )
 
@@ -612,6 +623,56 @@ def test_compute_my_outcome_advantage_constant_inputs_have_finite_correlations()
     assert correlation_metrics
     assert all(value == 0.0 for value in correlation_metrics.values())
     assert metrics["actor/actor_medium_delta_medium_ref_delta/same_sign_ratio"] == 0.0
+    assert metrics["actor/w/std"] == 0.0
+    assert metrics["actor/entropy_local_maxima_count/mean"] == 0.0
+
+
+def test_compute_my_outcome_advantage_suppresses_nearby_entropy_peaks():
+    response_mask = torch.ones(2, 10)
+    zeros = torch.zeros_like(response_mask)
+    medium_log_prob = torch.zeros_like(response_mask)
+    old_log_prob = torch.arange(10, dtype=torch.float32).repeat(2, 1)
+    entropy = torch.tensor([[0.0, 9.0, 0.0, 8.0, 0.0, 7.0, 0.0, 6.0, 0.0, 0.0]]).repeat(2, 1)
+
+    _, _, w, metrics = compute_my_outcome_advantage(
+        token_level_rewards=zeros,
+        response_mask=response_mask,
+        index=np.array(["group", "group"]),
+        old_log_prob=old_log_prob,
+        ref_log_prob=zeros,
+        medium_log_prob=medium_log_prob,
+        entropy=entropy,
+        d=2.0,
+        d_min=2,
+    )
+
+    # The target is four cuts, but greedy suppression keeps only peaks 1 and 5.
+    torch.testing.assert_close(w[:, :1], w[:, :1].expand(-1, 1))
+    torch.testing.assert_close(w[:, 1:5], w[:, 1:2].expand(-1, 4))
+    torch.testing.assert_close(w[:, 5:], w[:, 5:6].expand(-1, 5))
+    assert metrics["actor/entropy_local_maxima_count/mean"] == 4.0
+
+
+def test_compute_my_outcome_advantage_ignores_padding_when_splitting_steps():
+    response_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0]]).repeat(2, 1)
+    zeros = torch.zeros_like(response_mask)
+    old_log_prob = torch.arange(6, dtype=torch.float32).repeat(2, 1)
+    entropy = torch.tensor([[0.0, 4.0, 0.0, 0.0, 100.0, 200.0]]).repeat(2, 1)
+
+    _, _, w, _ = compute_my_outcome_advantage(
+        token_level_rewards=zeros,
+        response_mask=response_mask,
+        index=np.array(["group", "group"]),
+        old_log_prob=old_log_prob,
+        ref_log_prob=zeros,
+        medium_log_prob=zeros,
+        entropy=entropy,
+        d=2.0,
+        d_min=0,
+    )
+
+    assert torch.count_nonzero(w[:, 4:]) == 0
+    torch.testing.assert_close(w[:, 1:4], w[:, 1:2].expand(-1, 3))
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:

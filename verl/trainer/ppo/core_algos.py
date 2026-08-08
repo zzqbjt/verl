@@ -527,29 +527,36 @@ def compute_my_outcome_advantage(
     medium_log_prob: torch.Tensor,
     entropy: torch.Tensor,
     tau: float = 0.5,
+    d: float = 128.0,
+    d_min: int = 8,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
-    """Compute entropy-weighted GRPO outcome advantages.
+    """Compute step-weighted GRPO outcome advantages.
 
-    The outcome advantage is computed in the same way as GRPO. The
-    actor-to-medium and medium-to-reference log-probability deltas are z-score
-    normalized separately over all valid tokens in a prompt group. Their
-    tanh values are averaged before entropy weighting.
+    Entropy-local maxima split every response into steps. A split point starts
+    a new step, and ``k = max(round(response_length / d) - 1, 0)`` is the
+    target number of split points. Candidate maxima are considered from high
+    to low entropy, with candidates within ``d_min`` tokens of an accepted
+    point suppressed. If too few candidates remain, the response has fewer
+    than ``k`` split points.
 
-    For every valid token, the unnormalized weight is
-    ``I * normalized_entropy / tau``. A response-level softmax then keeps
-    the average valid-token weight equal to one before it is applied to the
-    GRPO advantage. Diagnostics contain global valid-token statistics for
-    both deltas before normalization and for ``I`` after normalization, plus
-    the raw-delta Pearson correlation and same-sign ratio, and correlations
-    among importance, entropy, and final weights.
+    Actor-to-medium and medium-to-reference log-probability deltas are first
+    averaged within every step and then z-score normalized separately over all
+    steps in a prompt group. Their tanh values are averaged into step
+    importance. A response-level softmax over steps keeps the average step
+    weight equal to one. Every token in a step receives that step's importance
+    and weight. Diagnostics likewise treat every step as one observation.
     """
     del config  # Kept for compatibility with the advantage-estimator interface.
 
     if tau <= 0.0:
         raise ValueError(f"my advantage tau must be positive, got {tau}")
+    if not np.isfinite(d) or d <= 0.0:
+        raise ValueError(f"my advantage d must be positive, got {d}")
+    if isinstance(d_min, bool) or not isinstance(d_min, int) or d_min < 0:
+        raise ValueError(f"my advantage d_min must be a non-negative integer, got {d_min}")
     if not (
         token_level_rewards.shape
         == response_mask.shape
@@ -586,21 +593,73 @@ def compute_my_outcome_advantage(
                 f"index length {group_index.numel()} does not match batch size {old_log_prob.shape[0]}"
             )
 
-        token_group_index = group_index.unsqueeze(-1).expand_as(old_log_prob)
+        step_ids = torch.full_like(response_mask, -1, dtype=torch.long)
+        step_counts_list: list[int] = []
+        entropy_local_maxima_counts: list[int] = []
+        next_step_id = 0
+        for response_idx in range(response_mask.shape[0]):
+            valid_positions = valid_mask[response_idx].nonzero(as_tuple=False).flatten()
+            response_entropy = entropy[response_idx, valid_positions]
+            response_length = valid_positions.numel()
+            target_num_splits = max(round(response_length / d) - 1, 0)
 
-        def normalize_delta_by_group(delta: torch.Tensor) -> torch.Tensor:
+            local_maxima_mask = torch.zeros(response_length, device=entropy.device, dtype=torch.bool)
+            if response_length >= 3:
+                local_maxima_mask[1:-1] = (response_entropy[1:-1] > response_entropy[:-2]) & (
+                    response_entropy[1:-1] > response_entropy[2:]
+                )
+            candidate_positions_tensor = local_maxima_mask.nonzero(as_tuple=False).flatten()
+            entropy_local_maxima_counts.append(candidate_positions_tensor.numel())
+            if target_num_splits > 0:
+                entropy_order = torch.argsort(
+                    response_entropy[candidate_positions_tensor], descending=True, stable=True
+                )
+                candidate_positions = candidate_positions_tensor[entropy_order].tolist()
+            else:
+                candidate_positions = []
+
+            split_positions: list[int] = []
+            for candidate_position in candidate_positions:
+                if all(abs(candidate_position - selected_position) > d_min for selected_position in split_positions):
+                    split_positions.append(candidate_position)
+                    if len(split_positions) == target_num_splits:
+                        break
+            split_positions.sort()
+
+            boundaries = [0, *split_positions, response_length]
+            num_steps = len(boundaries) - 1
+            step_counts_list.append(num_steps)
+            for step_idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
+                step_ids[response_idx, valid_positions[start:end]] = next_step_id + step_idx
+            next_step_id += num_steps
+
+        step_counts = torch.tensor(step_counts_list, device=response_mask.device, dtype=torch.long)
+        valid_step_ids = step_ids[valid_mask]
+        delta_step_ids = valid_step_ids.to(old_log_prob.device)
+        step_token_count = torch.bincount(delta_step_ids, minlength=next_step_id).float()
+        step_response_index = torch.repeat_interleave(
+            torch.arange(response_mask.shape[0], device=group_index.device), step_counts.to(group_index.device)
+        )
+        step_group_index = group_index[step_response_index]
+
+        def mean_delta_by_step(delta: torch.Tensor) -> torch.Tensor:
+            step_delta_sum = torch.zeros(next_step_id, device=delta.device, dtype=torch.float32)
+            step_delta_sum.index_add_(0, delta_step_ids, delta[valid_mask].float())
+            return step_delta_sum / step_token_count
+
+        def normalize_delta_by_group(step_delta: torch.Tensor) -> torch.Tensor:
             group_mean, group_std, _ = group_mean_std(
-                delta[valid_mask],
-                token_group_index[valid_mask],
+                step_delta,
+                step_group_index,
                 eps=epsilon,
-                device=delta.device,
+                device=step_delta.device,
             )
-            return (delta - group_mean[group_index].unsqueeze(-1).to(delta)) / (
-                group_std[group_index].unsqueeze(-1).to(delta) + epsilon
+            return (step_delta - group_mean[step_group_index].to(step_delta)) / (
+                group_std[step_group_index].to(step_delta) + epsilon
             )
 
         def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-            """Return a finite Pearson correlation for valid-token vectors."""
+            """Return a finite Pearson correlation for step-level vectors."""
             x = x.float()
             y = y.float()
             if x.numel() < 2:
@@ -613,16 +672,27 @@ def compute_my_outcome_advantage(
                 return 0.0
             return (x_centered * y_centered).sum().div(denominator).item()
 
-        actor_medium_delta = torch.exp(old_log_prob) - torch.exp(medium_log_prob)
-        medium_ref_delta = torch.exp(medium_log_prob) - torch.exp(ref_log_prob)
+        actor_medium_delta = mean_delta_by_step(old_log_prob - medium_log_prob)
+        medium_ref_delta = mean_delta_by_step(medium_log_prob - ref_log_prob)
 
-        # actor_medium_delta = normalize_delta_by_group(raw_actor_medium_delta)
-        # medium_ref_delta = normalize_delta_by_group(raw_medium_ref_delta)
-        importance = (torch.sigmoid(10.0 * actor_medium_delta) + torch.sigmoid(10.0 * medium_ref_delta)) / 2.0
+        actor_medium_delta_norm = normalize_delta_by_group(actor_medium_delta)
+        medium_ref_delta_norm = normalize_delta_by_group(medium_ref_delta)
+        step_importance = (torch.tanh(actor_medium_delta_norm) + torch.tanh(medium_ref_delta_norm)) / 2.0
 
-        valid_actor_medium_delta = actor_medium_delta[valid_mask].float()
-        valid_medium_ref_delta = medium_ref_delta[valid_mask].float()
-        valid_importance = importance[valid_mask].float()
+        step_w = torch.empty_like(step_importance)
+        step_offset = 0
+        for num_steps in step_counts_list:
+            step_slice = slice(step_offset, step_offset + num_steps)
+            step_w[step_slice] = torch.softmax(step_importance[step_slice] / tau, dim=0) * num_steps
+            step_offset += num_steps
+
+        w = torch.zeros_like(old_log_prob, dtype=step_w.dtype)
+        w[valid_mask] = step_w[valid_step_ids]
+
+        valid_actor_medium_delta = actor_medium_delta.float()
+        valid_medium_ref_delta = medium_ref_delta.float()
+        valid_importance = step_importance.float()
+        valid_w = step_w.float()
         diagnostics = {
             "actor/actor_medium_delta/mean": valid_actor_medium_delta.mean().item(),
             "actor/actor_medium_delta/std": valid_actor_medium_delta.std(unbiased=False).item(),
@@ -639,25 +709,12 @@ def compute_my_outcome_advantage(
             .float()
             .mean()
             .item(),
+            "actor/w/max": valid_w.max().item(),
+            "actor/w/min": valid_w.min().item(),
+            "actor/w/std": valid_w.std(unbiased=False).item(),
+            "actor/entropy_local_maxima_count/mean": sum(entropy_local_maxima_counts)
+            / len(entropy_local_maxima_counts),
         }
-
-        max_entropy = (entropy * response_mask).max(dim=-1, keepdim=True).values
-        normalized_entropy = entropy / max_entropy
-
-        w = (importance * normalized_entropy) / tau
-        w[~(response_mask.bool())] = -float("inf")
-        w = torch.softmax(w, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
-        valid_normalized_entropy = normalized_entropy[valid_mask]
-        valid_w = w[valid_mask]
-        diagnostics.update(
-            {
-                "actor/importance_normalized_entropy/pearson_corr": pearson_correlation(
-                    valid_importance, valid_normalized_entropy
-                ),
-                "actor/w_importance/pearson_corr": pearson_correlation(valid_w, valid_importance),
-                "actor/w_normalized_entropy/pearson_corr": pearson_correlation(valid_w, valid_normalized_entropy),
-            }
-        )
 
         advantages = advantages * w
 

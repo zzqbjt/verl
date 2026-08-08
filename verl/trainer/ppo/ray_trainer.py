@@ -208,7 +208,7 @@ def compute_advantage(
         if "uid" not in data.non_tensor_batch:
             raise ValueError("my advantage requires data.non_tensor_batch['uid']")
 
-        advantages, returns, w, advantage_metrics = core_algos.compute_my_outcome_advantage(
+        advantages, returns, _, advantage_metrics = core_algos.compute_my_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
@@ -217,19 +217,15 @@ def compute_advantage(
             medium_log_prob=data.batch["medium_log_prob"],
             entropy=data.batch["entropys"],
             tau=0.5 if config is None else float(config.get("tau", 0.5)),
+            d=128.0 if config is None else float(config.get("d", 128.0)),
+            d_min=8 if config is None else config.get("d_min", 8),
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
 
-        valid_w = w[data.batch["response_mask"].bool()]
-        data.meta_info["my_advantage_metrics"] = {
-            **advantage_metrics,
-            "actor/w/max": valid_w.max().detach().item(),
-            "actor/w/min": valid_w.min().detach().item(),
-            "actor/w/std": valid_w.std().detach().item(),
-        }
+        data.meta_info["my_advantage_metrics"] = advantage_metrics
     elif adv_estimator in (AdvantageEstimator.V_INFO, AdvantageEstimator.V_INFO.value):
         grpo_calculation_mask = data.batch["response_mask"]
         if "answer_log_prob" not in data.batch or "answer_step_end_mask" not in data.batch:
