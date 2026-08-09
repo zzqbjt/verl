@@ -529,6 +529,7 @@ def compute_my_outcome_advantage(
     tau: float = 0.5,
     d: float = 128.0,
     d_min: int = 8,
+    step_lambda: float = 0.0,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -546,8 +547,10 @@ def compute_my_outcome_advantage(
     averaged within every step and then z-score normalized separately over all
     steps in a prompt group. Their tanh values are averaged into step
     importance. A response-level softmax over steps keeps the average step
-    weight equal to one. Every token in a step receives that step's importance
-    and weight. Diagnostics likewise treat every step as one observation.
+    weight equal to one. Its token-level coefficient is then redistributed by
+    multiplying the first token in a step by ``1 + step_lambda`` and every
+    other token by ``1 - step_lambda / (step_length - 1)``. Diagnostics treat
+    every step as one observation.
     """
     del config  # Kept for compatibility with the advantage-estimator interface.
 
@@ -557,6 +560,8 @@ def compute_my_outcome_advantage(
         raise ValueError(f"my advantage d must be positive, got {d}")
     if isinstance(d_min, bool) or not isinstance(d_min, int) or d_min < 0:
         raise ValueError(f"my advantage d_min must be a non-negative integer, got {d_min}")
+    if not np.isfinite(step_lambda):
+        raise ValueError(f"my advantage step_lambda must be finite, got {step_lambda}")
     if not (
         token_level_rewards.shape
         == response_mask.shape
@@ -594,6 +599,7 @@ def compute_my_outcome_advantage(
             )
 
         step_ids = torch.full_like(response_mask, -1, dtype=torch.long)
+        step_first_token_mask = torch.zeros_like(valid_mask)
         step_counts_list: list[int] = []
         entropy_local_maxima_counts: list[int] = []
         next_step_id = 0
@@ -631,6 +637,7 @@ def compute_my_outcome_advantage(
             step_counts_list.append(num_steps)
             for step_idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
                 step_ids[response_idx, valid_positions[start:end]] = next_step_id + step_idx
+                step_first_token_mask[response_idx, valid_positions[start]] = True
             next_step_id += num_steps
 
         step_counts = torch.tensor(step_counts_list, device=response_mask.device, dtype=torch.long)
@@ -688,11 +695,20 @@ def compute_my_outcome_advantage(
 
         w = torch.zeros_like(old_log_prob, dtype=step_w.dtype)
         w[valid_mask] = step_w[valid_step_ids]
+        valid_step_lengths = step_token_count[delta_step_ids]
+        non_first_denominator = (valid_step_lengths - 1.0).clamp_min(1.0)
+        valid_c = torch.where(
+            step_first_token_mask[valid_mask],
+            torch.full_like(valid_step_lengths, 1.0 + step_lambda),
+            1.0 - step_lambda / non_first_denominator,
+        )
+        w[valid_mask] *= valid_c
+        final_step_w = mean_delta_by_step(w)
 
         valid_actor_medium_delta = actor_medium_delta.float()
         valid_medium_ref_delta = medium_ref_delta.float()
         valid_importance = step_importance.float()
-        valid_w = step_w.float()
+        valid_w = final_step_w.float()
         diagnostics = {
             "actor/actor_medium_delta/mean": valid_actor_medium_delta.mean().item(),
             "actor/actor_medium_delta/std": valid_actor_medium_delta.std(unbiased=False).item(),
@@ -2343,55 +2359,55 @@ def compute_policy_loss_my(
         if tau <= 0.0:
             raise ValueError(f"policy-loss tau must be positive, got {tau}")
         
-        delta_old = torch.exp(old_log_prob) - torch.exp(ref_log_prob)
-        delta_new = torch.exp(log_prob.detach()) - torch.exp(old_log_prob)
-        delta_old_mean = torch.sum(delta_old * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
-        delta_new_mean = torch.sum(delta_new * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
-        delta_old_std = torch.sqrt(torch.sum((delta_old - delta_old_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
-        delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
-        delta_old_norm = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
-        delta_new_norm = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
+        # delta_old = torch.exp(old_log_prob) - torch.exp(ref_log_prob)
+        # delta_new = torch.exp(log_prob.detach()) - torch.exp(old_log_prob)
+        # delta_old_mean = torch.sum(delta_old * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
+        # delta_new_mean = torch.sum(delta_new * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
+        # delta_old_std = torch.sqrt(torch.sum((delta_old - delta_old_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
+        # delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
+        # delta_old_norm = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
+        # delta_new_norm = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
 
-        # delta_old = (old_log_prob - ref_log_prob)
-        # delta_new = (log_prob.detach() - old_log_prob)
+        # # delta_old = (old_log_prob - ref_log_prob)
+        # # delta_new = (log_prob.detach() - old_log_prob)
 
-        I_old = torch.sigmoid(delta_old_norm)
-        I_new = torch.sigmoid(delta_new_norm)
-        I_old_high_ratio = ((I_old >= 0.95) * response_mask).sum() / response_mask.sum()
-        I_new_high_ratio = ((I_new >= 0.95) * response_mask).sum() / response_mask.sum()
-        I_old_low_ratio = ((I_old <= 0.05) * response_mask).sum() / response_mask.sum()
-        I_new_low_ratio = ((I_new <= 0.05) * response_mask).sum() / response_mask.sum()
+        # I_old = torch.sigmoid(delta_old_norm)
+        # I_new = torch.sigmoid(delta_new_norm)
+        # I_old_high_ratio = ((I_old >= 0.95) * response_mask).sum() / response_mask.sum()
+        # I_new_high_ratio = ((I_new >= 0.95) * response_mask).sum() / response_mask.sum()
+        # I_old_low_ratio = ((I_old <= 0.05) * response_mask).sum() / response_mask.sum()
+        # I_new_low_ratio = ((I_new <= 0.05) * response_mask).sum() / response_mask.sum()
         
+        # coeff = (I_old + I_new) / 2.0
         normalized_entropy = entropy / (entropy * response_mask).max(dim=-1, keepdim=True)[0]
-        coeff = (I_old + I_new) / 2.0
-        w = (coeff * normalized_entropy) / tau
+        w = (normalized_entropy) / tau
         w[~(response_mask.bool())] = -float("inf")
         w = torch.softmax(w, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
 
-        valid_mask = response_mask.bool()
-        valid_delta_old = delta_old[valid_mask].float()
-        valid_delta_new = delta_new[valid_mask].float()
-        valid_w = w[valid_mask].float()
-        valid_coeff = coeff[valid_mask].float()
-        valid_normalized_entropy = normalized_entropy[valid_mask].float()
+        # valid_mask = response_mask.bool()
+        # valid_delta_old = delta_old[valid_mask].float()
+        # valid_delta_new = delta_new[valid_mask].float()
+        # valid_w = w[valid_mask].float()
+        # valid_coeff = coeff[valid_mask].float()
+        # valid_normalized_entropy = normalized_entropy[valid_mask].float()
 
-        def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-            """Return a finite Pearson correlation for valid-token vectors."""
-            if x.numel() < 2:
-                return 0.0
+        # def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
+        #     """Return a finite Pearson correlation for valid-token vectors."""
+        #     if x.numel() < 2:
+        #         return 0.0
 
-            x_centered = x - x.mean()
-            y_centered = y - y.mean()
-            denominator = torch.sqrt(x_centered.square().sum() * y_centered.square().sum())
-            if denominator.item() <= torch.finfo(x.dtype).eps:
-                return 0.0
-            return (x_centered * y_centered).sum().div(denominator).item()
+        #     x_centered = x - x.mean()
+        #     y_centered = y - y.mean()
+        #     denominator = torch.sqrt(x_centered.square().sum() * y_centered.square().sum())
+        #     if denominator.item() <= torch.finfo(x.dtype).eps:
+        #         return 0.0
+        #     return (x_centered * y_centered).sum().div(denominator).item()
 
-        delta_old_delta_new_same_sign_ratio = (
-            ((valid_delta_old * valid_delta_new) > 0).float().mean().item()
-        )
-        w_coeff_pearson_corr = pearson_correlation(valid_w, valid_coeff)
-        w_normalized_entropy_pearson_corr = pearson_correlation(valid_w, valid_normalized_entropy)
+        # delta_old_delta_new_same_sign_ratio = (
+        #     ((valid_delta_old * valid_delta_new) > 0).float().mean().item()
+        # )
+        # w_coeff_pearson_corr = pearson_correlation(valid_w, valid_coeff)
+        # w_normalized_entropy_pearson_corr = pearson_correlation(valid_w, valid_normalized_entropy)
         
         advantages = w * advantages
     
@@ -2431,19 +2447,19 @@ def compute_policy_loss_my(
         "actor/w/max": w[response_mask.bool()].max().detach().item(),
         "actor/w/min": w[response_mask.bool()].min().detach().item(),
         "actor/w/std": w[response_mask.bool()].std().detach().item(),
-        "actor/delta_old/mean": valid_delta_old.mean().item(),
-        "actor/delta_old/std": valid_delta_old.std(unbiased=False).item(),
-        "actor/delta_new/mean": valid_delta_new.mean().item(),
-        "actor/delta_new/std": valid_delta_new.std(unbiased=False).item(),
-        "actor/delta_old_delta_new/same_sign_ratio": delta_old_delta_new_same_sign_ratio,
-        "actor/w_coeff/pearson_corr": w_coeff_pearson_corr,
-        "actor/w_normalized_entropy/pearson_corr": w_normalized_entropy_pearson_corr,
-        "actor/I_old/std": I_old[response_mask.bool()].std().detach().item(),
-        "actor/I_new/std": I_new[response_mask.bool()].std().detach().item(),
-        "actor/I_old/high_ratio": I_old_high_ratio.detach().item(),
-        "actor/I_new/high_ratio": I_new_high_ratio.detach().item(),
-        "actor/I_old/low_ratio": I_old_low_ratio.detach().item(),
-        "actor/I_new/low_ratio": I_new_low_ratio.detach().item(),
+        # "actor/delta_old/mean": valid_delta_old.mean().item(),
+        # "actor/delta_old/std": valid_delta_old.std(unbiased=False).item(),
+        # "actor/delta_new/mean": valid_delta_new.mean().item(),
+        # "actor/delta_new/std": valid_delta_new.std(unbiased=False).item(),
+        # "actor/delta_old_delta_new/same_sign_ratio": delta_old_delta_new_same_sign_ratio,
+        # "actor/w_coeff/pearson_corr": w_coeff_pearson_corr,
+        # "actor/w_normalized_entropy/pearson_corr": w_normalized_entropy_pearson_corr,
+        # "actor/I_old/std": I_old[response_mask.bool()].std().detach().item(),
+        # "actor/I_new/std": I_new[response_mask.bool()].std().detach().item(),
+        # "actor/I_old/high_ratio": I_old_high_ratio.detach().item(),
+        # "actor/I_new/high_ratio": I_new_high_ratio.detach().item(),
+        # "actor/I_old/low_ratio": I_old_low_ratio.detach().item(),
+        # "actor/I_new/low_ratio": I_new_low_ratio.detach().item(),
         "actor/normalized_entropy/mean": normalized_entropy[response_mask.bool()].mean().detach().item(),
     }
     return pg_loss, pg_metrics

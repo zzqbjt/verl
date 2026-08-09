@@ -526,7 +526,7 @@ def test_compute_policy_loss_my_reports_delta_and_pearson_metrics():
     )
 
 
-def test_compute_my_outcome_advantage_returns_shared_step_weights():
+def test_compute_my_outcome_advantage_returns_step_weighted_token_coefficients():
     response_mask = torch.ones(2, 8)
     token_level_rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0] * 8])
     actor_medium_token_delta = torch.tensor(
@@ -549,6 +549,7 @@ def test_compute_my_outcome_advantage_returns_shared_step_weights():
         entropy=entropy,
         d=2.0,
         d_min=1,
+        step_lambda=0.6,
     )
 
     assert advantages.shape == returns.shape == w.shape == response_mask.shape
@@ -570,11 +571,17 @@ def test_compute_my_outcome_advantage_returns_shared_step_weights():
             torch.softmax(expected_importance[4:] / 0.5, dim=0) * 4,
         )
     )
-    expected_w = expected_step_w[step_ids]
+    expected_c = torch.tensor(
+        [[1.6, 1.6, 0.4, 1.6, 0.4, 1.6, 0.7, 0.7], [1.6, 0.4, 1.6, 0.4, 1.6, 0.4, 1.6, 0.4]]
+    )
+    expected_w = expected_step_w[step_ids] * expected_c
     torch.testing.assert_close(w, expected_w)
-    assert w[0, 1] == w[0, 2]
-    assert w[0, 5] == w[0, 6] == w[0, 7]
-    assert w[1, 0] == w[1, 1]
+    assert w[0, 1] / w[0, 2] == pytest.approx(4.0)
+    assert w[0, 5] / w[0, 6] == pytest.approx(1.6 / 0.7)
+
+    expected_final_step_w = torch.zeros_like(expected_step_w)
+    expected_final_step_w.index_add_(0, step_ids.flatten(), expected_w.flatten())
+    expected_final_step_w /= torch.bincount(step_ids.flatten()).float()
 
     def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
         return torch.corrcoef(torch.stack((x.flatten(), y.flatten())))[0, 1].item()
@@ -596,9 +603,9 @@ def test_compute_my_outcome_advantage_returns_shared_step_weights():
             .float()
             .mean()
             .item(),
-            "actor/w/max": expected_step_w.max().item(),
-            "actor/w/min": expected_step_w.min().item(),
-            "actor/w/std": expected_step_w.std(unbiased=False).item(),
+            "actor/w/max": expected_final_step_w.max().item(),
+            "actor/w/min": expected_final_step_w.min().item(),
+            "actor/w/std": expected_final_step_w.std(unbiased=False).item(),
             "actor/entropy_local_maxima_count/mean": 3.0,
         }
     )

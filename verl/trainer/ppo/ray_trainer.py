@@ -219,6 +219,7 @@ def compute_advantage(
             tau=0.5 if config is None else float(config.get("tau", 0.5)),
             d=128.0 if config is None else float(config.get("d", 128.0)),
             d_min=8 if config is None else config.get("d_min", 8),
+            step_lambda=0.0 if config is None else float(config.get("step_lambda", 0.0)),
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )
