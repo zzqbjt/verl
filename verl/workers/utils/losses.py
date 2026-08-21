@@ -133,7 +133,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
+    policy_loss_kwargs = {}
+    if loss_mode == "my":
+        if entropy is None:
+            raise ValueError("policy_loss='my' requires entropy in the model output.")
+        policy_loss_kwargs["entropy"] = entropy
+        policy_loss_kwargs["vinfo_weights"] = data.get("vinfo_weights", None)
+    policy_loss_output = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -141,7 +147,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **policy_loss_kwargs,
     )
+    if loss_mode == "my":
+        pg_loss, pg_metrics, _ = policy_loss_output
+    else:
+        pg_loss, pg_metrics = policy_loss_output
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -161,7 +172,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     # add kl loss
-    if config.use_kl_loss:
+    kl_loss_needs_ref = config.use_kl_loss and float(config.kl_loss_coef) != 0.0
+    if kl_loss_needs_ref:
         ref_log_prob = data["ref_log_prob"]
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)

@@ -97,11 +97,12 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     LENGTH_ADAPTIVE_GAE = "length_adaptive_gae"
     GRPO = "grpo"
-    MY = "my"
+    STEP_VALUE = "step_value"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
+    NORMALIZED_RLOO = "normalized_rloo"
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
@@ -256,12 +257,7 @@ def compute_log_prob_values(
     Returns:
         Token-level values and their broadcast response-level targets.
     """
-    if not (
-        old_log_prob.shape
-        == ref_log_prob.shape
-        == token_level_rewards.shape
-        == response_mask.shape
-    ):
+    if not (old_log_prob.shape == ref_log_prob.shape == token_level_rewards.shape == response_mask.shape):
         raise ValueError(
             "old_log_prob, ref_log_prob, token_level_rewards, and response_mask "
             f"must have the same shape, got {old_log_prob.shape}, "
@@ -425,10 +421,7 @@ def compute_length_adaptive_gae_advantage_return(
     """
     if alpha <= 0:
         raise ValueError(f"length-adaptive GAE requires alpha > 0, got {alpha}")
-    if not (
-        token_level_rewards.shape == values.shape == response_mask.shape
-        and response_mask.ndim == 2
-    ):
+    if not (token_level_rewards.shape == values.shape == response_mask.shape and response_mask.ndim == 2):
         raise ValueError(
             "token_level_rewards, values, and response_mask must be rank-2 tensors with the same shape, "
             f"got {token_level_rewards.shape}, {values.shape}, and {response_mask.shape}"
@@ -517,236 +510,262 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
-@register_adv_est(AdvantageEstimator.MY)
-def compute_my_outcome_advantage(
+def _compute_group_relative_sequence_advantage(
+    scores: torch.Tensor,
+    group_index: torch.Tensor,
+    *,
+    epsilon: float,
+    normalize_by_std: bool,
+    zero_when_group_uniform: bool,
+) -> torch.Tensor:
+    """Return one group-relative scalar advantage per response.
+
+    This helper intentionally uses a leave-one-out mean whenever a prompt has
+    more than one response.  The baseline for response ``i`` therefore cannot
+    depend on that response's own reward.  Singleton and reward-uniform groups
+    produce zero when ``zero_when_group_uniform`` is enabled.
+    """
+
+    scores = scores.detach().float().reshape(-1)
+    group_index = group_index.to(device=scores.device, dtype=torch.long).reshape(-1)
+    if scores.numel() != group_index.numel():
+        raise ValueError(
+            "scores and group_index must contain the same number of responses, "
+            f"got {scores.numel()} and {group_index.numel()}"
+        )
+
+    advantages = torch.zeros_like(scores)
+    for group_id in torch.unique(group_index).tolist():
+        rows = torch.nonzero(group_index == group_id, as_tuple=False).flatten()
+        group_scores = scores.index_select(0, rows)
+        if rows.numel() <= 1:
+            continue
+        if zero_when_group_uniform and torch.allclose(
+            group_scores,
+            group_scores[0].expand_as(group_scores),
+            atol=epsilon,
+            rtol=0.0,
+        ):
+            continue
+
+        leave_one_out_mean = (group_scores.sum() - group_scores) / (rows.numel() - 1)
+        group_advantages = group_scores - leave_one_out_mean
+        if normalize_by_std:
+            group_advantages = group_advantages / (group_scores.std(unbiased=True) + epsilon)
+        advantages.index_copy_(0, rows, group_advantages)
+
+    return advantages
+
+
+def prepare_step_value_context(
+    targets: torch.Tensor,
+    index: np.ndarray,
+    *,
+    norm_by_group_std: bool,
+    zero_when_group_uniform: bool,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare provider-scale ``V_0``, normalization scales, and active flags.
+
+    ``targets`` must use the same scale as the provider's step values. This
+    function never interprets that scale as a probability or a reward.
+    """
+
+    targets = targets.detach().float().reshape(-1)
+    if not torch.isfinite(targets).all():
+        raise ValueError("step-value targets must be finite")
+    if len(index) != targets.numel():
+        raise ValueError(f"index must contain {targets.numel()} group ids, got {len(index)}")
+
+    group_index = as_torch_index(index, device=targets.device)
+    initial_values = torch.empty_like(targets)
+    scales = torch.ones_like(targets)
+    active = torch.ones_like(targets, dtype=torch.bool)
+    for group_id in torch.unique(group_index).tolist():
+        rows = torch.nonzero(group_index == group_id, as_tuple=False).flatten()
+        group_targets = targets.index_select(0, rows)
+        if rows.numel() <= 1:
+            initial_values[rows] = group_targets
+            active[rows] = False
+            continue
+
+        initial_values[rows] = (group_targets.sum() - group_targets) / (rows.numel() - 1)
+        group_uniform = torch.allclose(
+            group_targets,
+            group_targets[0].expand_as(group_targets),
+            atol=epsilon,
+            rtol=0.0,
+        )
+        if zero_when_group_uniform and group_uniform:
+            active[rows] = False
+        if norm_by_group_std and not group_uniform:
+            scales[rows] = group_targets.std(unbiased=True) + epsilon
+    return initial_values, scales, active
+
+
+@register_adv_est(AdvantageEstimator.STEP_VALUE)
+def compute_step_value_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
-    old_log_prob: torch.Tensor,
-    ref_log_prob: torch.Tensor,
-    medium_log_prob: torch.Tensor,
-    entropy: torch.Tensor,
-    tau: float = 0.5,
-    d: float = 128.0,
-    d_min: int = 8,
-    step_lambda: float = 0.0,
+    step_values: torch.Tensor,
+    step_end_mask: torch.Tensor,
+    step_value_initial_values: torch.Tensor,
+    step_value_scales: torch.Tensor,
+    step_value_active: torch.Tensor,
+    step_value_task_rewards: torch.Tensor,
+    step_value_ready: torch.Tensor | bool,
+    lam: float = 0.9,
     epsilon: float = 1e-6,
-    norm_adv_by_std_in_grpo: bool = True,
+    norm_by_group_std: bool = True,
     config: Optional[AlgoConfig] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
-    """Compute step-weighted GRPO outcome advantages.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute lambda advantages from provider-prepared step-value trajectories.
 
-    Entropy-local maxima split every response into steps. A split point starts
-    a new step, and ``k = max(round(response_length / d) - 1, 0)`` is the
-    target number of split points. Candidate maxima are considered from high
-    to low entropy, with candidates within ``d_min`` tokens of an accepted
-    point suppressed. If too few candidates remain, the response has fewer
-    than ``k`` split points.
-
-    Actor-to-medium and medium-to-reference log-probability deltas are first
-    averaged within every step and then z-score normalized separately over all
-    steps in a prompt group. Their tanh values are averaged into step
-    importance. A response-level softmax over steps keeps the average step
-    weight equal to one. Its token-level coefficient is then redistributed by
-    multiplying the first token in a step by ``1 + step_lambda`` and every
-    other token by ``1 - step_lambda / (step_length - 1)``. Diagnostics treat
-    every step as one observation.
+    The estimator assigns no semantics to the values: they may be success
+    probabilities, raw rewards, or another scalar value. The provider must
+    supply ``V_0``, every step value including the verified terminal value,
+    normalization scales, and active flags in one consistent value space.
+    It computes normalized deltas and lambda traces without mapping the value
+    trajectory, then adds any non-task reward component at sequence level.
     """
-    del config  # Kept for compatibility with the advantage-estimator interface.
 
-    if tau <= 0.0:
-        raise ValueError(f"my advantage tau must be positive, got {tau}")
-    if not np.isfinite(d) or d <= 0.0:
-        raise ValueError(f"my advantage d must be positive, got {d}")
-    if isinstance(d_min, bool) or not isinstance(d_min, int) or d_min < 0:
-        raise ValueError(f"my advantage d_min must be a non-negative integer, got {d_min}")
-    if not np.isfinite(step_lambda):
-        raise ValueError(f"my advantage step_lambda must be finite, got {step_lambda}")
-    if not (
-        token_level_rewards.shape
-        == response_mask.shape
-        == old_log_prob.shape
-        == ref_log_prob.shape
-        == medium_log_prob.shape
-        == entropy.shape
-        and response_mask.ndim == 2
+    expected_shape = token_level_rewards.shape
+    for name, tensor in (
+        ("response_mask", response_mask),
+        ("step_values", step_values),
+        ("step_end_mask", step_end_mask),
     ):
+        if tensor.shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}")
+    if token_level_rewards.ndim != 2:
+        raise ValueError(f"step-value advantage expects rank-2 token tensors, got rank {token_level_rewards.ndim}")
+    if not 0.0 <= float(lam) <= 1.0:
+        raise ValueError(f"lam must be in [0, 1], got {lam}")
+
+    batch_size, response_length = expected_shape
+    initial_values = step_value_initial_values.detach().float().reshape(-1)
+    scales = step_value_scales.detach().float().reshape(-1)
+    active_rows = step_value_active.detach().bool().reshape(-1)
+    for name, tensor in (
+        ("step_value_initial_values", initial_values),
+        ("step_value_scales", scales),
+        ("step_value_active", active_rows),
+    ):
+        if tensor.numel() != batch_size:
+            raise ValueError(f"{name} must contain one value per response")
+    if not torch.isfinite(initial_values).all():
+        raise ValueError("step_value_initial_values must be finite")
+    if not torch.isfinite(scales).all() or torch.any(scales <= 0.0):
+        raise ValueError("step_value_scales must be finite and positive")
+
+    task_rewards = step_value_task_rewards.detach().float().reshape(-1)
+    if task_rewards.numel() != batch_size:
         raise ValueError(
-            "token_level_rewards, response_mask, old_log_prob, ref_log_prob, medium_log_prob, and entropy "
-            "must be rank-2 tensors with the same shape, got "
-            f"{token_level_rewards.shape}, {response_mask.shape}, {old_log_prob.shape}, "
-            f"{ref_log_prob.shape}, {medium_log_prob.shape}, and {entropy.shape}"
+            "step_value_task_rewards must contain one verifier reward per response, "
+            f"got {task_rewards.numel()} rewards for batch size {batch_size}"
+        )
+    if not torch.isfinite(task_rewards).all():
+        raise ValueError("step_value_task_rewards must be finite")
+
+    if isinstance(step_value_ready, torch.Tensor):
+        ready_values = step_value_ready.detach().bool().reshape(-1)
+        if ready_values.numel() not in (1, batch_size):
+            raise ValueError(
+                f"step_value_ready must be scalar or contain one flag per response, got {ready_values.numel()} values"
+            )
+        if not torch.all(ready_values == ready_values[0]):
+            raise ValueError("A batch cannot mix warm-up and active step-value predictions")
+        values_ready = bool(ready_values[0].item())
+    else:
+        values_ready = bool(step_value_ready)
+
+    if not values_ready:
+        return compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_by_group_std,
         )
 
     valid_mask = response_mask.bool()
-    valid_count = valid_mask.sum(dim=-1, keepdim=True)
-    if torch.any(valid_count == 0):
-        raise ValueError("my advantage requires every response to contain at least one valid token")
+    end_mask = step_end_mask.bool()
+    if torch.any(end_mask & ~valid_mask):
+        raise ValueError("step_end_mask may only mark valid response tokens")
+    if torch.any(end_mask.sum(dim=-1) == 0):
+        raise ValueError("Every response must contain at least one step end")
 
-    advantages, _ = compute_grpo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        epsilon=epsilon,
-        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-    )
+    group_index = as_torch_index(index, device=task_rewards.device)
 
-    with torch.no_grad():
-        group_index = as_torch_index(index, device=old_log_prob.device)
-        if group_index.numel() != old_log_prob.shape[0]:
-            raise ValueError(
-                f"index length {group_index.numel()} does not match batch size {old_log_prob.shape[0]}"
+    total_scores = token_level_rewards.detach().float().sum(dim=-1)
+    # Auxiliary reward components stay sequence-level. They are independent
+    # of the provider's value space and are never used to transform step values.
+    auxiliary_scores = total_scores - task_rewards.to(total_scores)
+    auxiliary_advantage = torch.zeros_like(auxiliary_scores)
+    for group_id in torch.unique(group_index).tolist():
+        rows = torch.nonzero(group_index == group_id, as_tuple=False).flatten()
+        group_auxiliary_scores = auxiliary_scores.index_select(0, rows)
+        group_auxiliary_advantage = group_auxiliary_scores - group_auxiliary_scores.mean()
+        group_task_rewards = task_rewards.index_select(0, rows)
+        if (
+            norm_by_group_std
+            and rows.numel() > 1
+            and not torch.allclose(
+                group_task_rewards,
+                group_task_rewards[0].expand_as(group_task_rewards),
+                atol=epsilon,
+                rtol=0.0,
             )
+        ):
+            group_auxiliary_advantage = group_auxiliary_advantage / (group_task_rewards.std(unbiased=True) + epsilon)
+        auxiliary_advantage.index_copy_(0, rows, group_auxiliary_advantage)
 
-        step_ids = torch.full_like(response_mask, -1, dtype=torch.long)
-        step_first_token_mask = torch.zeros_like(valid_mask)
-        step_counts_list: list[int] = []
-        entropy_local_maxima_counts: list[int] = []
-        next_step_id = 0
-        for response_idx in range(response_mask.shape[0]):
-            valid_positions = valid_mask[response_idx].nonzero(as_tuple=False).flatten()
-            response_entropy = entropy[response_idx, valid_positions]
-            response_length = valid_positions.numel()
-            target_num_splits = max(round(response_length / d) - 1, 0)
+    advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+    for row in range(batch_size):
+        end_positions = torch.nonzero(end_mask[row], as_tuple=False).flatten()
+        predicted_values = step_values[row].detach().float().index_select(0, end_positions)
+        if not torch.isfinite(predicted_values).all():
+            raise ValueError("Active step_values must be finite at every step end")
 
-            local_maxima_mask = torch.zeros(response_length, device=entropy.device, dtype=torch.bool)
-            if response_length >= 3:
-                local_maxima_mask[1:-1] = (response_entropy[1:-1] > response_entropy[:-2]) & (
-                    response_entropy[1:-1] > response_entropy[2:]
-                )
-            candidate_positions_tensor = local_maxima_mask.nonzero(as_tuple=False).flatten()
-            entropy_local_maxima_counts.append(candidate_positions_tensor.numel())
-            if target_num_splits > 0:
-                entropy_order = torch.argsort(
-                    response_entropy[candidate_positions_tensor], descending=True, stable=True
-                )
-                candidate_positions = candidate_positions_tensor[entropy_order].tolist()
-            else:
-                candidate_positions = []
+        if not active_rows[row]:
+            task_step_advantages = torch.zeros_like(predicted_values)
+        else:
+            deltas = torch.empty_like(predicted_values)
+            deltas[0] = (predicted_values[0] - initial_values[row]) / scales[row]
+            if predicted_values.numel() > 1:
+                deltas[1:] = (predicted_values[1:] - predicted_values[:-1]) / scales[row]
 
-            split_positions: list[int] = []
-            for candidate_position in candidate_positions:
-                if all(abs(candidate_position - selected_position) > d_min for selected_position in split_positions):
-                    split_positions.append(candidate_position)
-                    if len(split_positions) == target_num_splits:
-                        break
-            split_positions.sort()
+            task_step_advantages = torch.empty_like(deltas)
+            trace = torch.zeros((), device=deltas.device, dtype=deltas.dtype)
+            for step_idx in range(deltas.numel() - 1, -1, -1):
+                trace = deltas[step_idx] + float(lam) * trace
+                task_step_advantages[step_idx] = trace
 
-            boundaries = [0, *split_positions, response_length]
-            num_steps = len(boundaries) - 1
-            step_counts_list.append(num_steps)
-            for step_idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
-                step_ids[response_idx, valid_positions[start:end]] = next_step_id + step_idx
-                step_first_token_mask[response_idx, valid_positions[start]] = True
-            next_step_id += num_steps
+        start = 0
+        for step_idx, end in enumerate(end_positions.tolist()):
+            advantages[row, start : end + 1] = task_step_advantages[step_idx]
+            start = end + 1
+        # EOS is excluded from the value position but remains part of the final
+        # macro action for policy-gradient accounting.
+        if start < response_length:
+            trailing_valid = valid_mask[row, start:]
+            advantages[row, start:][trailing_valid] = task_step_advantages[-1]
 
-        step_counts = torch.tensor(step_counts_list, device=response_mask.device, dtype=torch.long)
-        valid_step_ids = step_ids[valid_mask]
-        delta_step_ids = valid_step_ids.to(old_log_prob.device)
-        step_token_count = torch.bincount(delta_step_ids, minlength=next_step_id).float()
-        step_response_index = torch.repeat_interleave(
-            torch.arange(response_mask.shape[0], device=group_index.device), step_counts.to(group_index.device)
-        )
-        step_group_index = group_index[step_response_index]
-
-        def mean_delta_by_step(delta: torch.Tensor) -> torch.Tensor:
-            step_delta_sum = torch.zeros(next_step_id, device=delta.device, dtype=torch.float32)
-            step_delta_sum.index_add_(0, delta_step_ids, delta[valid_mask].float())
-            return step_delta_sum / step_token_count
-
-        def normalize_delta_by_group(step_delta: torch.Tensor) -> torch.Tensor:
-            group_mean, group_std, _ = group_mean_std(
-                step_delta,
-                step_group_index,
-                eps=epsilon,
-                device=step_delta.device,
-            )
-            return (step_delta - group_mean[step_group_index].to(step_delta)) / (
-                group_std[step_group_index].to(step_delta) + epsilon
-            )
-
-        def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-            """Return a finite Pearson correlation for step-level vectors."""
-            x = x.float()
-            y = y.float()
-            if x.numel() < 2:
-                return 0.0
-
-            x_centered = x - x.mean()
-            y_centered = y - y.mean()
-            denominator = torch.sqrt(x_centered.square().sum() * y_centered.square().sum())
-            if denominator.item() <= epsilon:
-                return 0.0
-            return (x_centered * y_centered).sum().div(denominator).item()
-
-        actor_medium_delta = mean_delta_by_step(old_log_prob - medium_log_prob)
-        medium_ref_delta = mean_delta_by_step(medium_log_prob - ref_log_prob)
-
-        actor_medium_delta_norm = normalize_delta_by_group(actor_medium_delta)
-        medium_ref_delta_norm = normalize_delta_by_group(medium_ref_delta)
-        step_importance = (torch.tanh(actor_medium_delta_norm) + torch.tanh(medium_ref_delta_norm)) / 2.0
-
-        step_w = torch.empty_like(step_importance)
-        step_offset = 0
-        for num_steps in step_counts_list:
-            step_slice = slice(step_offset, step_offset + num_steps)
-            step_w[step_slice] = torch.softmax(step_importance[step_slice] / tau, dim=0) * num_steps
-            step_offset += num_steps
-
-        w = torch.zeros_like(old_log_prob, dtype=step_w.dtype)
-        w[valid_mask] = step_w[valid_step_ids]
-        valid_step_lengths = step_token_count[delta_step_ids]
-        non_first_denominator = (valid_step_lengths - 1.0).clamp_min(1.0)
-        valid_c = torch.where(
-            step_first_token_mask[valid_mask],
-            torch.full_like(valid_step_lengths, 1.0 + step_lambda),
-            1.0 - step_lambda / non_first_denominator,
-        )
-        w[valid_mask] *= valid_c
-        final_step_w = mean_delta_by_step(w)
-
-        valid_actor_medium_delta = actor_medium_delta.float()
-        valid_medium_ref_delta = medium_ref_delta.float()
-        valid_importance = step_importance.float()
-        valid_w = final_step_w.float()
-        diagnostics = {
-            "actor/actor_medium_delta/mean": valid_actor_medium_delta.mean().item(),
-            "actor/actor_medium_delta/std": valid_actor_medium_delta.std(unbiased=False).item(),
-            "actor/medium_ref_delta/mean": valid_medium_ref_delta.mean().item(),
-            "actor/medium_ref_delta/std": valid_medium_ref_delta.std(unbiased=False).item(),
-            "actor/importance/mean": valid_importance.mean().item(),
-            "actor/importance/std": valid_importance.std(unbiased=False).item(),
-            "actor/actor_medium_delta_medium_ref_delta/pearson_corr": pearson_correlation(
-                valid_actor_medium_delta, valid_medium_ref_delta
-            ),
-            "actor/actor_medium_delta_medium_ref_delta/same_sign_ratio": (
-                (valid_actor_medium_delta * valid_medium_ref_delta) > 0
-            )
-            .float()
-            .mean()
-            .item(),
-            "actor/w/max": valid_w.max().item(),
-            "actor/w/min": valid_w.min().item(),
-            "actor/w/std": valid_w.std(unbiased=False).item(),
-            "actor/entropy_local_maxima_count/mean": sum(entropy_local_maxima_counts)
-            / len(entropy_local_maxima_counts),
-        }
-
-        advantages = advantages * w
-
-    return advantages, advantages, w, diagnostics
+    advantages = (advantages + auxiliary_advantage.unsqueeze(-1)) * response_mask.float()
+    return advantages, advantages
 
 
 def _compute_answer_advantage_weights(
     response_mask: torch.Tensor,
     index: np.ndarray,
     answer_log_prob: torch.Tensor,
-    answer_step_end_mask: torch.Tensor,
+    step_end_mask: torch.Tensor,
     epsilon: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute token weights from answer-log-prob IG with group-level step normalization."""
     answer_log_prob = answer_log_prob.detach()
-    answer_step_end_mask = answer_step_end_mask.to(device=response_mask.device).bool()
+    step_end_mask = step_end_mask.to(device=response_mask.device).bool()
     response_mask_bool = response_mask.bool()
 
     IG_at_step_end = answer_log_prob[:, 1:] - answer_log_prob[:, :-1]
@@ -756,16 +775,20 @@ def _compute_answer_advantage_weights(
             f"answer_log_prob implies IG shape {IG_at_step_end.shape}, "
             f"but response_mask has shape {response_mask.shape}."
         )
-    if answer_step_end_mask.shape != response_mask.shape:
+    if step_end_mask.shape != response_mask.shape:
         raise ValueError(
-            f"answer_step_end_mask shape {answer_step_end_mask.shape} does not match "
+            f"step_end_mask shape {step_end_mask.shape} does not match "
             f"response_mask shape {response_mask.shape}."
         )
+    if torch.any(step_end_mask & ~response_mask_bool):
+        raise ValueError("step_end_mask may select only valid response tokens.")
+    if torch.any(step_end_mask.sum(dim=-1) < 1):
+        raise ValueError("step_end_mask must contain at least one shared endpoint per response.")
 
     bsz, response_length = IG_at_step_end.shape
     response_positions = torch.arange(response_length, device=response_mask.device).unsqueeze(0)
     no_step_position = torch.full_like(response_positions, response_length)
-    step_positions = torch.where(answer_step_end_mask, response_positions, no_step_position)
+    step_positions = torch.where(step_end_mask, response_positions, no_step_position)
     next_step_idx = torch.cummin(step_positions.flip(dims=[1]), dim=1).values.flip(dims=[1])
     IG = IG_at_step_end.gather(dim=1, index=next_step_idx.clamp(max=response_length - 1))
     IG = torch.where(next_step_idx < response_length, IG, torch.zeros_like(IG))
@@ -777,10 +800,10 @@ def _compute_answer_advantage_weights(
     group_count_per_response = IG_at_step_end.new_zeros((bsz, 1))
     IG_mean = IG_at_step_end.new_zeros((bsz, 1))
     IG_std = IG_at_step_end.new_ones((bsz, 1))
-    if answer_step_end_mask.any():
+    if step_end_mask.any():
         work_dtype = torch.float64 if IG_at_step_end.dtype == torch.float64 else torch.float32
-        IG_step_values = IG_at_step_end.to(work_dtype)[answer_step_end_mask]
-        step_gidx = gidx.unsqueeze(1).expand_as(answer_step_end_mask)[answer_step_end_mask]
+        IG_step_values = IG_at_step_end.to(work_dtype)[step_end_mask]
+        step_gidx = gidx.unsqueeze(1).expand_as(step_end_mask)[step_end_mask]
         group_count = torch.zeros(
             int(torch.max(gidx).item()) + 1,
             device=IG_at_step_end.device,
@@ -806,23 +829,27 @@ def _compute_answer_advantage_weights(
     centered_IG = IG - IG_mean
     IG = torch.where(group_count_per_response > 1, centered_IG / (IG_std + epsilon), centered_IG)
 
-    has_step = answer_step_end_mask.sum(dim=-1, keepdim=True) > 0
+    has_step = step_end_mask.sum(dim=-1, keepdim=True) > 0
     IG = torch.where(has_step, IG, torch.zeros_like(IG))
 
     g = torch.nn.functional.softplus(IG) + epsilon
     response_count = response_mask.sum(dim=-1, keepdim=True).clamp_min(1)
     g_bar = (g * response_mask).sum(dim=-1, keepdim=True) / response_count
     w = g / (g_bar + epsilon)
-    
+
     lamb = 1.0
     w = (1 - lamb) + lamb * w
-    last_step_end_idx = torch.where(
-        answer_step_end_mask,
-        response_positions,
-        response_positions.new_full(response_positions.shape, -1),
-    ).max(dim=-1, keepdim=True).values
-    answer_step_mask = (response_positions > last_step_end_idx) & response_mask_bool
-    w = torch.where(answer_step_mask, torch.ones_like(w), w)
+    last_step_end_idx = (
+        torch.where(
+            step_end_mask,
+            response_positions,
+            response_positions.new_full(response_positions.shape, -1),
+        )
+        .max(dim=-1, keepdim=True)
+        .values
+    )
+    trailing_response_mask = (response_positions > last_step_end_idx) & response_mask_bool
+    w = torch.where(trailing_response_mask, torch.ones_like(w), w)
     w = torch.where(response_mask_bool, w, torch.ones_like(w))
     return w, IG
 
@@ -833,7 +860,7 @@ def compute_vinfo_outcome_advantage(
     response_mask: torch.Tensor,
     index: np.ndarray,
     answer_log_prob: torch.Tensor,
-    answer_step_end_mask: torch.Tensor,
+    step_end_mask: torch.Tensor,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -862,12 +889,13 @@ def compute_vinfo_outcome_advantage(
             response_mask=response_mask,
             index=index,
             answer_log_prob=answer_log_prob,
-            answer_step_end_mask=answer_step_end_mask,
+            step_end_mask=step_end_mask,
         )
+        advantages = advantages * w
     return advantages, returns, w
 
 
-@register_adv_est(AdvantageEstimator.LR) 
+@register_adv_est(AdvantageEstimator.LR)
 def compute_lr_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -921,7 +949,7 @@ def compute_lr_outcome_advantage(
 
         for i in range(bsz):
             id2length[index[i]].append(lengths[i].float())
-        
+
         for idx in id2length:
             length_tensor = torch.stack(id2length[idx])
             id2lengthmean[idx] = torch.mean(length_tensor)
@@ -930,8 +958,8 @@ def compute_lr_outcome_advantage(
         for i in range(bsz):
             z = (lengths[i] - id2lengthmean[index[i]]) / (id2lengthstd[index[i]] + epsilon)
             if scores[i] >= 0:
-                combined_scores[i] = torch.exp(- 0.05 * z)
-                
+                combined_scores[i] = torch.exp(-0.05 * z)
+
         returns = combined_scores.unsqueeze(-1) * response_mask
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
@@ -953,11 +981,12 @@ def compute_lr_outcome_advantage(
                 scores[i] = (combined_scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = combined_scores[i] - id2mean[index[i]]
-        
+
         scores = scores.unsqueeze(-1) * response_mask
     return scores, returns
 
-@register_adv_est(AdvantageEstimator.LEAD) 
+
+@register_adv_est(AdvantageEstimator.LEAD)
 def compute_lead_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1012,7 +1041,7 @@ def compute_lead_outcome_advantage(
         for i in range(bsz):
             if scores[i] >= 0:
                 id2length[index[i]].append(lengths[i].float())
-        
+
         for idx in id2length:
             if len(id2length[idx]) == 1:
                 id2lengthmean[idx] = torch.tensor(0.0)
@@ -1023,11 +1052,11 @@ def compute_lead_outcome_advantage(
                 id2lengthstd[idx] = torch.std(length_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
-            
+
         for i in range(bsz):
             if scores[i] >= 0:
                 z = (lengths[i] - id2lengthmean[index[i]]) / (id2lengthstd[index[i]] + epsilon)
-                scores[i] = scores[i] * torch.exp(- 0.05 * z)
+                scores[i] = scores[i] * torch.exp(-0.05 * z)
 
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
@@ -1056,7 +1085,7 @@ def compute_lead_outcome_advantage(
                 scores[i] = scores[i] * w
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-        
+
         scores = scores.unsqueeze(-1) * response_mask
     return scores, scores
 
@@ -1364,6 +1393,69 @@ def compute_rloo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.NORMALIZED_RLOO)
+def compute_normalized_rloo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: Optional[bool] = None,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute leave-one-out outcome advantages with optional group scaling.
+
+    This estimator is a normalized RLOO control for GRPO experiments.  For a
+    response ``i`` in prompt group ``g`` it computes
+
+    ``r_i - mean(r_j for j in g if j != i)``
+
+    and, by default, divides it by the unbiased standard deviation of all
+    rewards in ``g``.  The resulting response scalar is broadcast to every
+    valid response token.  Singleton and reward-uniform groups contribute zero.
+
+    ``norm_adv_by_std_in_grpo`` may be passed explicitly for direct callers. If
+    omitted, the estimator reuses ``config.norm_adv_by_std_in_grpo`` and
+    defaults to normalization being enabled.  The existing ``rloo`` estimator
+    intentionally remains unchanged.
+    """
+    del kwargs
+    if token_level_rewards.ndim != 2:
+        raise ValueError(f"normalized_rloo expects rank-2 token_level_rewards, got rank {token_level_rewards.ndim}")
+    if response_mask.shape != token_level_rewards.shape:
+        raise ValueError(
+            "response_mask must match token_level_rewards, got "
+            f"{tuple(response_mask.shape)} and {tuple(token_level_rewards.shape)}"
+        )
+    if not np.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError(f"epsilon must be finite and positive, got {epsilon!r}")
+    if not torch.isfinite(token_level_rewards).all():
+        raise ValueError("token_level_rewards must be finite")
+    if not torch.isfinite(response_mask).all():
+        raise ValueError("response_mask must be finite")
+
+    batch_size = token_level_rewards.shape[0]
+    if len(index) != batch_size:
+        raise ValueError(f"index must contain {batch_size} group ids, got {len(index)}")
+
+    if norm_adv_by_std_in_grpo is None:
+        norm_adv_by_std_in_grpo = True if config is None else bool(config.get("norm_adv_by_std_in_grpo", True))
+
+    with torch.no_grad():
+        scores = token_level_rewards.detach().float().sum(dim=-1)
+        group_index = as_torch_index(index, device=scores.device)
+        scalar_advantages = _compute_group_relative_sequence_advantage(
+            scores,
+            group_index,
+            epsilon=epsilon,
+            normalize_by_std=bool(norm_adv_by_std_in_grpo),
+            zero_when_group_uniform=True,
+        )
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask.float()
+
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
@@ -2096,6 +2188,7 @@ def compute_policy_loss_vanilla(
     }
     return pg_loss, pg_metrics
 
+
 def compute_token_ranking_similarity(
     weights1: torch.Tensor,
     weights2: torch.Tensor,
@@ -2120,6 +2213,7 @@ def compute_token_ranking_similarity(
     """
 
     from scipy.stats import kendalltau
+
     # move to cpu numpy
     weights1 = weights1.detach().float().cpu().numpy()
     weights2 = weights2.detach().float().cpu().numpy()
@@ -2131,7 +2225,6 @@ def compute_token_ranking_similarity(
     B = weights1.shape[0]
 
     for i in range(B):
-
         # select valid response tokens
         w1 = weights1[i][response_mask[i]]
         w2 = weights2[i][response_mask[i]]
@@ -2141,11 +2234,7 @@ def compute_token_ranking_similarity(
             continue
 
         # ---------- Kendall tau-b ----------
-        tau, _ = kendalltau(
-            w1,
-            w2,
-            variant="b"
-        )
+        tau, _ = kendalltau(w1, w2, variant="b")
 
         if not np.isnan(tau):
             taus.append(tau)
@@ -2155,12 +2244,9 @@ def compute_token_ranking_similarity(
         top1 = np.argpartition(w1, -k)[-k:]
         top2 = np.argpartition(w2, -k)[-k:]
 
-        overlap = len(
-            set(top1).intersection(set(top2))
-        ) / k
+        overlap = len(set(top1).intersection(set(top2))) / k
 
         overlaps.append(overlap)
-
 
     results = {
         "kendall_tau": float(np.mean(taus)) if len(taus) > 0 else 0.0,
@@ -2171,143 +2257,123 @@ def compute_token_ranking_similarity(
 
     return results
 
-@register_policy_loss("ours")  # type: ignore[arg-type]
-def compute_policy_loss_ours(
-    old_log_prob: torch.Tensor,
-    log_prob: torch.Tensor,
-    advantages: torch.Tensor,
-    response_mask: torch.Tensor,
-    w: torch.Tensor | None = None,
-    ref_log_prob: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
-    loss_agg_mode: str = "token-mean",
-    config: Optional[ActorConfig] = None,
-    rollout_is_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """
-    PPO loss with entropy/coefficient weights normalized independently within each answer step.
-
-    Args:
-        w: Per-token V-Info weights produced by ``compute_vinfo_outcome_advantage``.
-    """
-    
-    assert config is not None
-    assert not isinstance(config, AlgoConfig)
-    if ref_log_prob is None:
-        raise ValueError("compute_policy_loss_ours requires ref_log_prob.")
-    if entropy is None:
-        raise ValueError("compute_policy_loss_ours requires entropy.")
-    if w is None:
-        raise ValueError("compute_policy_loss_ours requires V-Info weights w.")
-    if w.shape != advantages.shape:
-        raise ValueError(f"w shape {w.shape} does not match advantages shape {advantages.shape}.")
-    
-    clip_ratio = config.clip_ratio
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-    clip_ratio_c = config.get("clip_ratio_c", 3.0)
-
-    cliprange = clip_ratio
-    cliprange_low = clip_ratio_low
-    cliprange_high = clip_ratio_high
-
-    assert clip_ratio_c > 1.0, (
-        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
-        + f" but get the value: {clip_ratio_c}."
-    )
-    negative_approx_kl = log_prob - old_log_prob
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    
-    with torch.no_grad():
-        I_old = torch.sigmoid(10.0 * (torch.exp(old_log_prob) - torch.exp(ref_log_prob)))
-        I_new = torch.sigmoid(10.0 * (torch.exp(log_prob.detach()) - torch.exp(old_log_prob)))
-        coeff = (I_old + I_new) / 2
-        
-        normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True)[0]
-        weights = coeff * normalized_entropy / 0.5
-        
-        direction1 = weights > 1
-        direction2 = w > 1
-        overlap_ratio = torch.sum((direction1 == direction2) * response_mask) / torch.sum(response_mask)
-        metrics = compute_token_ranking_similarity(weights, w, response_mask)
-
-        weights[~(response_mask.bool())] = -float("inf")
-        weights = torch.softmax(weights, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
-        weights = torch.clamp(1 + weights * (w - 1), min=0.2, max=5.0)
-        advantages = weights * advantages
-    
-    with torch.no_grad():
-        advantages = w * advantages
-        
-    pg_losses1 = -advantages * ratio
-    if cliprange_low is None:
-        cliprange_low = cliprange
-    if cliprange_high is None:
-        cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
-    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
-
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-
-    if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
-
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-    )
-
-    pg_metrics = {
-        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-        "actor/ppo_kl": ppo_kl.detach().item(),
-        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-        "actor/I_old/std": I_old[response_mask.bool()].std().detach().item(),
-        "actor/I_new/std": I_new[response_mask.bool()].std().detach().item(),
-        "actor/normalized_entropy/mean": normalized_entropy[response_mask.bool()].mean().detach().item(),
-        "actor/overlap_ratio": overlap_ratio.detach().item(),
-        "actor/weights_similarity": metrics["kendall_tau"],
-        f"actor/topk_overlap": metrics[f"topk_overlap"],
-    }
-    return pg_loss, pg_metrics
-
 def masked_percentile_rank(tensor, mask):
-    masked_tensor = tensor.float().masked_fill(mask == 0, float('-inf'))
+    masked_tensor = tensor.float().masked_fill(mask == 0, float("-inf"))
     sorted_indices = torch.argsort(masked_tensor, dim=1)
-    
+
     valid_counts = mask.sum(dim=1, keepdim=True).float()
     max_count = mask.shape[1]
     invalid_counts = max_count - valid_counts
-    
+
     ranks = torch.arange(1, max_count + 1, dtype=torch.float16, device=tensor.device)
     percentile_matrix = (ranks.unsqueeze(0) - invalid_counts) / valid_counts
-    
+
     unsort_indices = torch.argsort(sorted_indices, dim=1)
     result = torch.gather(percentile_matrix, dim=1, index=unsort_indices)
     result = result * mask.float()
-    
+
     return result
+
+
+def _mean_rowwise_masked_pearson_correlation(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    mask: torch.Tensor,
+    epsilon: float = 1e-12,
+) -> tuple[float, float]:
+    """Return equal-response mean Pearson correlation and its valid-response ratio.
+
+    Correlation is computed independently over valid tokens in each response,
+    then averaged so long responses do not dominate the metric. Responses with
+    fewer than two valid tokens or zero variance in either weight are excluded.
+    """
+    if first.shape != second.shape or first.shape != mask.shape or first.ndim != 2:
+        raise ValueError(
+            "Pearson correlation expects rank-2 tensors with matching shapes, "
+            f"got {first.shape}, {second.shape}, and {mask.shape}."
+        )
+
+    mask_float = mask.bool().to(dtype=torch.float32)
+    first_float = first.detach().float()
+    second_float = second.detach().float()
+    token_counts = mask_float.sum(dim=-1)
+    safe_counts = token_counts.clamp_min(1.0)
+    first_mean = (first_float * mask_float).sum(dim=-1) / safe_counts
+    second_mean = (second_float * mask_float).sum(dim=-1) / safe_counts
+    first_centered = (first_float - first_mean.unsqueeze(-1)) * mask_float
+    second_centered = (second_float - second_mean.unsqueeze(-1)) * mask_float
+    first_square_sum = first_centered.square().sum(dim=-1)
+    second_square_sum = second_centered.square().sum(dim=-1)
+    denominator = torch.sqrt(first_square_sum * second_square_sum)
+    valid_responses = (token_counts >= 2) & (denominator > epsilon)
+
+    row_correlation = (first_centered * second_centered).sum(dim=-1) / denominator.clamp_min(epsilon)
+    row_correlation = row_correlation.clamp(min=-1.0, max=1.0)
+    if valid_responses.any():
+        correlation_mean = row_correlation[valid_responses].mean().item()
+    else:
+        correlation_mean = 0.0
+    valid_response_ratio = valid_responses.float().mean().item()
+    return correlation_mean, valid_response_ratio
+
+
+def _average_tie_ranks(values: torch.Tensor) -> torch.Tensor:
+    """Rank a one-dimensional tensor, assigning tied values their average rank."""
+    sorted_values, sorted_indices = torch.sort(values, stable=True)
+    _, tie_counts = torch.unique_consecutive(sorted_values, return_counts=True)
+    tie_ends = tie_counts.cumsum(dim=0)
+    tie_starts = tie_ends - tie_counts
+    average_ranks = (tie_starts + tie_ends - 1).to(dtype=torch.float32) / 2.0
+    sorted_ranks = torch.repeat_interleave(average_ranks, tie_counts)
+    ranks = torch.empty_like(sorted_ranks)
+    ranks[sorted_indices] = sorted_ranks
+    return ranks
+
+
+def _masked_average_ranks(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Rank every response over all of its valid tokens; masked tokens stay zero."""
+    ranks = torch.zeros_like(values, dtype=torch.float32)
+    valid_mask = mask.bool()
+    for row_index in range(values.shape[0]):
+        row_mask = valid_mask[row_index]
+        ranks[row_index, row_mask] = _average_tie_ranks(values[row_index, row_mask].detach().float())
+    return ranks
+
+
+def _mean_rowwise_masked_spearman_correlation(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[float, float]:
+    """Return the equal-response mean Spearman correlation over all valid tokens.
+
+    Each weight vector is converted to average ranks independently within its
+    response. Pearson correlation is then computed between the two rank vectors.
+    Responses with fewer than two valid tokens or constant ranks are excluded.
+    """
+    if first.shape != second.shape or first.shape != mask.shape or first.ndim != 2:
+        raise ValueError(
+            "Spearman correlation expects rank-2 tensors with matching shapes, "
+            f"got {first.shape}, {second.shape}, and {mask.shape}."
+        )
+
+    first_ranks = _masked_average_ranks(first, mask)
+    second_ranks = _masked_average_ranks(second, mask)
+    return _mean_rowwise_masked_pearson_correlation(first_ranks, second_ranks, mask)
 
 
 @register_policy_loss("my")  # type: ignore[arg-type]
 def compute_policy_loss_my(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
-    ref_log_prob: torch.Tensor,
     entropy: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+    vinfo_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any], torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
 
@@ -2319,10 +2385,16 @@ def compute_policy_loss_my(
             Log-probabilities of actions under the old policy, shape (batch_size, response_length).
         log_prob (torch.Tensor):
             Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        entropy (torch.Tensor):
+            Token entropies from the current policy, shape (batch_size, response_length).
         advantages (torch.Tensor):
             Advantage estimates for each action, shape (batch_size, response_length).
         response_mask (torch.Tensor):
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        vinfo_weights (torch.Tensor, optional):
+            Per-token V-Info weights. When present, their response-wise Spearman
+            correlation with the entropy-derived weights is reported over all
+            valid response tokens.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
         config: `(verl.trainer.config.ActorConfig)`:
@@ -2333,6 +2405,8 @@ def compute_policy_loss_my(
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)
+    if entropy is None:
+        raise ValueError("policy_loss='my' requires entropy.")
     clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
@@ -2355,62 +2429,11 @@ def compute_policy_loss_my(
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     with torch.no_grad():
-        tau = float(config.policy_loss.get("tau", 0.5))
-        if tau <= 0.0:
-            raise ValueError(f"policy-loss tau must be positive, got {tau}")
-        
-        # delta_old = torch.exp(old_log_prob) - torch.exp(ref_log_prob)
-        # delta_new = torch.exp(log_prob.detach()) - torch.exp(old_log_prob)
-        # delta_old_mean = torch.sum(delta_old * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
-        # delta_new_mean = torch.sum(delta_new * response_mask, dim=-1, keepdim=True) / torch.sum(response_mask, dim=-1, keepdim=True)
-        # delta_old_std = torch.sqrt(torch.sum((delta_old - delta_old_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
-        # delta_new_std = torch.sqrt(torch.sum((delta_new - delta_new_mean) ** 2 * response_mask, dim=-1, keepdim=True) / (torch.sum(response_mask, dim=-1, keepdim=True) - 1))
-        # delta_old_norm = (delta_old - delta_old_mean) / (delta_old_std + 1e-8)
-        # delta_new_norm = (delta_new - delta_new_mean) / (delta_new_std + 1e-8)
-
-        # # delta_old = (old_log_prob - ref_log_prob)
-        # # delta_new = (log_prob.detach() - old_log_prob)
-
-        # I_old = torch.sigmoid(delta_old_norm)
-        # I_new = torch.sigmoid(delta_new_norm)
-        # I_old_high_ratio = ((I_old >= 0.95) * response_mask).sum() / response_mask.sum()
-        # I_new_high_ratio = ((I_new >= 0.95) * response_mask).sum() / response_mask.sum()
-        # I_old_low_ratio = ((I_old <= 0.05) * response_mask).sum() / response_mask.sum()
-        # I_new_low_ratio = ((I_new <= 0.05) * response_mask).sum() / response_mask.sum()
-        
-        # coeff = (I_old + I_new) / 2.0
-        normalized_entropy = entropy / (entropy * response_mask).max(dim=-1, keepdim=True)[0]
-        w = (normalized_entropy) / tau
+        w = entropy / (entropy * response_mask).max(dim=-1, keepdim=True)[0]
         w[~(response_mask.bool())] = -float("inf")
         w = torch.softmax(w, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
-
-        # valid_mask = response_mask.bool()
-        # valid_delta_old = delta_old[valid_mask].float()
-        # valid_delta_new = delta_new[valid_mask].float()
-        # valid_w = w[valid_mask].float()
-        # valid_coeff = coeff[valid_mask].float()
-        # valid_normalized_entropy = normalized_entropy[valid_mask].float()
-
-        # def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-        #     """Return a finite Pearson correlation for valid-token vectors."""
-        #     if x.numel() < 2:
-        #         return 0.0
-
-        #     x_centered = x - x.mean()
-        #     y_centered = y - y.mean()
-        #     denominator = torch.sqrt(x_centered.square().sum() * y_centered.square().sum())
-        #     if denominator.item() <= torch.finfo(x.dtype).eps:
-        #         return 0.0
-        #     return (x_centered * y_centered).sum().div(denominator).item()
-
-        # delta_old_delta_new_same_sign_ratio = (
-        #     ((valid_delta_old * valid_delta_new) > 0).float().mean().item()
-        # )
-        # w_coeff_pearson_corr = pearson_correlation(valid_w, valid_coeff)
-        # w_normalized_entropy_pearson_corr = pearson_correlation(valid_w, valid_normalized_entropy)
-        
         advantages = w * advantages
-    
+
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
@@ -2447,22 +2470,16 @@ def compute_policy_loss_my(
         "actor/w/max": w[response_mask.bool()].max().detach().item(),
         "actor/w/min": w[response_mask.bool()].min().detach().item(),
         "actor/w/std": w[response_mask.bool()].std().detach().item(),
-        # "actor/delta_old/mean": valid_delta_old.mean().item(),
-        # "actor/delta_old/std": valid_delta_old.std(unbiased=False).item(),
-        # "actor/delta_new/mean": valid_delta_new.mean().item(),
-        # "actor/delta_new/std": valid_delta_new.std(unbiased=False).item(),
-        # "actor/delta_old_delta_new/same_sign_ratio": delta_old_delta_new_same_sign_ratio,
-        # "actor/w_coeff/pearson_corr": w_coeff_pearson_corr,
-        # "actor/w_normalized_entropy/pearson_corr": w_normalized_entropy_pearson_corr,
-        # "actor/I_old/std": I_old[response_mask.bool()].std().detach().item(),
-        # "actor/I_new/std": I_new[response_mask.bool()].std().detach().item(),
-        # "actor/I_old/high_ratio": I_old_high_ratio.detach().item(),
-        # "actor/I_new/high_ratio": I_new_high_ratio.detach().item(),
-        # "actor/I_old/low_ratio": I_old_low_ratio.detach().item(),
-        # "actor/I_new/low_ratio": I_new_low_ratio.detach().item(),
-        "actor/normalized_entropy/mean": normalized_entropy[response_mask.bool()].mean().detach().item(),
     }
-    return pg_loss, pg_metrics
+    if vinfo_weights is not None:
+        spearman_mean, valid_response_ratio = _mean_rowwise_masked_spearman_correlation(
+            w,
+            vinfo_weights,
+            response_mask,
+        )
+        pg_metrics["actor/w_vinfo/spearman_corr_mean"] = spearman_mean
+        pg_metrics["actor/w_vinfo/spearman_valid_response_ratio"] = valid_response_ratio
+    return pg_loss, pg_metrics, w
 
 
 @register_policy_loss("future_kl")
@@ -2519,33 +2536,36 @@ def compute_policy_loss_future_kl(
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     # let's compute the future kl, which is the kl accumulated from the current token to the end of the response(within the response_mask)
 
-    assert log_prob.shape == old_log_prob.shape == advantages.shape, \
+    assert log_prob.shape == old_log_prob.shape == advantages.shape, (
         f"log/old/adv shape mismatch: {log_prob.shape}, {old_log_prob.shape}, {advantages.shape}"
-    
-    assert response_mask.dim() == 2 and response_mask.size(0) == log_prob.size(0), \
+    )
+
+    assert response_mask.dim() == 2 and response_mask.size(0) == log_prob.size(0), (
         f"response_mask shape {response_mask.shape} incompatible with batch {log_prob.shape}"
+    )
 
     # calculate future_kl using negative_approx_kl and response_mask
     batch_size, response_len = log_prob.shape
     device = log_prob.device
 
-    assert response_mask.size(1) == response_len, \
+    assert response_mask.size(1) == response_len, (
         f"Time dim mismatch: log_prob length={response_len}, response_mask length={response_mask.size(1)}"
+    )
 
-    chunk_size = config.policy_loss.get('chunk_size', 128)
-    decay_rate = config.policy_loss.get('decay_rate',128)
-    gamma = 2 ** (-1.0 / decay_rate) 
+    chunk_size = config.policy_loss.get("chunk_size", 128)
+    decay_rate = config.policy_loss.get("decay_rate", 128)
+    gamma = 2 ** (-1.0 / decay_rate)
 
     future_kl = torch.zeros((batch_size, response_len), device=device, dtype=log_prob.dtype)
     pos_i = torch.arange(response_len, device=device).unsqueeze(1)  # (L,1)
-    # to avoid high is token from the sample to deviate our training and weighting 
-    # we exclude those greater than clip_frac_c. These tokens have no gradient neither in the following training. 
-    filter_threshold = torch.log(torch.tensor(clip_ratio_c, device=device, dtype=log_prob.dtype))    
-    ignore_mask = negative_approx_kl > filter_threshold # bsz, L
+    # to avoid high is token from the sample to deviate our training and weighting
+    # we exclude those greater than clip_frac_c. These tokens have no gradient neither in the following training.
+    filter_threshold = torch.log(torch.tensor(clip_ratio_c, device=device, dtype=log_prob.dtype))
+    ignore_mask = negative_approx_kl > filter_threshold  # bsz, L
     participation_mask = ~ignore_mask
-    kl_response_premask = negative_approx_kl * response_mask.to(log_prob.dtype) # response mased kl diff
-    kl_response = kl_response_premask * participation_mask.to(log_prob.dtype) 
-    
+    kl_response_premask = negative_approx_kl * response_mask.to(log_prob.dtype)  # response mased kl diff
+    kl_response = kl_response_premask * participation_mask.to(log_prob.dtype)
+
     gamma_t = torch.tensor(gamma, dtype=log_prob.dtype, device=device)
     for j_start in range(0, response_len, chunk_size):
         j_end = min(response_len, j_start + chunk_size)
@@ -2565,26 +2585,28 @@ def compute_policy_loss_future_kl(
 
     if config.policy_loss.get("future_kl_clip_ratio") != 0.0:
         clip_ratio = config.policy_loss.get("future_kl_clip_ratio")
-        if not config.policy_loss.get('future_kl_clip_high_only'):
+        if not config.policy_loss.get("future_kl_clip_high_only"):
             # seems to work well with smaller models such as 7b --> usually create lower entropy
             upper_bound = 1.0 + clip_ratio
             lower_bound = 1.0 - clip_ratio
-            influence_weights = torch.clamp(torch.exp(future_kl),  min=lower_bound,max=upper_bound).detach()
+            influence_weights = torch.clamp(torch.exp(future_kl), min=lower_bound, max=upper_bound).detach()
         else:
             # a radical way to update model, works fine for larger model to break boundary hopefully
             upper_bound = 1.0 + clip_ratio
             lower_bound = 1.0
-            influence_weights = torch.clamp(torch.exp(future_kl),  min=1.0,max=1.0+clip_ratio).detach()
+            influence_weights = torch.clamp(torch.exp(future_kl), min=1.0, max=1.0 + clip_ratio).detach()
     else:
         upper_bound = 10.0
         lower_bound = 0.0
-        influence_weights = torch.clamp(torch.exp(future_kl),  max=10.0).detach()
+        influence_weights = torch.clamp(torch.exp(future_kl), max=10.0).detach()
     # Apply a safety threshold: if a negative sample's IS value is too high and its weight is increasing, cap it at the baseline value (1.0)
     # To avoid over-penalization
-    safe_threshold = config.policy_loss.get('safety_thresh', 4.0)
+    safe_threshold = config.policy_loss.get("safety_thresh", 4.0)
     mask_neg_high_is = (advantages < 0) & (ratio > safe_threshold)
-    influence_weights = torch.where(mask_neg_high_is, torch.clamp(influence_weights, min=0.8, max=1.0), influence_weights)
-    
+    influence_weights = torch.where(
+        mask_neg_high_is, torch.clamp(influence_weights, min=0.8, max=1.0), influence_weights
+    )
+
     weighted_advantages = advantages * influence_weights
 
     pg_losses1 = -weighted_advantages * ratio
@@ -2607,23 +2629,21 @@ def compute_policy_loss_future_kl(
     )
     # Stats info to collect：
     # raw influence weight，lower clip token count, done
-    # Percentages of IS negative samples > 2, 3, 4, 10 
+    # Percentages of IS negative samples > 2, 3, 4, 10
     # Negative sample is: max，995 percent，999 percent, done
     # Positive sample is: max，995 percent，999 percent, done
     # Extremely small is from Positive sample (could result in large distribution shift)
 
-    # filter mechanism： if a sequence contains more than 1 token that has been clip by dual clip, then we throw away the entire sequence. 
-    # however, this is rarely activated in the 32b training. 
-    lower_clip_mask = (
-                        (advantages < 0) &
-                        (clip_pg_losses1 > pg_losses3) &
-                        response_mask.bool()
-                    ) 
+    # filter mechanism： if a sequence contains more than 1 token that has been clip by dual clip, then we throw away the entire sequence.
+    # however, this is rarely activated in the 32b training.
+    lower_clip_mask = (advantages < 0) & (clip_pg_losses1 > pg_losses3) & response_mask.bool()
     low_clip_token_counts = lower_clip_mask.sum(dim=1)  # (batch,）
 
     # sequence-level: whether this entire response should be invalidated
-    seq_has_low_clip = (low_clip_token_counts > 1)        # (batch,) # hard threshold (if sequence has many, > threshold,--> sequence)
-    seq_valid_mask = (~seq_has_low_clip).unsqueeze(1)   # (batch,1)
+    seq_has_low_clip = (
+        low_clip_token_counts > 1
+    )  # (batch,) # hard threshold (if sequence has many, > threshold,--> sequence)
+    seq_valid_mask = (~seq_has_low_clip).unsqueeze(1)  # (batch,1)
 
     final_mask = response_mask.bool() & seq_valid_mask  # (batch, response_len)
     final_mask_f = final_mask.to(log_prob.dtype)
@@ -2640,27 +2660,25 @@ def compute_policy_loss_future_kl(
     }
     return pg_loss, pg_metrics
 
+
 def compute_hellinger_with_intersection(
-    logits: torch.Tensor,
-    ref_logits: torch.Tensor,
-    logits_indices: torch.Tensor,
-    ref_logits_indices: torch.Tensor
+    logits: torch.Tensor, ref_logits: torch.Tensor, logits_indices: torch.Tensor, ref_logits_indices: torch.Tensor
 ) -> torch.Tensor:
-    
+
     B, S, K = logits.shape
 
-    logits_flat = logits.reshape(-1, K)                # (N, K)
-    ref_logits_flat = ref_logits.reshape(-1, K)        # (N, K)
-    idx_flat = logits_indices.reshape(-1, K)           # (N, K)
-    ref_idx_flat = ref_logits_indices.reshape(-1, K)   # (N, K)
+    logits_flat = logits.reshape(-1, K)  # (N, K)
+    ref_logits_flat = ref_logits.reshape(-1, K)  # (N, K)
+    idx_flat = logits_indices.reshape(-1, K)  # (N, K)
+    ref_idx_flat = ref_logits_indices.reshape(-1, K)  # (N, K)
 
     idx_equal_mask = idx_flat.unsqueeze(2) == ref_idx_flat.unsqueeze(1)
     logits_intersection_mask = idx_equal_mask.any(dim=2)  # (N, K)
     ref_intersection_mask = idx_equal_mask.any(dim=1)
     intersection_ratio = logits_intersection_mask.sum() / (B * S * K)
-    
-    masked_logits = logits_flat.masked_fill(~logits_intersection_mask, -100.0)   # (N,K)
-    masked_ref_logits = ref_logits_flat.masked_fill(~ref_intersection_mask, -100.0) # (N,K)
+
+    masked_logits = logits_flat.masked_fill(~logits_intersection_mask, -100.0)  # (N,K)
+    masked_ref_logits = ref_logits_flat.masked_fill(~ref_intersection_mask, -100.0)  # (N,K)
 
     p = torch.softmax(masked_logits, dim=-1)
     q = torch.softmax(masked_ref_logits, dim=-1)
@@ -2671,6 +2689,7 @@ def compute_hellinger_with_intersection(
     hellinger_dist = torch.max(hellinger_dist, torch.zeros_like(hellinger_dist))  # Ensure non-negativity
 
     return hellinger_dist, intersection_ratio
+
 
 @register_policy_loss("dgpo")  # type: ignore[arg-type]
 def compute_policy_loss_dgpo(
@@ -2725,7 +2744,9 @@ def compute_policy_loss_dgpo(
     cliprange_high = clip_ratio_high
 
     with torch.no_grad():
-        d, intersection_ratio = compute_hellinger_with_intersection(logits, ref_logits, logits_indices, ref_logits_indices)
+        d, intersection_ratio = compute_hellinger_with_intersection(
+            logits, ref_logits, logits_indices, ref_logits_indices
+        )
         entropy = entropy / torch.log(torch.tensor(151936.0, device=entropy.device))
         w = d * entropy / tau
         w[~(response_mask.bool())] = -float("inf")
@@ -2784,6 +2805,7 @@ def compute_policy_loss_dgpo(
         "actor/intersection_ratio": intersection_ratio.detach().item(),
     }
     return pg_loss, pg_metrics
+
 
 @register_policy_loss("dppo_tv")
 def compute_policy_loss_dppo_tv(

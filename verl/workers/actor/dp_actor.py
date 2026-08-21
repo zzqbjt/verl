@@ -19,15 +19,13 @@ Single Process Actor
 
 import logging
 import os
-import re
-from bisect import bisect_right
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
-import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -45,10 +43,212 @@ from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pa
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
-__all__ = ["DataParallelPPOActor"]
+__all__ = [
+    "DataParallelPPOActor",
+    "StepValueProbe",
+    "dapo_reference_topk_forward_kl",
+    "gather_dapo_reference_teacher_topk",
+    "mix_dapo_reference_kl_loss",
+    "summarize_dapo_reference_teacher_topk",
+]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_DAPO_REFERENCE_KL_TOKEN_CHUNK_SIZE = 512
+
+
+def summarize_dapo_reference_teacher_topk(
+    teacher_logits: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compress a teacher distribution to teacher top-k log-probs and tail mass."""
+
+    if teacher_logits.ndim != 2:
+        raise ValueError(
+            f"DAPO reference top-k teacher logits must have shape [tokens, vocab], got {tuple(teacher_logits.shape)}."
+        )
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ValueError(f"DAPO reference top_k must be a positive integer, got {top_k!r}.")
+    vocab_size = teacher_logits.shape[-1]
+    if vocab_size < 1:
+        raise ValueError("DAPO reference top-k teacher logits must have a non-empty vocabulary dimension.")
+
+    top_k = min(top_k, vocab_size)
+    teacher_logits_f = teacher_logits.detach().float()
+    top_values, top_indices = torch.topk(teacher_logits_f, k=top_k, dim=-1)
+    teacher_log_z = torch.logsumexp(teacher_logits_f, dim=-1, keepdim=True)
+    teacher_top_log_probs = top_values - teacher_log_z
+    if top_k == vocab_size:
+        teacher_tail_prob = torch.zeros_like(teacher_log_z.squeeze(-1))
+    else:
+        teacher_top_log_mass = torch.logsumexp(teacher_top_log_probs, dim=-1).clamp_max(0.0)
+        teacher_tail_prob = (-torch.expm1(teacher_top_log_mass)).clamp_min(torch.finfo(torch.float32).tiny)
+    return top_indices, teacher_top_log_probs, teacher_tail_prob
+
+
+def _dapo_reference_topk_forward_kl_chunk(
+    student_logits: torch.Tensor,
+    teacher_top_indices: torch.Tensor,
+    teacher_top_log_probs: torch.Tensor,
+    teacher_tail_prob: torch.Tensor,
+) -> torch.Tensor:
+    """Compute one token chunk of the teacher-top-k-plus-tail forward KL."""
+
+    student_logits_f = student_logits.float()
+    student_log_z = torch.logsumexp(student_logits_f, dim=-1, keepdim=True)
+    student_top_log_probs = student_logits_f.gather(-1, teacher_top_indices) - student_log_z
+    teacher_top_prob = teacher_top_log_probs.exp()
+    token_kl = (teacher_top_prob * (teacher_top_log_probs - student_top_log_probs)).sum(dim=-1)
+
+    if teacher_top_indices.shape[-1] < student_logits.shape[-1]:
+        student_top_log_mass = torch.logsumexp(student_top_log_probs, dim=-1).clamp_max(0.0)
+        student_tail_prob = (-torch.expm1(student_top_log_mass)).clamp_min(torch.finfo(torch.float32).tiny)
+        token_kl = token_kl + teacher_tail_prob * (teacher_tail_prob.log() - student_tail_prob.log())
+    return token_kl
+
+
+def dapo_reference_topk_forward_kl(
+    student_logits: torch.Tensor,
+    teacher_top_indices: torch.Tensor,
+    teacher_top_log_probs: torch.Tensor,
+    teacher_tail_prob: torch.Tensor,
+    token_chunk_size: int = _DAPO_REFERENCE_KL_TOKEN_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Return a memory-bounded teacher-top-k-plus-tail approximation of ``KL(teacher || student)``.
+
+    Each token chunk is activation-checkpointed while gradients are enabled. This prevents the
+    full-vocabulary FP32 logits and their gradients from being resident for all selected response
+    tokens at once, without changing the KL approximation.
+    """
+
+    if student_logits.ndim != 2:
+        raise ValueError(
+            f"DAPO reference top-k student logits must have shape [tokens, vocab], got {tuple(student_logits.shape)}."
+        )
+    expected_shape = teacher_top_indices.shape
+    if teacher_top_log_probs.shape != expected_shape:
+        raise ValueError("DAPO reference teacher top-k indices and log-probs must have matching shapes.")
+    if teacher_tail_prob.shape != expected_shape[:-1]:
+        raise ValueError("DAPO reference teacher tail probability must have shape [tokens].")
+    if student_logits.shape[0] != expected_shape[0]:
+        raise ValueError("DAPO reference teacher and student top-k summaries must have the same token count.")
+    if not isinstance(token_chunk_size, int) or isinstance(token_chunk_size, bool) or token_chunk_size < 1:
+        raise ValueError(f"DAPO reference KL token_chunk_size must be a positive integer, got {token_chunk_size!r}.")
+
+    num_tokens = student_logits.shape[0]
+    if num_tokens == 0:
+        return _dapo_reference_topk_forward_kl_chunk(
+            student_logits,
+            teacher_top_indices,
+            teacher_top_log_probs,
+            teacher_tail_prob,
+        )
+
+    checkpoint_chunks = torch.is_grad_enabled() and student_logits.requires_grad
+    token_kl_chunks = []
+    for start in range(0, num_tokens, token_chunk_size):
+        stop = min(start + token_chunk_size, num_tokens)
+        chunk_args = (
+            student_logits[start:stop],
+            teacher_top_indices[start:stop],
+            teacher_top_log_probs[start:stop],
+            teacher_tail_prob[start:stop],
+        )
+        if checkpoint_chunks:
+            chunk_kl = activation_checkpoint(
+                _dapo_reference_topk_forward_kl_chunk,
+                *chunk_args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            chunk_kl = _dapo_reference_topk_forward_kl_chunk(*chunk_args)
+        token_kl_chunks.append(chunk_kl)
+    return torch.cat(token_kl_chunks, dim=0)
+
+
+def gather_dapo_reference_teacher_topk(
+    teacher_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    row_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather cached old-policy teacher targets in micro-batch token order."""
+
+    if row_ids.ndim != 1:
+        raise ValueError(f"DAPO reference KL row_ids must be one-dimensional, got {tuple(row_ids.shape)}.")
+    if loss_mask.ndim != 2 or loss_mask.shape[0] != row_ids.shape[0]:
+        raise ValueError(
+            "DAPO reference KL loss_mask must have shape [batch, response_length] with the same "
+            f"batch size as row_ids, got {tuple(loss_mask.shape)} and {tuple(row_ids.shape)}."
+        )
+
+    selected_rows = loss_mask.bool().any(dim=-1)
+    selected_row_ids = row_ids[selected_rows].detach().cpu().tolist()
+    selected_token_counts = loss_mask[selected_rows].sum(dim=-1).detach().cpu().tolist()
+    cached_indices = []
+    cached_log_probs = []
+    cached_tail_probs = []
+    top_k = None
+    for row_id, token_count in zip(selected_row_ids, selected_token_counts, strict=True):
+        row_id = int(row_id)
+        token_count = int(token_count)
+        if row_id not in teacher_cache:
+            raise ValueError(f"DAPO reference KL is missing an old-policy teacher cache entry for row {row_id}.")
+        indices, log_probs, tail_probs = teacher_cache[row_id]
+        if indices.ndim != 2 or log_probs.shape != indices.shape or tail_probs.shape != indices.shape[:-1]:
+            raise ValueError(f"DAPO reference KL teacher cache entry for row {row_id} has invalid shapes.")
+        if indices.shape[0] != token_count:
+            raise ValueError(
+                f"DAPO reference KL teacher cache row {row_id} contains {indices.shape[0]} tokens, "
+                f"but its current loss mask selects {token_count}."
+            )
+        if top_k is None:
+            top_k = indices.shape[-1]
+        elif indices.shape[-1] != top_k:
+            raise ValueError("DAPO reference KL teacher cache entries must use one shared top_k.")
+        cached_indices.append(indices)
+        cached_log_probs.append(log_probs)
+        cached_tail_probs.append(tail_probs)
+
+    if not cached_indices:
+        raise ValueError("DAPO reference KL cannot gather an empty old-policy teacher target.")
+    return (
+        torch.cat(cached_indices, dim=0).to(device=device, dtype=torch.long),
+        torch.cat(cached_log_probs, dim=0).to(device=device),
+        torch.cat(cached_tail_probs, dim=0).to(device=device),
+    )
+
+
+def mix_dapo_reference_kl_loss(
+    dapo_loss: torch.Tensor,
+    reference_kl_loss: torch.Tensor,
+    loss_coef: float,
+) -> torch.Tensor:
+    """Return the configured convex combination of DAPO and reference-KL losses."""
+
+    return (1.0 - loss_coef) * dapo_loss + loss_coef * reference_kl_loss
+
+
+class StepValueProbe(nn.Module):
+    """Two-layer MLP that predicts eventual success from a step-tail hidden state."""
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_layer = nn.Linear(self.input_dim, self.hidden_dim, dtype=torch.float32)
+        self.activation = nn.SiLU()
+        self.output_layer = nn.Linear(self.hidden_dim, 1, dtype=torch.float32)
+
+    def reset_parameters(self) -> None:
+        """Reset both trainable layers without changing the architecture."""
+        self.input_layer.reset_parameters()
+        self.output_layer.reset_parameters()
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.output_layer(self.activation(self.input_layer(hidden)))
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -58,7 +258,6 @@ class DataParallelPPOActor(BasePPOActor):
         config (ActorConfig): Actor config
         actor_module (nn.Module): Actor or ref module
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
-        medium_policy_module (nn.Module, optional): Independent FSDP EMA policy used for medium scoring.
     """
 
     def __init__(
@@ -66,13 +265,11 @@ class DataParallelPPOActor(BasePPOActor):
         config: ActorConfig,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
-        medium_policy_module: nn.Module | None = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
-        self.medium_policy_module = medium_policy_module
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -123,160 +320,225 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
-        self.medium_ema_alpha = float(self.config.get("medium_ema_alpha", 1.0))
-        self.save_medium_policy_checkpoint = bool(self.config.get("save_medium_policy_checkpoint", True))
-        if not 0.0 <= self.medium_ema_alpha <= 1.0:
-            raise ValueError(
-                "medium_ema_alpha must be in [0, 1], "
-                f"got {self.medium_ema_alpha}."
-            )
-        if (
-            self.actor_optimizer is not None
-            and self.medium_ema_alpha < 1.0
-            and self.medium_policy_module is None
-        ):
-            raise ValueError("An independent medium_policy_module is required when medium_ema_alpha < 1.")
-        if self.medium_policy_module is not None:
-            self.medium_policy_module.eval()
-            self._copy_actor_to_medium_policy()
-
-        self._delimiter_token_id_cache = {}
+        self._init_step_value_probe()
 
     @staticmethod
-    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        """Return the tensor shard owned by this rank for a parameter or buffer."""
-        if isinstance(tensor, DTensor):
-            return tensor._local_tensor
-        return tensor
-
-    @torch.no_grad()
-    def _copy_named_tensors(
-        self,
-        source_tensors: dict[str, torch.Tensor],
-        target_tensors: dict[str, torch.Tensor],
-    ) -> None:
-        if source_tensors.keys() != target_tensors.keys():
-            raise RuntimeError("Actor and medium-policy tensor names do not match.")
-        for name, source_tensor in source_tensors.items():
-            source_local_tensor = self._local_tensor(source_tensor).detach()
-            target_local_tensor = self._local_tensor(target_tensors[name])
-            if source_local_tensor.shape != target_local_tensor.shape:
-                raise RuntimeError(
-                    f"Actor tensor {name!r} has shape {source_local_tensor.shape}, "
-                    f"but the medium-policy shard has shape {target_local_tensor.shape}."
-                )
-            target_local_tensor.copy_(
-                source_local_tensor.to(device=target_local_tensor.device, dtype=target_local_tensor.dtype)
-            )
-
-    @torch.no_grad()
-    def _copy_actor_to_medium_policy(self) -> None:
-        """Reset the independent medium policy to exactly match the online actor."""
-        if self.medium_policy_module is None:
-            return
-        self._copy_named_tensors(
-            dict(self.actor_module.named_parameters()),
-            dict(self.medium_policy_module.named_parameters()),
-        )
-        self._copy_named_tensors(
-            dict(self.actor_module.named_buffers()),
-            dict(self.medium_policy_module.named_buffers()),
-        )
-
-    @torch.no_grad()
-    def update_medium_policy(self) -> None:
-        """Apply ``medium <- (1 - alpha) * medium + alpha * actor`` once."""
-        if self.medium_policy_module is None:
-            return
-
-        alpha = self.medium_ema_alpha
-        if alpha == 0.0:
-            return
-        actor_parameters = dict(self.actor_module.named_parameters())
-        medium_parameters = dict(self.medium_policy_module.named_parameters())
-        if actor_parameters.keys() != medium_parameters.keys():
-            raise RuntimeError("Actor and medium-policy parameter names do not match.")
-
-        for name, actor_parameter in actor_parameters.items():
-            if not actor_parameter.requires_grad:
+    def _unwrap_model(module: nn.Module) -> nn.Module:
+        """Unwrap only transparent distributed/PEFT containers."""
+        seen = set()
+        while id(module) not in seen:
+            seen.add(id(module))
+            if isinstance(module, FSDP):
+                module = module._fsdp_wrapped_module
                 continue
-            actor_local_parameter = self._local_tensor(actor_parameter).detach()
-            medium_local_parameter = self._local_tensor(medium_parameters[name])
-            actor_local_parameter = actor_local_parameter.to(
-                device=medium_local_parameter.device,
-                dtype=medium_local_parameter.dtype,
+            wrapped_module = getattr(module, "module", None)
+            if isinstance(wrapped_module, nn.Module) and wrapped_module is not module:
+                module = wrapped_module
+                continue
+            break
+        return module
+
+    @staticmethod
+    def _model_hidden_size(module: nn.Module) -> int:
+        module = DataParallelPPOActor._unwrap_model(module)
+        config = getattr(module, "config", None)
+        candidate_configs = [config, getattr(config, "text_config", None)]
+        for candidate in candidate_configs:
+            if candidate is None:
+                continue
+            for field_name in ("hidden_size", "n_embd", "d_model"):
+                value = getattr(candidate, field_name, None)
+                if value is not None:
+                    return int(value)
+        raise ValueError("step_value_probe could not infer the actor hidden size from the model config.")
+
+    def _init_step_value_probe(self) -> None:
+        probe_config = self.config.get("step_value_probe", None)
+        self.step_value_probe_enabled = bool(probe_config is not None and probe_config.get("enabled", False))
+        self.step_value_probe = None
+        self.step_value_probe_optimizer = None
+        self.step_value_probe_updates = 0
+        self.step_value_probe_warmup_completed_at = None
+        self.step_value_probe_last_global_step = None
+        self._step_value_probe_needs_broadcast = False
+
+        if not self.step_value_probe_enabled:
+            return
+        if self.actor_optimizer is None:
+            raise ValueError("step_value_probe is supported only by the trainable actor.")
+        if self.use_ulysses_sp:
+            raise ValueError("step_value_probe does not support Ulysses sequence parallelism (SP > 1).")
+        if self.use_prefix_grouper:
+            raise ValueError("step_value_probe does not support use_prefix_grouper=True.")
+        if self.use_fused_kernels:
+            raise ValueError("step_value_probe does not support use_fused_kernels=True.")
+
+        model = self._unwrap_model(self.actor_module)
+        model_config = getattr(model, "config", None)
+        if getattr(model_config, "vision_config", None) is not None:
+            raise ValueError("step_value_probe currently supports text-only causal language models.")
+        output_embeddings = getattr(model, "get_output_embeddings", lambda: None)()
+        if not isinstance(output_embeddings, nn.Module):
+            raise ValueError(
+                "step_value_probe requires a causal language model with a module returned by get_output_embeddings()."
             )
-            if medium_local_parameter.is_floating_point() or medium_local_parameter.is_complex():
-                medium_local_parameter.lerp_(actor_local_parameter, alpha)
-            else:
-                medium_local_parameter.copy_(actor_local_parameter)
 
-        # Buffers are not part of theta, but copying them keeps model-specific
-        # inference state (for example QAT observers) coherent with the actor.
-        self._copy_named_tensors(
-            dict(self.actor_module.named_buffers()),
-            dict(self.medium_policy_module.named_buffers()),
+        hidden_size = self._model_hidden_size(model)
+        probe_hidden_size = int(probe_config.get("hidden_dim", 256))
+        # The auxiliary probe must not perturb the actor's checkpointed RNG stream.
+        with torch.random.fork_rng(devices=[], device_type="cpu"):
+            self.step_value_probe = StepValueProbe(hidden_size, probe_hidden_size)
+        self._step_value_probe_needs_broadcast = True
+        self.step_value_probe_optimizer = torch.optim.AdamW(
+            self.step_value_probe.parameters(),
+            lr=float(probe_config.get("lr", 1e-3)),
+            weight_decay=float(probe_config.get("weight_decay", 0.0)),
         )
-
-    def medium_policy_state_dict(self, include_buffers: bool = True) -> dict | None:
-        """Return the rank-local EMA medium-policy state for checkpointing.
-
-        Buffers always track the online actor and are therefore optional: after
-        the actor checkpoint has been restored, ``load_medium_policy_state_dict``
-        can reconstruct them from that actor.  Omitting them is useful when one
-        parameter shard is shared by several HSDP/DDP replica ranks whose
-        runtime buffers are not necessarily identical.
-        """
-        if self.medium_policy_module is None:
-            return None
-        state_dict = {
-            "ema_alpha": self.medium_ema_alpha,
-            "parameters": {
-                name: self._local_tensor(parameter).detach().cpu()
-                for name, parameter in self.medium_policy_module.named_parameters()
-            },
-        }
-        if include_buffers:
-            state_dict["buffers"] = {
-                name: self._local_tensor(buffer).detach().cpu()
-                for name, buffer in self.medium_policy_module.named_buffers()
-            }
-        return state_dict
 
     @property
-    def has_medium_policy(self) -> bool:
-        return self.medium_policy_module is not None
+    def has_step_value_probe(self) -> bool:
+        return self.step_value_probe is not None
+
+    def _broadcast_step_value_probe(self) -> bool:
+        if not self.has_step_value_probe or not torch.distributed.is_initialized():
+            return False
+        for parameter in self.step_value_probe.parameters():
+            torch.distributed.broadcast(parameter.data, src=0)
+        return True
+
+    @staticmethod
+    def _move_optimizer_value(value, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device)
+        if isinstance(value, dict):
+            return {key: DataParallelPPOActor._move_optimizer_value(item, device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [DataParallelPPOActor._move_optimizer_value(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(DataParallelPPOActor._move_optimizer_value(item, device) for item in value)
+        return value
+
+    def _ensure_step_value_probe_device(self, device: torch.device) -> None:
+        if not self.has_step_value_probe:
+            return
+        self.step_value_probe.to(device=device, dtype=torch.float32)
+        for state in self.step_value_probe_optimizer.state.values():
+            for key, value in list(state.items()):
+                state[key] = self._move_optimizer_value(value, device)
+        if self._step_value_probe_needs_broadcast and self._broadcast_step_value_probe():
+            self._step_value_probe_needs_broadcast = False
+
+    def _get_output_embeddings_module(self) -> nn.Module:
+        model = self._unwrap_model(self.actor_module)
+        output_embeddings = getattr(model, "get_output_embeddings", lambda: None)()
+        if not isinstance(output_embeddings, nn.Module):
+            raise RuntimeError("Final-hidden capture lost access to the actor output-embedding module.")
+        return output_embeddings
+
+    @contextmanager
+    def _capture_final_hidden_state(self, selector: torch.Tensor):
+        """Capture the lm-head input without asking Transformers for every layer."""
+        captured = []
+
+        def capture_input(_module, args):
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise RuntimeError("Final-hidden capture expected the lm-head input to be a tensor.")
+            hidden = args[0]
+            if selector.shape != hidden.shape[:-1]:
+                raise RuntimeError(
+                    "Final-hidden selector does not match the lm-head input: "
+                    f"selector={tuple(selector.shape)}, hidden={tuple(hidden.shape)}."
+                )
+            captured.append(hidden[selector].detach())
+
+        handle = self._get_output_embeddings_module().register_forward_pre_hook(capture_input)
+        try:
+            yield captured
+        finally:
+            handle.remove()
+
+    @staticmethod
+    def _take_captured_hidden(captured: list[torch.Tensor]) -> torch.Tensor:
+        if len(captured) != 1:
+            raise RuntimeError(
+                "Final-hidden capture expected exactly one lm-head invocation per actor forward, "
+                f"but observed {len(captured)}."
+            )
+        hidden = captured[0]
+        if not hidden.is_floating_point() or hidden.ndim != 2:
+            raise RuntimeError("Expected selected final hidden states with shape [steps, hidden].")
+        return hidden
+
+    @staticmethod
+    def _nested_to_cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {key: DataParallelPPOActor._nested_to_cpu(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [DataParallelPPOActor._nested_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(DataParallelPPOActor._nested_to_cpu(item) for item in value)
+        return value
+
+    def step_value_probe_state_dict(self) -> dict | None:
+        if not self.has_step_value_probe:
+            return None
+        return {
+            "format_version": 2,
+            "architecture": {
+                "type": "two_layer_mlp",
+                "input_dim": self.step_value_probe.input_dim,
+                "hidden_dim": self.step_value_probe.hidden_dim,
+            },
+            "model": {name: tensor.detach().cpu() for name, tensor in self.step_value_probe.state_dict().items()},
+            "optimizer": self._nested_to_cpu(self.step_value_probe_optimizer.state_dict()),
+            "updates": self.step_value_probe_updates,
+            "warmup_completed_at": self.step_value_probe_warmup_completed_at,
+            "last_global_step": self.step_value_probe_last_global_step,
+        }
 
     @torch.no_grad()
-    def load_medium_policy_state_dict(self, state_dict: dict | None) -> None:
-        """Restore the rank-local EMA medium policy, or reset it from the actor for old checkpoints."""
-        if self.medium_policy_module is None:
+    def reset_step_value_probe(self) -> None:
+        """Reset an enabled probe and require a fresh warmup round."""
+        if not self.has_step_value_probe:
+            return
+        probe_device = next(self.step_value_probe.parameters()).device
+        fork_devices = [] if probe_device.type == "cpu" else [probe_device]
+        with torch.random.fork_rng(devices=fork_devices, device_type=probe_device.type):
+            self.step_value_probe.reset_parameters()
+        self._step_value_probe_needs_broadcast = True
+        self.step_value_probe_optimizer.state.clear()
+        self.step_value_probe_updates = 0
+        self.step_value_probe_warmup_completed_at = None
+        self.step_value_probe_last_global_step = None
+
+    def load_step_value_probe_state_dict(self, state_dict: dict | None) -> None:
+        if not self.has_step_value_probe:
             return
         if state_dict is None:
-            self._copy_actor_to_medium_policy()
+            self.reset_step_value_probe()
             return
-
-        saved_parameters = state_dict.get("parameters", state_dict)
-        medium_parameters = dict(self.medium_policy_module.named_parameters())
-        if saved_parameters.keys() != medium_parameters.keys():
-            raise RuntimeError("EMA medium-policy checkpoint parameters do not match the actor parameters.")
-        for name, saved_parameter in saved_parameters.items():
-            medium_parameter = self._local_tensor(medium_parameters[name])
-            if saved_parameter.shape != medium_parameter.shape:
-                raise RuntimeError(
-                    f"EMA medium-policy checkpoint parameter {name!r} has shape {saved_parameter.shape}, "
-                    f"but the actor shard has shape {medium_parameter.shape}."
-                )
-            medium_parameter.copy_(saved_parameter.to(dtype=medium_parameter.dtype, device=medium_parameter.device))
-
-        saved_buffers = state_dict.get("buffers")
-        if saved_buffers is None:
-            self._copy_named_tensors(
-                dict(self.actor_module.named_buffers()),
-                dict(self.medium_policy_module.named_buffers()),
+        format_version = int(state_dict.get("format_version", 0))
+        if format_version != 2:
+            raise RuntimeError("Unsupported step-value probe checkpoint format.")
+        expected_architecture = {
+            "type": "two_layer_mlp",
+            "input_dim": self.step_value_probe.input_dim,
+            "hidden_dim": self.step_value_probe.hidden_dim,
+        }
+        checkpoint_architecture = state_dict.get("architecture")
+        if checkpoint_architecture != expected_architecture:
+            raise RuntimeError(
+                "Step-value probe checkpoint architecture does not match the configured probe: "
+                f"checkpoint={checkpoint_architecture!r}, configured={expected_architecture!r}."
             )
-        else:
-            self._copy_named_tensors(saved_buffers, dict(self.medium_policy_module.named_buffers()))
+        self.step_value_probe.load_state_dict(state_dict["model"], strict=True)
+        self.step_value_probe_optimizer.load_state_dict(state_dict["optimizer"])
+        self.step_value_probe_updates = int(state_dict.get("updates", 0))
+        self.step_value_probe_warmup_completed_at = state_dict.get("warmup_completed_at")
+        self.step_value_probe_last_global_step = state_dict.get("last_global_step")
+        self._step_value_probe_needs_broadcast = False
 
     def _reshard_model_after_forward(self, model: nn.Module) -> None:
         if not torch.distributed.is_initialized():
@@ -289,28 +551,17 @@ class DataParallelPPOActor(BasePPOActor):
         elif isinstance(model, FSDPModule):
             model.reshard()
 
-    @contextmanager
-    def _use_medium_policy(self):
-        """Temporarily run forwards with the EMA medium policy, restoring the actor afterwards."""
-        if self.medium_policy_module is None:
-            yield
-            return
-
-        actor_module = self.actor_module
-        self.actor_module = self.medium_policy_module
-        self.actor_module.eval()
-        try:
-            yield
-        finally:
-            self._reshard_model_after_forward(self.actor_module)
-            self.actor_module = actor_module
-
     def _forward_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
         temperature: float,
         calculate_entropy: bool = False,
         return_topk_logits: bool = False,
+        return_full_logits: bool = False,
+        return_valid_logits: bool = False,
+        valid_logits_only: bool = False,
+        return_step_hidden: bool = False,
+        return_step_value_hidden: bool | None = None,
         use_prefix_grouper: bool | None = None,
         use_remove_padding: bool | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -325,16 +576,53 @@ class DataParallelPPOActor(BasePPOActor):
                 if return_topk_logits is True:
                     logits: (bs, response_len, min(100, vocab_size))
                     logits_indices: (bs, response_len, min(100, vocab_size))
+                if return_full_logits is True:
+                    full_logits: (bs, response_len, vocab_size)
+                if return_valid_logits is True:
+                    valid_logits: (num_valid_response_tokens, vocab_size)
+                    if valid_logits_only is True, no policy outputs are computed
+                if return_step_hidden is True:
+                    step_hidden: hidden states selected by ``step_end_mask`` in
+                        row-major order; this does not enable or invoke a probe.
         """
-        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False) and not (
+            return_full_logits or return_valid_logits
+        )
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
         use_remove_padding = self.use_remove_padding if use_remove_padding is None else use_remove_padding
+        legacy_step_hidden_requested = return_step_value_hidden is not None
+        if legacy_step_hidden_requested:
+            if return_step_hidden and not bool(return_step_value_hidden):
+                raise ValueError("Conflicting return_step_hidden and return_step_value_hidden settings")
+            return_step_hidden = bool(return_step_value_hidden)
+        if return_step_hidden:
+            if self.use_ulysses_sp:
+                raise ValueError("Step-hidden capture does not support Ulysses sequence parallelism (SP > 1).")
+            if self.use_fused_kernels:
+                raise ValueError("Step-hidden capture does not support use_fused_kernels=True.")
+            if self.use_prefix_grouper:
+                raise ValueError("Step-hidden capture does not support use_prefix_grouper=True.")
+            if return_topk_logits:
+                raise ValueError("Step-hidden capture cannot be combined with return_topk_logits=True.")
+            if "step_end_mask" not in micro_batch:
+                raise ValueError("Step-hidden capture requires step_end_mask in the actor batch.")
         if return_topk_logits and self.use_fused_kernels:
             raise ValueError("DGPO top-k logits are not supported with use_fused_kernels=True.")
+        if valid_logits_only and not return_valid_logits:
+            raise ValueError("valid_logits_only=True requires return_valid_logits=True.")
+        if return_full_logits or return_valid_logits:
+            if self.use_fused_kernels:
+                raise ValueError("Full-vocabulary logits do not support use_fused_kernels=True.")
+            if self.use_ulysses_sp:
+                raise ValueError("Full-vocabulary logits do not support Ulysses sequence parallelism.")
+            if return_full_logits and return_valid_logits:
+                raise ValueError("return_full_logits and return_valid_logits cannot both be enabled.")
+            if return_full_logits and (return_topk_logits or return_step_hidden or calculate_entropy):
+                raise ValueError("return_full_logits cannot be combined with other forward outputs.")
         # PrefixGrouper path for shared-prefix optimization
         prefix_grouper_override = use_prefix_grouper is not None
         use_prefix_grouper = self.use_prefix_grouper if use_prefix_grouper is None else use_prefix_grouper
-        if use_prefix_grouper and not return_topk_logits:
+        if use_prefix_grouper and not return_topk_logits and not return_full_logits and not return_valid_logits:
             can_use_pg = (
                 not use_remove_padding
                 and not self.use_ulysses_sp
@@ -371,6 +659,23 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            valid_logits = None
+            if return_step_hidden:
+                step_end_mask = micro_batch["step_end_mask"].bool()
+                if step_end_mask.shape != (batch_size, response_length):
+                    raise ValueError(
+                        "step_end_mask must have shape [batch, response_length], "
+                        f"got {tuple(step_end_mask.shape)} instead of {(batch_size, response_length)}."
+                    )
+                response_attention_mask = attention_mask[:, -response_length:].bool()
+                if (step_end_mask & ~response_attention_mask).any():
+                    raise ValueError("step_end_mask may select only valid response tokens.")
+                full_step_end_mask = torch.zeros(
+                    (batch_size, seqlen),
+                    dtype=torch.bool,
+                    device=step_end_mask.device,
+                )
+                full_step_end_mask[:, -response_length:] = step_end_mask
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -448,20 +753,41 @@ class DataParallelPPOActor(BasePPOActor):
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
+                if return_step_hidden:
+                    step_end_selector = index_first_axis(
+                        rearrange(full_step_end_mask.unsqueeze(-1), "b s ... -> (b s) ..."),
+                        indices,
+                    ).squeeze(-1)
+                    if is_mask_all_zero:
+                        step_end_selector = torch.zeros(
+                            input_ids_rmpad.shape,
+                            dtype=torch.bool,
+                            device=input_ids_rmpad.device,
+                        )
+                    else:
+                        step_end_selector = step_end_selector.unsqueeze(0)
+
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                    **extra_args,
-                )  # prevent model thinks we are generating
+                capture_context = (
+                    self._capture_final_hidden_state(step_end_selector) if return_step_hidden else nullcontext(None)
+                )
+                with capture_context as captured_hidden:
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        **extra_args,
+                    )  # prevent model thinks we are generating
+
+                if return_step_hidden:
+                    step_hidden = self._take_captured_hidden(captured_hidden)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -470,16 +796,38 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    if return_full_logits or return_valid_logits:
+                        valid_response_mask = micro_batch.get(
+                            "dapo_reference_kl_loss_mask", micro_batch["response_mask"]
+                        )
+                        predictor_mask = torch.zeros((batch_size, seqlen), dtype=torch.bool, device=input_ids.device)
+                        predictor_mask[:, -response_length - 1 : -1] = valid_response_mask.bool()
+                        predictor_selector = index_first_axis(
+                            rearrange(predictor_mask.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                        ).squeeze(-1)
+                        selected_logits = logits_rmpad[predictor_selector]
+                        if return_valid_logits:
+                            valid_logits = selected_logits
+                            if valid_logits_only:
+                                return {"valid_logits": valid_logits}
+                        else:
+                            response_selector = micro_batch["response_mask"].bool().reshape(-1).nonzero().squeeze(-1)
+                            flat_response_logits = logits_rmpad.new_zeros(
+                                (batch_size * response_length, logits_rmpad.shape[-1])
+                            )
+                            flat_response_logits = flat_response_logits.index_copy(
+                                0, response_selector, selected_logits
+                            )
+                            response_logits = flat_response_logits.view(
+                                batch_size, response_length, logits_rmpad.shape[-1]
+                            )
+                            return {"full_logits": response_logits}
                     if return_topk_logits:
                         topk = min(100, logits_rmpad.size(-1))
-                        topk_logits, topk_logits_indices = torch.topk(
-                            logits_rmpad.detach(), k=topk, dim=-1
-                        )
+                        topk_logits, topk_logits_indices = torch.topk(logits_rmpad.detach(), k=topk, dim=-1)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
+                    inplace_backward = not (calculate_entropy or return_valid_logits)
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
@@ -601,14 +949,21 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                    **extra_args,
-                )  # prevent model thinks we are generating
+                capture_context = (
+                    self._capture_final_hidden_state(full_step_end_mask) if return_step_hidden else nullcontext(None)
+                )
+                with capture_context as captured_hidden:
+                    output = self.actor_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        **extra_args,
+                    )  # prevent model thinks we are generating
+
+                if return_step_hidden:
+                    step_hidden = self._take_captured_hidden(captured_hidden)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -619,10 +974,23 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if return_valid_logits:
+                        valid_response_mask = micro_batch.get(
+                            "dapo_reference_kl_loss_mask", micro_batch["response_mask"]
+                        )
+                        valid_logits = logits[valid_response_mask.bool()]
+                        if valid_logits_only:
+                            return {"valid_logits": valid_logits}
+                    if return_full_logits:
+                        return {"full_logits": logits}
                     if return_topk_logits:
                         topk = min(100, logits.size(-1))
                         topk_logits, topk_logits_indices = torch.topk(logits.detach(), k=topk, dim=-1)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    log_probs = logprobs_from_logits(
+                        logits,
+                        micro_batch["responses"],
+                        inplace_backward=not return_valid_logits,
+                    )
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -644,6 +1012,12 @@ class DataParallelPPOActor(BasePPOActor):
             if return_topk_logits:
                 outputs["logits"] = topk_logits
                 outputs["logits_indices"] = topk_logits_indices
+            if return_valid_logits:
+                outputs["valid_logits"] = valid_logits
+            if return_step_hidden:
+                outputs["step_hidden"] = step_hidden
+                if legacy_step_hidden_requested:
+                    outputs["step_value_hidden"] = step_hidden
             return outputs
 
     def _get_fsdp_process_group(self, model: nn.Module | None = None):
@@ -702,12 +1076,107 @@ class DataParallelPPOActor(BasePPOActor):
 
         return grad_norm
 
+    def _step_value_is_ready(self, global_step: int) -> bool:
+        probe_config = self.config.step_value_probe
+        return (
+            self.step_value_probe_updates >= int(probe_config.warmup_updates)
+            and self.step_value_probe_warmup_completed_at is not None
+            and global_step > int(self.step_value_probe_warmup_completed_at)
+        )
+
+    def _sync_step_value_probe_gradients(self, local_trajectory_count: int) -> int:
+        probe_parameter = next(self.step_value_probe.parameters())
+        count = torch.tensor(
+            float(local_trajectory_count),
+            dtype=torch.float32,
+            device=probe_parameter.device,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            for parameter in self.step_value_probe.parameters():
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
+                torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
+
+        global_trajectory_count = int(count.item())
+        if global_trajectory_count > 0:
+            for parameter in self.step_value_probe.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(count)
+        return global_trajectory_count
+
+    def _step_value_probe_grad_norm(self) -> torch.Tensor:
+        """Return the L2 norm of the synchronized probe gradients."""
+        probe_parameter = next(self.step_value_probe.parameters())
+        squared_norm = torch.zeros((), dtype=torch.float32, device=probe_parameter.device)
+        for parameter in self.step_value_probe.parameters():
+            if parameter.grad is not None:
+                squared_norm.add_(parameter.grad.detach().float().square().sum())
+        return squared_norm.sqrt()
+
+    def _update_step_value_probe(
+        self,
+        hidden: torch.Tensor,
+        targets: torch.Tensor,
+        endpoint_weights: torch.Tensor,
+        local_trajectory_count: int,
+        global_step: int,
+    ) -> torch.Tensor:
+        """Update the replicated probe and return its synchronized gradient norm."""
+        if self.step_value_probe_last_global_step is not None:
+            previous_step = int(self.step_value_probe_last_global_step)
+            if global_step < previous_step:
+                raise ValueError(
+                    "step_value_probe received a global_steps value older than its last update: "
+                    f"{global_step} < {previous_step}."
+                )
+            if global_step == previous_step:
+                probe_parameter = next(self.step_value_probe.parameters())
+                gradient_norm = torch.zeros((), dtype=torch.float32, device=probe_parameter.device)
+                return gradient_norm
+
+        probe_config = self.config.step_value_probe
+        is_warmup = self.step_value_probe_updates < int(probe_config.warmup_updates)
+        epochs = int(probe_config.warmup_epochs if is_warmup else probe_config.update_epochs)
+        self.step_value_probe.train()
+        self._ensure_step_value_probe_device(hidden.device)
+
+        did_update = False
+        gradient_norm = torch.zeros((), dtype=torch.float32, device=hidden.device)
+        for _ in range(epochs):
+            self.step_value_probe_optimizer.zero_grad(set_to_none=True)
+            if hidden.numel() > 0:
+                logits = self.step_value_probe(hidden.float()).squeeze(-1)
+                endpoint_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits,
+                    targets,
+                    reduction="none",
+                )
+                (endpoint_losses * endpoint_weights).sum().backward()
+
+            global_trajectory_count = self._sync_step_value_probe_gradients(local_trajectory_count)
+            gradient_norm = self._step_value_probe_grad_norm()
+            if global_trajectory_count > 0:
+                self.step_value_probe_optimizer.step()
+                did_update = True
+
+        if did_update:
+            self.step_value_probe_updates += 1
+            self.step_value_probe_last_global_step = global_step
+            if self.step_value_probe_updates == int(probe_config.warmup_updates):
+                self.step_value_probe_warmup_completed_at = global_step
+        self.step_value_probe.eval()
+        return gradient_norm
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(
         self,
         data: DataProto,
         calculate_entropy: bool = False,
         return_topk_logits: bool = False,
+        compute_step_value_probe: bool = False,
+        compute_similarity_step_embeddings: bool = False,
+        compute_step_values: bool | None = None,
     ) -> dict[str, torch.Tensor | float]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
@@ -730,8 +1199,96 @@ class DataParallelPPOActor(BasePPOActor):
                 - ``sum_pi_squared``: tensor of shape [batch_size, response_length]. torch.float32.
                 - ``logits``: top-k logits of shape [batch_size, response_length, k], when requested.
                 - ``logits_indices``: top-k token indices with the same shape as ``logits``, when requested.
+                - ``step_values``: sparse step-end probabilities with shape [batch_size, response_length].
+                - ``step_value_trajectory_logit_mean``: trajectory-balanced input for prompt-center calibration.
+                - ``step_value_ready``: whether the pre-update predictions are usable for policy training.
+                - ``step_value_probe_loss``: pre-update mean probe loss for each trajectory.
+                - ``step_value_probe_grad_norm``: synchronized gradient L2 norm of the final probe epoch.
+                - ``step_value_audit_trajectory_logit_mean``: post-update mean raw logit for audit trajectories.
+                - ``step_value_audit_endpoint_count``: number of cached endpoints used by each audit trajectory.
+                - ``step_value_audit_ready_next``: whether an audit trajectory is ready for next-step calibration.
+                - ``step_value_forward_row_id``: stable row identifier echoed through dynamic batching.
+                - ``similarity_step_embeddings``: packed normalized ``H(end)-H(start)`` step representations.
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+
+        # ``compute_step_values`` is the deprecated name for the built-in
+        # probe request. Keep it for out-of-tree callers without conflating it
+        # with the provider-agnostic step-value estimator.
+        if compute_step_values is not None:
+            if compute_step_value_probe and not bool(compute_step_values):
+                raise ValueError("Conflicting compute_step_value_probe and compute_step_values settings.")
+            compute_step_value_probe = bool(compute_step_values)
+
+        if compute_step_value_probe:
+            if not self.has_step_value_probe:
+                raise ValueError("compute_step_value_probe requires actor.step_value_probe.enabled=True.")
+            if return_topk_logits:
+                raise ValueError("step_value_probe cannot be combined with return_topk_logits=True.")
+            missing_keys = [key for key in ("step_end_mask", "step_value_targets") if key not in data.batch]
+            if missing_keys:
+                raise ValueError("compute_step_value_probe requires actor batch keys: " + ", ".join(missing_keys))
+            if "global_steps" not in data.meta_info:
+                raise ValueError("compute_step_value_probe requires global_steps in data.meta_info.")
+            global_step = int(data.meta_info["global_steps"])
+            step_value_ready_before_update = self._step_value_is_ready(global_step)
+
+            audit_contract_keys = (
+                "step_value_probe_update_mask",
+                "step_value_prompt_center_audit_mask",
+                "step_value_forward_row_id",
+            )
+            present_audit_contract_keys = [key for key in audit_contract_keys if key in data.batch]
+            delayed_audit_requested = bool(present_audit_contract_keys)
+            if delayed_audit_requested and len(present_audit_contract_keys) != len(audit_contract_keys):
+                missing_audit_contract_keys = [
+                    key for key in audit_contract_keys if key not in present_audit_contract_keys
+                ]
+                raise ValueError(
+                    "Delayed step-value audit requires all actor batch keys: "
+                    + ", ".join(missing_audit_contract_keys)
+                )
+            if delayed_audit_requested:
+                batch_size = data.batch["responses"].shape[0]
+                update_mask = data.batch["step_value_probe_update_mask"]
+                audit_mask = data.batch["step_value_prompt_center_audit_mask"]
+                forward_row_id = data.batch["step_value_forward_row_id"]
+                for key, mask in (
+                    ("step_value_probe_update_mask", update_mask),
+                    ("step_value_prompt_center_audit_mask", audit_mask),
+                ):
+                    if mask.ndim != 1 or mask.shape[0] != batch_size or mask.dtype != torch.bool:
+                        raise ValueError(f"{key} must be a bool tensor with shape [batch_size].")
+                integer_dtypes = {
+                    torch.int8,
+                    torch.int16,
+                    torch.int32,
+                    torch.int64,
+                    torch.uint8,
+                }
+                if (
+                    forward_row_id.ndim != 1
+                    or forward_row_id.shape[0] != batch_size
+                    or forward_row_id.dtype not in integer_dtypes
+                ):
+                    raise ValueError("step_value_forward_row_id must be an integer tensor with shape [batch_size].")
+                if torch.unique(forward_row_id).numel() != batch_size:
+                    raise ValueError("step_value_forward_row_id must be unique within an actor forward.")
+        if compute_step_value_probe and compute_similarity_step_embeddings:
+            raise ValueError("Probe values and similarity embeddings cannot be requested in the same actor pass.")
+        if compute_similarity_step_embeddings:
+            if return_topk_logits:
+                raise ValueError("Similarity step embeddings cannot be combined with return_topk_logits=True.")
+            missing_keys = [key for key in ("step_start_mask", "step_end_mask") if key not in data.batch]
+            if missing_keys:
+                raise ValueError(
+                    "compute_similarity_step_embeddings requires actor batch keys: " + ", ".join(missing_keys)
+                )
+            if "similarity_max_steps" not in data.meta_info:
+                raise ValueError("compute_similarity_step_embeddings requires similarity_max_steps in meta_info.")
+            similarity_max_steps = int(data.meta_info["similarity_max_steps"])
+            if similarity_max_steps <= 0:
+                raise ValueError("similarity_max_steps must be positive.")
 
         # set to eval
         self.actor_module.eval()
@@ -743,6 +1300,12 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if compute_step_value_probe:
+            select_keys.extend(["step_end_mask", "step_value_targets"])
+            if delayed_audit_requested:
+                select_keys.extend(audit_contract_keys)
+        if compute_similarity_step_embeddings:
+            select_keys.extend(["step_start_mask", "step_end_mask"])
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
         if self.use_prefix_grouper:
             select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
@@ -764,17 +1327,165 @@ class DataParallelPPOActor(BasePPOActor):
         logits_indices_lst = []
         entropy_lst = []
         sum_pi_squared_lst = []
+        step_values_lst = []
+        step_value_trajectory_logit_mean_lst = []
+        step_value_loss_lst = []
+        step_value_hidden_lst = []
+        step_value_target_lst = []
+        step_value_endpoint_weight_lst = []
+        step_value_audit_hidden_lst = []
+        step_value_audit_sample_index_lst = []
+        step_value_audit_mask_lst = []
+        step_value_forward_row_id_lst = []
+        similarity_step_embeddings_lst = []
+        local_step_value_trajectory_count = 0
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+            if compute_similarity_step_embeddings:
+                step_start_mask = model_inputs["step_start_mask"].bool()
+                similarity_step_end_mask = model_inputs["step_end_mask"].bool()
+                if not torch.equal(step_start_mask.sum(dim=-1), similarity_step_end_mask.sum(dim=-1)):
+                    raise ValueError("Similarity step start/end counts must match for every response.")
+                model_inputs["step_end_mask"] = step_start_mask | similarity_step_end_mask
             with torch.no_grad():
                 outputs = self._forward_micro_batch(
                     model_inputs,
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
                     return_topk_logits=return_topk_logits,
+                    return_step_hidden=compute_step_value_probe or compute_similarity_step_embeddings,
                 )
             log_probs_lst.append(outputs["log_probs"])
+            if compute_similarity_step_embeddings:
+                boundary_hidden = outputs["step_hidden"].detach()
+                boundary_mask = model_inputs["step_end_mask"].bool()
+                boundary_ordinals = boundary_mask.reshape(-1).long().cumsum(dim=0) - 1
+                start_indices = boundary_ordinals[step_start_mask.reshape(-1)]
+                end_indices = boundary_ordinals[similarity_step_end_mask.reshape(-1)]
+                if start_indices.numel() != end_indices.numel():
+                    raise RuntimeError("Captured similarity step start/end counts differ.")
+                step_embeddings = boundary_hidden.index_select(0, end_indices) - boundary_hidden.index_select(
+                    0, start_indices
+                )
+                step_embeddings = torch.nn.functional.normalize(
+                    step_embeddings.float(),
+                    p=2,
+                    dim=-1,
+                    eps=1e-12,
+                )
+                step_counts = similarity_step_end_mask.sum(dim=-1, dtype=torch.long)
+                packed_embeddings = torch.zeros(
+                    (similarity_step_end_mask.shape[0], similarity_max_steps, step_embeddings.shape[-1]),
+                    dtype=torch.float16,
+                    device=step_embeddings.device,
+                )
+                offset = 0
+                for row, count_tensor in enumerate(step_counts):
+                    count = int(count_tensor.item())
+                    packed_embeddings[row, :count] = step_embeddings[offset : offset + count].to(
+                        dtype=packed_embeddings.dtype
+                    )
+                    offset += count
+                if offset != step_embeddings.shape[0]:
+                    raise RuntimeError("Failed to pack every similarity step embedding.")
+                similarity_step_embeddings_lst.append(packed_embeddings)
+            if compute_step_value_probe:
+                step_value_hidden = outputs["step_hidden"].detach()
+                self._ensure_step_value_probe_device(step_value_hidden.device)
+                step_end_mask = model_inputs["step_end_mask"].bool()
+                step_value_targets = model_inputs["step_value_targets"].float().reshape(-1)
+                if step_value_targets.shape[0] != step_end_mask.shape[0]:
+                    raise ValueError(
+                        "step_value_targets must contain one scalar per trajectory, "
+                        f"got shape {tuple(model_inputs['step_value_targets'].shape)}."
+                    )
+                if not torch.isfinite(step_value_targets).all():
+                    raise ValueError("step_value_targets must be finite.")
+                if ((step_value_targets < 0) | (step_value_targets > 1)).any():
+                    raise ValueError("step_value_targets must be in [0, 1].")
+
+                step_counts = step_end_mask.sum(dim=-1, dtype=torch.long)
+                sample_indices = torch.arange(step_end_mask.shape[0], device=step_end_mask.device).repeat_interleave(
+                    step_counts
+                )
+                endpoint_targets = step_value_targets.index_select(0, sample_indices)
+                nonempty_counts = step_counts.clamp_min(1).float()
+                endpoint_weights = nonempty_counts.reciprocal().index_select(0, sample_indices)
+
+                with torch.no_grad():
+                    endpoint_logits = self.step_value_probe(step_value_hidden.float()).squeeze(-1)
+                    endpoint_values = torch.sigmoid(endpoint_logits)
+                    endpoint_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+                        endpoint_logits,
+                        endpoint_targets,
+                        reduction="none",
+                    )
+                trajectory_logit_means = torch.zeros(
+                    step_end_mask.shape[0],
+                    dtype=torch.float32,
+                    device=step_end_mask.device,
+                )
+                trajectory_logit_means.scatter_add_(
+                    0,
+                    sample_indices,
+                    endpoint_logits.float() * endpoint_weights,
+                )
+                dense_step_values = torch.zeros(
+                    step_end_mask.shape,
+                    dtype=torch.float32,
+                    device=step_end_mask.device,
+                )
+                dense_step_values[step_end_mask] = endpoint_values
+                endpoint_positions = torch.arange(
+                    step_end_mask.shape[1],
+                    device=step_end_mask.device,
+                ).expand_as(step_end_mask)
+                terminal_positions = endpoint_positions.masked_fill(~step_end_mask, -1).max(dim=-1).values
+                if torch.any(terminal_positions < 0):
+                    raise ValueError("Every probe trajectory must contain a terminal step endpoint.")
+                dense_step_values[
+                    torch.arange(step_end_mask.shape[0], device=step_end_mask.device),
+                    terminal_positions,
+                ] = step_value_targets
+                trajectory_losses = torch.zeros(
+                    step_end_mask.shape[0],
+                    dtype=torch.float32,
+                    device=step_end_mask.device,
+                )
+                trajectory_losses.scatter_add_(
+                    0,
+                    sample_indices,
+                    endpoint_losses * endpoint_weights,
+                )
+
+                step_values_lst.append(dense_step_values)
+                step_value_trajectory_logit_mean_lst.append(trajectory_logit_means)
+                step_value_loss_lst.append(trajectory_losses)
+                if delayed_audit_requested:
+                    update_mask = model_inputs["step_value_probe_update_mask"].bool().reshape(-1)
+                    audit_mask = model_inputs["step_value_prompt_center_audit_mask"].bool().reshape(-1)
+                    endpoint_update_mask = update_mask.index_select(0, sample_indices)
+                    endpoint_audit_mask = audit_mask.index_select(0, sample_indices)
+
+                    step_value_hidden_lst.append(step_value_hidden[endpoint_update_mask])
+                    step_value_target_lst.append(endpoint_targets[endpoint_update_mask])
+                    step_value_endpoint_weight_lst.append(endpoint_weights[endpoint_update_mask])
+                    local_step_value_trajectory_count += int(((step_counts > 0) & update_mask).sum().item())
+
+                    # Audit hidden states stay local to the actor. After the one
+                    # normal Probe update below, only the tiny MLP is replayed.
+                    step_value_audit_hidden_lst.append(step_value_hidden[endpoint_audit_mask])
+                    step_value_audit_sample_index_lst.append(sample_indices[endpoint_audit_mask])
+                    step_value_audit_mask_lst.append(audit_mask)
+                    step_value_forward_row_id_lst.append(model_inputs["step_value_forward_row_id"].reshape(-1))
+                else:
+                    # Preserve the legacy tensor and reduction path exactly when
+                    # delayed auditing is disabled.
+                    step_value_hidden_lst.append(step_value_hidden)
+                    step_value_target_lst.append(endpoint_targets)
+                    step_value_endpoint_weight_lst.append(endpoint_weights)
+                    local_step_value_trajectory_count += int((step_counts > 0).sum().item())
             if return_topk_logits:
                 logits_lst.append(outputs["logits"])
                 logits_indices_lst.append(outputs["logits_indices"])
@@ -791,6 +1502,12 @@ class DataParallelPPOActor(BasePPOActor):
             entropys = torch.concat(entropy_lst, dim=0)
         if calculate_sum_pi_squared:
             sum_pi_squared = torch.concat(sum_pi_squared_lst, dim=0)
+        if compute_step_value_probe:
+            step_values = torch.concat(step_values_lst, dim=0)
+            step_value_trajectory_logit_mean = torch.concat(step_value_trajectory_logit_mean_lst, dim=0)
+            step_value_probe_loss = torch.concat(step_value_loss_lst, dim=0)
+        if compute_similarity_step_embeddings:
+            similarity_step_embeddings = torch.concat(similarity_step_embeddings_lst, dim=0)
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if return_topk_logits:
@@ -800,6 +1517,93 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
             if calculate_sum_pi_squared:
                 sum_pi_squared = restore_dynamic_batch(sum_pi_squared, batch_idx_list)
+            if compute_step_value_probe:
+                step_values = restore_dynamic_batch(step_values, batch_idx_list)
+                step_value_trajectory_logit_mean = restore_dynamic_batch(
+                    step_value_trajectory_logit_mean,
+                    batch_idx_list,
+                )
+                step_value_probe_loss = restore_dynamic_batch(step_value_probe_loss, batch_idx_list)
+            if compute_similarity_step_embeddings:
+                similarity_step_embeddings = restore_dynamic_batch(similarity_step_embeddings, batch_idx_list)
+
+        if compute_step_value_probe:
+            all_step_value_hidden = torch.concat(step_value_hidden_lst, dim=0)
+            all_step_value_targets = torch.concat(step_value_target_lst, dim=0)
+            all_step_value_endpoint_weights = torch.concat(step_value_endpoint_weight_lst, dim=0)
+            step_value_probe_grad_norm = self._update_step_value_probe(
+                hidden=all_step_value_hidden,
+                targets=all_step_value_targets,
+                endpoint_weights=all_step_value_endpoint_weights,
+                local_trajectory_count=local_step_value_trajectory_count,
+                global_step=global_step,
+            )
+            if delayed_audit_requested:
+                audit_ready_next = self._step_value_is_ready(global_step + 1)
+                step_value_audit_trajectory_logit_mean_lst = []
+                step_value_audit_endpoint_count_lst = []
+                step_value_audit_ready_next_lst = []
+                with torch.no_grad():
+                    for audit_hidden, audit_sample_indices, audit_mask in zip(
+                        step_value_audit_hidden_lst,
+                        step_value_audit_sample_index_lst,
+                        step_value_audit_mask_lst,
+                        strict=True,
+                    ):
+                        row_count = audit_mask.shape[0]
+                        audit_endpoint_counts = torch.zeros(
+                            row_count,
+                            dtype=torch.long,
+                            device=audit_mask.device,
+                        )
+                        audit_endpoint_counts.scatter_add_(
+                            0,
+                            audit_sample_indices,
+                            torch.ones_like(audit_sample_indices, dtype=torch.long),
+                        )
+                        audit_logit_sums = torch.zeros(
+                            row_count,
+                            dtype=torch.float32,
+                            device=audit_mask.device,
+                        )
+                        if audit_hidden.numel() > 0:
+                            audit_endpoint_logits = self.step_value_probe(audit_hidden.float()).squeeze(-1)
+                            audit_logit_sums.scatter_add_(
+                                0,
+                                audit_sample_indices,
+                                audit_endpoint_logits.float(),
+                            )
+                        audit_logit_means = audit_logit_sums / audit_endpoint_counts.clamp_min(1)
+                        step_value_audit_trajectory_logit_mean_lst.append(audit_logit_means)
+                        step_value_audit_endpoint_count_lst.append(audit_endpoint_counts)
+                        step_value_audit_ready_next_lst.append(
+                            audit_mask & (audit_endpoint_counts > 0) & audit_ready_next
+                        )
+
+                step_value_audit_trajectory_logit_mean = torch.concat(
+                    step_value_audit_trajectory_logit_mean_lst,
+                    dim=0,
+                )
+                step_value_audit_endpoint_count = torch.concat(step_value_audit_endpoint_count_lst, dim=0)
+                step_value_audit_ready_next = torch.concat(step_value_audit_ready_next_lst, dim=0)
+                step_value_forward_row_id = torch.concat(step_value_forward_row_id_lst, dim=0)
+                if use_dynamic_bsz:
+                    step_value_audit_trajectory_logit_mean = restore_dynamic_batch(
+                        step_value_audit_trajectory_logit_mean,
+                        batch_idx_list,
+                    )
+                    step_value_audit_endpoint_count = restore_dynamic_batch(
+                        step_value_audit_endpoint_count,
+                        batch_idx_list,
+                    )
+                    step_value_audit_ready_next = restore_dynamic_batch(
+                        step_value_audit_ready_next,
+                        batch_idx_list,
+                    )
+                    step_value_forward_row_id = restore_dynamic_batch(
+                        step_value_forward_row_id,
+                        batch_idx_list,
+                    )
 
         outputs = {"log_probs": log_probs}
         if return_topk_logits:
@@ -809,6 +1613,27 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["entropys"] = entropys
         if calculate_sum_pi_squared:
             outputs["sum_pi_squared"] = sum_pi_squared
+        if compute_step_value_probe:
+            batch_size = log_probs.shape[0]
+            outputs["step_values"] = step_values
+            outputs["step_value_trajectory_logit_mean"] = step_value_trajectory_logit_mean
+            outputs["step_value_ready"] = torch.full(
+                (batch_size,),
+                step_value_ready_before_update,
+                dtype=torch.bool,
+                device=log_probs.device,
+            )
+            outputs["step_value_probe_loss"] = step_value_probe_loss
+            outputs["step_value_probe_grad_norm"] = (
+                step_value_probe_grad_norm.to(device=log_probs.device).expand(batch_size).clone()
+            )
+            if delayed_audit_requested:
+                outputs["step_value_audit_trajectory_logit_mean"] = step_value_audit_trajectory_logit_mean
+                outputs["step_value_audit_endpoint_count"] = step_value_audit_endpoint_count
+                outputs["step_value_audit_ready_next"] = step_value_audit_ready_next
+                outputs["step_value_forward_row_id"] = step_value_forward_row_id
+        if compute_similarity_step_embeddings:
+            outputs["similarity_step_embeddings"] = similarity_step_embeddings
         return outputs
 
     @staticmethod
@@ -822,89 +1647,6 @@ class DataParallelPPOActor(BasePPOActor):
     @staticmethod
     def _decode_common_escapes(value: str) -> str:
         return str(value).replace("\\n", "\n").replace("\\t", "\t")
-
-    @staticmethod
-    def _as_float_scalar(value) -> float | None:
-        if isinstance(value, torch.Tensor):
-            value = value.detach().float().reshape(-1)
-            return None if value.numel() == 0 else float(value[0].item())
-        if hasattr(value, "item"):
-            value = value.item()
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_response_correct(data: DataProto, sample_idx: int) -> bool:
-        if "acc" in data.non_tensor_batch:
-            acc = DataParallelPPOActor._as_float_scalar(data.non_tensor_batch["acc"][sample_idx])
-            if acc is not None:
-                return acc > 0
-        if "rm_scores" in data.batch.keys():
-            return float(data.batch["rm_scores"][sample_idx].sum().item()) > 0
-        raise ValueError("compute_answer_log_prob requires `acc` or `rm_scores` to select wrong answers.")
-
-    @staticmethod
-    def _strip_answer_prefix(text: str, answer_prefix: str) -> str:
-        text = text.strip()
-        prefix = answer_prefix.strip()
-        if prefix and text[: len(prefix)].casefold() == prefix.casefold():
-            return text[len(prefix) :].strip()
-        return text
-
-    @staticmethod
-    def _last_boxed_content(text: str) -> str | None:
-        left = "\\boxed{"
-        start = text.rfind(left)
-        if start < 0:
-            return None
-        content_start = start + len(left)
-        depth = 1
-        for idx in range(content_start, len(text)):
-            if text[idx] == "{":
-                depth += 1
-            elif text[idx] == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[content_start:idx].strip()
-        return None
-
-    @staticmethod
-    def _extract_answer_from_response_text(response_text: str, answer_prefix: str) -> str:
-        response_text = response_text.strip()
-        if not response_text:
-            return ""
-
-        exact_prefix_idx = response_text.rfind(answer_prefix) if answer_prefix else -1
-        if exact_prefix_idx >= 0:
-            answer_tail = response_text[exact_prefix_idx + len(answer_prefix) :].strip()
-            for line in answer_tail.splitlines():
-                line = line.strip()
-                if line:
-                    return DataParallelPPOActor._strip_answer_prefix(line, answer_prefix)
-            return ""
-
-        prefix = answer_prefix.strip()
-        if prefix:
-            prefix_idx = response_text.casefold().rfind(prefix.casefold())
-            if prefix_idx >= 0:
-                answer_tail = response_text[prefix_idx + len(prefix) :].strip()
-                for line in answer_tail.splitlines():
-                    line = line.strip()
-                    if line:
-                        return DataParallelPPOActor._strip_answer_prefix(line, answer_prefix)
-                return ""
-
-        boxed = DataParallelPPOActor._last_boxed_content(response_text)
-        if boxed:
-            return boxed
-
-        for line in reversed(response_text.splitlines()):
-            line = line.strip()
-            if line:
-                return DataParallelPPOActor._strip_answer_prefix(line, answer_prefix)
-        return response_text
 
     @staticmethod
     def _encode_prefixed_answer(tokenizer, answer_prefix: str, answer: str) -> tuple[list[int], list[int]]:
@@ -936,140 +1678,6 @@ class DataParallelPPOActor(BasePPOActor):
         answer_ids = tokenizer.encode(answer, add_special_tokens=False)
         return prefix_ids + answer_ids, [0] * len(prefix_ids) + [1] * len(answer_ids)
 
-    def _get_delimiter_token_ids(self, tokenizer, delimiter: str) -> set[int]:
-        cache_key = (id(tokenizer), delimiter)
-        if cache_key in self._delimiter_token_id_cache:
-            return self._delimiter_token_id_cache[cache_key]
-
-        delimiter_token_ids: set[int] = set()
-        if delimiter:
-            vocab = tokenizer.get_vocab()
-            for token_id in vocab.values():
-                piece = tokenizer.decode(
-                    [token_id],
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-                if delimiter in piece:
-                    delimiter_token_ids.add(token_id)
-        self._delimiter_token_id_cache[cache_key] = delimiter_token_ids
-        return delimiter_token_ids
-
-    @staticmethod
-    def _select_step_end_positions(
-        tokenizer,
-        valid_response_ids: list[int],
-        valid_response_positions: list[int],
-        delimiter_token_ids: set[int],
-        delimiter_token_sequence: list[int],
-        delimiter: str,
-        step_interval: int,
-        delimiter_step_marker_filter: bool,
-        delimiter_step_marker_lookahead: int,
-        delimiter_step_marker_patterns: list[str],
-        delimiter_fallback_min_tokens: int,
-        delimiter_max_steps_per_response: int,
-    ) -> list[int]:
-        delimiter_candidates = [
-            (pos, idx, idx)
-            for idx, (token_id, pos) in enumerate(zip(valid_response_ids, valid_response_positions, strict=True))
-            if token_id in delimiter_token_ids
-        ]
-        if delimiter_token_sequence:
-            seq_len = len(delimiter_token_sequence)
-            for start in range(0, len(valid_response_ids) - seq_len + 1):
-                if valid_response_ids[start : start + seq_len] == delimiter_token_sequence:
-                    delimiter_candidates.append(
-                        (valid_response_positions[start + seq_len - 1], start, start + seq_len - 1)
-                    )
-
-        candidates_by_position: dict[int, list[tuple[int, int]]] = {}
-        for pos, start_idx, end_idx in delimiter_candidates:
-            candidates_by_position.setdefault(pos, []).append((start_idx, end_idx))
-
-        delimiter_positions = []
-        boundary_candidates: list[tuple[int, int, bool]] = []
-        for pos in sorted(candidates_by_position):
-            if not delimiter_step_marker_filter:
-                delimiter_positions.append(pos)
-                continue
-
-            candidate_ranges = candidates_by_position[pos]
-            end_idx = max(end_idx for _, end_idx in candidate_ranges)
-            is_strong_boundary = any(
-                DataParallelPPOActor._has_strong_boundary_after_delimiter(
-                    tokenizer=tokenizer,
-                    valid_response_ids=valid_response_ids,
-                    delimiter_start_idx=start_idx,
-                    delimiter_end_idx=end_idx,
-                    delimiter=delimiter,
-                    lookahead=delimiter_step_marker_lookahead,
-                    patterns=delimiter_step_marker_patterns,
-                )
-                for start_idx, end_idx in candidate_ranges
-            )
-            boundary_candidates.append((pos, end_idx, is_strong_boundary))
-
-        if delimiter_step_marker_filter:
-            strong_positions = [pos for pos, _, is_strong in boundary_candidates if is_strong]
-            if strong_positions:
-                delimiter_positions = strong_positions
-            else:
-                fallback_min_tokens = int(delimiter_fallback_min_tokens)
-                if fallback_min_tokens > 0:
-                    last_selected_end_idx = -1
-                    for pos, end_idx, _ in boundary_candidates:
-                        if end_idx - last_selected_end_idx >= fallback_min_tokens:
-                            delimiter_positions.append(pos)
-                            last_selected_end_idx = end_idx
-
-        step_interval = max(int(step_interval), 1)
-        selected_positions = []
-        for step_idx, pos in enumerate(delimiter_positions, start=1):
-            if step_idx % step_interval == 0 or step_idx == len(delimiter_positions):
-                selected_positions.append(pos)
-
-        max_steps = int(delimiter_max_steps_per_response)
-        if max_steps > 0 and len(selected_positions) > max_steps:
-            if max_steps == 1:
-                return [selected_positions[-1]]
-            last_idx = len(selected_positions) - 1
-            selected_positions = [
-                selected_positions[round(slot * last_idx / (max_steps - 1))] for slot in range(max_steps)
-            ]
-        return selected_positions
-
-    @staticmethod
-    def _has_strong_boundary_after_delimiter(
-        tokenizer,
-        valid_response_ids: list[int],
-        delimiter_start_idx: int,
-        delimiter_end_idx: int,
-        delimiter: str,
-        lookahead: int,
-        patterns: list[str],
-    ) -> bool:
-        if lookahead <= 0 or not patterns:
-            return False
-        window_end = min(len(valid_response_ids), delimiter_end_idx + 1 + lookahead)
-        window_ids = valid_response_ids[delimiter_start_idx:window_end]
-        window_text = tokenizer.decode(
-            window_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        delimiter_offset = window_text.find(delimiter) if delimiter else -1
-        if delimiter_offset >= 0:
-            marker_text = window_text[delimiter_offset + len(delimiter) :]
-        else:
-            marker_text = tokenizer.decode(
-                valid_response_ids[delimiter_end_idx + 1 : window_end],
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-        marker_text = marker_text.lstrip()
-        return any(re.search(pattern, marker_text) is not None for pattern in patterns)
-
     @staticmethod
     def _pad_sequences(
         sequences: list[list[int]],
@@ -1092,6 +1700,20 @@ class DataParallelPPOActor(BasePPOActor):
                 ids[i, : len(seq)] = seq_tensor
                 mask[i, : len(seq)] = 1
         return ids, mask
+
+    @staticmethod
+    def _shared_step_prefixes(
+        response_mask: torch.Tensor,
+        step_end_mask: torch.Tensor,
+    ) -> tuple[list[int], list[int]]:
+        """Map shared endpoint positions to response-prefix lengths."""
+        valid_response_positions = response_mask.nonzero(as_tuple=False).flatten().tolist()
+        selected_positions = step_end_mask.nonzero(as_tuple=False).flatten().tolist()
+        response_position_to_prefix_length = {
+            position: prefix_length for prefix_length, position in enumerate(valid_response_positions, start=1)
+        }
+        selected_prefix_lengths = [response_position_to_prefix_length[position] for position in selected_positions]
+        return selected_positions, selected_prefix_lengths
 
     def _build_answer_log_prob_data(
         self,
@@ -1144,104 +1766,7 @@ class DataParallelPPOActor(BasePPOActor):
             torch.distributed.get_world_size(group=process_group),
         )
 
-    def _gather_answer_candidates(self, local_candidates: list[tuple[list[int], list[int], list[int], bool]]):
-        process_group, rank, world_size = self._get_answer_dp_info()
-        if world_size == 1:
-            return local_candidates, rank, world_size
-
-        device = torch.device(get_device_name(), get_device_id())
-        metadata = []
-        prompt_tokens = []
-        answer_tokens = []
-        answer_mask_tokens = []
-        for prompt_ids, answer_ids, answer_mask, is_correct in local_candidates:
-            metadata.append([len(prompt_ids), len(answer_ids), int(is_correct)])
-            prompt_tokens.extend(prompt_ids)
-            answer_tokens.extend(answer_ids)
-            answer_mask_tokens.extend(answer_mask)
-
-        metadata_tensor = (
-            torch.tensor(metadata, dtype=torch.long, device=device).flatten()
-            if metadata
-            else torch.empty(0, dtype=torch.long, device=device)
-        )
-        prompt_tensor = (
-            torch.tensor(prompt_tokens, dtype=torch.long, device=device)
-            if prompt_tokens
-            else torch.empty(0, dtype=torch.long, device=device)
-        )
-        answer_tensor = (
-            torch.tensor(answer_tokens, dtype=torch.long, device=device)
-            if answer_tokens
-            else torch.empty(0, dtype=torch.long, device=device)
-        )
-        answer_mask_tensor = (
-            torch.tensor(answer_mask_tokens, dtype=torch.long, device=device)
-            if answer_mask_tokens
-            else torch.empty(0, dtype=torch.long, device=device)
-        )
-        local_sizes = torch.tensor(
-            [len(local_candidates), prompt_tensor.numel(), answer_tensor.numel(), answer_mask_tensor.numel()],
-            dtype=torch.long,
-            device=device,
-        )
-        gathered_sizes = [torch.empty_like(local_sizes) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_sizes, local_sizes, group=process_group)
-        gathered_sizes = torch.stack(gathered_sizes)
-        max_item_count = int(gathered_sizes[:, 0].max().item())
-        max_prompt_tokens = int(gathered_sizes[:, 1].max().item())
-        max_answer_tokens = int(gathered_sizes[:, 2].max().item())
-        max_answer_mask_tokens = int(gathered_sizes[:, 3].max().item())
-        local_payload = torch.cat([metadata_tensor, prompt_tensor, answer_tensor, answer_mask_tensor], dim=0)
-        max_payload_len = max_item_count * 3 + max_prompt_tokens + max_answer_tokens + max_answer_mask_tokens
-
-        def _pad_1d(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
-            if tensor.numel() == target_len:
-                return tensor
-            padded = torch.zeros(target_len, dtype=tensor.dtype, device=tensor.device)
-            if tensor.numel() > 0:
-                padded[: tensor.numel()] = tensor
-            return padded
-
-        local_payload = _pad_1d(local_payload, max_payload_len)
-        gathered_payloads = [torch.empty_like(local_payload) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_payloads, local_payload, group=process_group)
-
-        global_candidates = []
-        gathered_sizes = gathered_sizes.cpu()
-        for rank_idx in range(world_size):
-            item_count = int(gathered_sizes[rank_idx, 0].item())
-            prompt_token_count = int(gathered_sizes[rank_idx, 1].item())
-            answer_token_count = int(gathered_sizes[rank_idx, 2].item())
-            answer_mask_token_count = int(gathered_sizes[rank_idx, 3].item())
-            metadata_len = item_count * 3
-            prompt_start = metadata_len
-            answer_start = prompt_start + prompt_token_count
-            answer_mask_start = answer_start + answer_token_count
-            rank_payload = gathered_payloads[rank_idx]
-            rank_metadata = rank_payload[:metadata_len].view(item_count, 3).cpu().tolist()
-            rank_prompts = rank_payload[prompt_start:answer_start].cpu().tolist()
-            rank_answers = rank_payload[answer_start : answer_start + answer_token_count].cpu().tolist()
-            rank_answer_masks = rank_payload[
-                answer_mask_start : answer_mask_start + answer_mask_token_count
-            ].cpu().tolist()
-
-            prompt_offset = 0
-            answer_offset = 0
-            answer_mask_offset = 0
-            for prompt_len, answer_len, is_correct in rank_metadata:
-                prompt_ids = rank_prompts[prompt_offset : prompt_offset + prompt_len]
-                answer_ids = rank_answers[answer_offset : answer_offset + answer_len]
-                answer_mask = rank_answer_masks[answer_mask_offset : answer_mask_offset + answer_len]
-                prompt_offset += prompt_len
-                answer_offset += answer_len
-                answer_mask_offset += answer_len
-                global_candidates.append((prompt_ids, answer_ids, answer_mask, bool(is_correct)))
-        return global_candidates, rank, world_size
-
-    def _gather_answer_items(
-        self, local_items: list[tuple[list[int], list[int], list[int], tuple[int, int, int, int]]]
-    ):
+    def _gather_answer_items(self, local_items: list[tuple[list[int], list[int], list[int], tuple[int, int, int]]]):
         process_group, rank, world_size = self._get_answer_dp_info()
         if world_size == 1:
             return local_items, rank, world_size
@@ -1251,8 +1776,8 @@ class DataParallelPPOActor(BasePPOActor):
         prompt_tokens = []
         answer_tokens = []
         answer_mask_tokens = []
-        for prompt_ids, answer_ids, answer_mask, (owner_rank, sample_idx, answer_pos, answer_sign) in local_items:
-            metadata.append([len(prompt_ids), len(answer_ids), owner_rank, sample_idx, answer_pos, answer_sign])
+        for prompt_ids, answer_ids, answer_mask, (owner_rank, sample_idx, answer_pos) in local_items:
+            metadata.append([len(prompt_ids), len(answer_ids), owner_rank, sample_idx, answer_pos])
             prompt_tokens.extend(prompt_ids)
             answer_tokens.extend(answer_ids)
             answer_mask_tokens.extend(answer_mask)
@@ -1290,7 +1815,7 @@ class DataParallelPPOActor(BasePPOActor):
         max_answer_tokens = int(gathered_sizes[:, 2].max().item())
         max_answer_mask_tokens = int(gathered_sizes[:, 3].max().item())
         local_payload = torch.cat([metadata_tensor, prompt_tensor, answer_tensor, answer_mask_tensor], dim=0)
-        max_payload_len = max_item_count * 6 + max_prompt_tokens + max_answer_tokens + max_answer_mask_tokens
+        max_payload_len = max_item_count * 5 + max_prompt_tokens + max_answer_tokens + max_answer_mask_tokens
 
         def _pad_1d(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
             if tensor.numel() == target_len:
@@ -1311,46 +1836,42 @@ class DataParallelPPOActor(BasePPOActor):
             prompt_token_count = int(gathered_sizes[rank_idx, 1].item())
             answer_token_count = int(gathered_sizes[rank_idx, 2].item())
             answer_mask_token_count = int(gathered_sizes[rank_idx, 3].item())
-            metadata_len = item_count * 6
+            metadata_len = item_count * 5
             prompt_start = metadata_len
             answer_start = prompt_start + prompt_token_count
             answer_mask_start = answer_start + answer_token_count
             rank_payload = gathered_payloads[rank_idx]
-            rank_metadata = rank_payload[:metadata_len].view(item_count, 6).cpu().tolist()
+            rank_metadata = rank_payload[:metadata_len].view(item_count, 5).cpu().tolist()
             rank_prompts = rank_payload[prompt_start:answer_start].cpu().tolist()
             rank_answers = rank_payload[answer_start : answer_start + answer_token_count].cpu().tolist()
-            rank_answer_masks = rank_payload[
-                answer_mask_start : answer_mask_start + answer_mask_token_count
-            ].cpu().tolist()
+            rank_answer_masks = (
+                rank_payload[answer_mask_start : answer_mask_start + answer_mask_token_count].cpu().tolist()
+            )
 
             prompt_offset = 0
             answer_offset = 0
             answer_mask_offset = 0
-            for prompt_len, answer_len, owner_rank, sample_idx, answer_pos, answer_sign in rank_metadata:
+            for prompt_len, answer_len, owner_rank, sample_idx, answer_pos in rank_metadata:
                 prompt_ids = rank_prompts[prompt_offset : prompt_offset + prompt_len]
                 answer_ids = rank_answers[answer_offset : answer_offset + answer_len]
                 answer_mask = rank_answer_masks[answer_mask_offset : answer_mask_offset + answer_len]
                 prompt_offset += prompt_len
                 answer_offset += answer_len
                 answer_mask_offset += answer_len
-                global_items.append(
-                    (prompt_ids, answer_ids, answer_mask, (owner_rank, sample_idx, answer_pos, answer_sign))
-                )
+                global_items.append((prompt_ids, answer_ids, answer_mask, (owner_rank, sample_idx, answer_pos)))
         return global_items, rank, world_size
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_answer_log_prob(self, data: DataProto, tokenizer) -> dict[str, torch.Tensor]:
-        """Compute correct-answer log probabilities or correct-minus-wrong margins.
+        """Compute old-policy answer log probabilities at shared step endpoints.
 
-        For every response prefix, the correct answer score is its mean answer-token
-        log probability. When ``answer_log_prob_num_wrong_answers`` is positive,
-        subtract the mean score of up to that many distinct wrong answers sampled
-        from responses belonging to the same prompt.
+        Step boundaries are supplied by ``verl.utils.step_split`` through the
+        input ``step_end_mask``. This method only scores the selected prefixes;
+        it does not perform any independent response splitting.
 
         Returns:
             dict[str, torch.Tensor]:
                 log_probs: (batch_size, response_length + 1)
-                step_mask: (batch_size, response_length)
         """
         self.actor_module.eval()
 
@@ -1360,100 +1881,53 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = max(int(data.meta_info["micro_batch_size"]), 1)
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        num_wrong_answers = int(
-            data.meta_info.get(
-                "answer_log_prob_num_wrong_answers",
-                self.config.get("answer_log_prob_num_wrong_answers", 1),
-            )
-        )
-        if num_wrong_answers < 0:
-            raise ValueError("answer_log_prob_num_wrong_answers must be non-negative.")
         pad_token_id = data.meta_info.get("pad_token_id", 0)
-        delimiter = self._decode_common_escapes(data.meta_info["delimiter"])
         answer_prefix = self._decode_common_escapes(data.meta_info["answer_prefix"])
-        step_interval = data.meta_info["step_interval"]
-        delimiter_step_marker_filter = data.meta_info.get("delimiter_step_marker_filter", False)
-        delimiter_step_marker_lookahead = int(data.meta_info.get("delimiter_step_marker_lookahead", 10))
-        delimiter_fallback_min_tokens = int(
-            data.meta_info.get(
-                "delimiter_fallback_min_tokens",
-                self.config.get("delimiter_fallback_min_tokens", 0),
-            )
+        data = data.select(
+            batch_keys=["responses", "input_ids", "attention_mask", "response_mask", "step_end_mask"],
+            non_tensor_batch_keys=["reward_model"],
         )
-        delimiter_max_steps_per_response = int(
-            data.meta_info.get(
-                "delimiter_max_steps_per_response",
-                self.config.get("delimiter_max_steps_per_response", 0),
-            )
-        )
-        delimiter_step_marker_patterns = [
-            self._decode_common_escapes(pattern)
-            for pattern in data.meta_info.get(
-                "delimiter_step_marker_patterns",
-                [
-                    r"(?i)\bStep\s*\d+\b",
-                    r"\b\d+\.\s",
-                    (
-                        r"(?i)^(?:[#*_]+[ \t]+)*[#*_]*[ \t]*"
-                        r"(?:First|Firstly|Second|Secondly|Third|Thirdly|Next|Then|Finally|Similarly)\b"
-                    ),
-                ],
-            )
-        ]
-
-        select_keys = ["responses", "input_ids", "attention_mask", "response_mask"]
-        if num_wrong_answers > 0 and "rm_scores" in data.batch.keys():
-            select_keys.append("rm_scores")
-        non_tensor_select_keys = ["reward_model"]
-        if num_wrong_answers > 0 and "acc" in data.non_tensor_batch:
-            non_tensor_select_keys.append("acc")
-        if num_wrong_answers > 0 and "pred" in data.non_tensor_batch:
-            non_tensor_select_keys.append("pred")
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         responses = data.batch["responses"]
         input_ids = data.batch["input_ids"]
         attention_mask = data.batch["attention_mask"]
         response_mask = data.batch["response_mask"]
+        step_end_mask = data.batch["step_end_mask"].to(device=response_mask.device, dtype=torch.bool)
         response_len = responses.size(1)
         prompt_len = input_ids.size(1) - response_len
         batch_size = responses.size(0)
         device = torch.device(get_device_name(), get_device_id())
         dtype = responses.dtype
 
-        delimiter_token_ids = self._get_delimiter_token_ids(tokenizer, delimiter)
-        delimiter_token_sequence = tokenizer.encode(delimiter, add_special_tokens=False) if delimiter else []
+        if step_end_mask.shape != response_mask.shape:
+            raise ValueError(
+                "step_end_mask must match response_mask in answer-log-prob computation, "
+                f"got {tuple(step_end_mask.shape)} and {tuple(response_mask.shape)}."
+            )
+        response_mask_bool = response_mask.bool()
+        if torch.any(step_end_mask & ~response_mask_bool):
+            raise ValueError("step_end_mask may select only valid response tokens.")
+        if torch.any(step_end_mask.sum(dim=-1) < 1):
+            raise ValueError("Shared step_end_mask must contain at least one endpoint per response.")
+
+        step_end_mask = step_end_mask.to(device=device)
         answer_log_probs = torch.zeros((batch_size, response_len + 1), dtype=torch.float32, device=device)
-        step_mask = torch.zeros((batch_size, response_len), dtype=torch.long, device=device)
         computed_pos_mask = torch.zeros((batch_size, response_len + 1), dtype=torch.bool, device=device)
         computed_pos_mask[:, 0] = True
+        computed_pos_mask[:, 1:] = step_end_mask
 
-        process_group, rank, world_size = self._get_answer_dp_info()
+        _, rank, world_size = self._get_answer_dp_info()
         sample_records = []
-        local_candidates: list[tuple[list[int], list[int], list[int], bool]] = []
         ground_truth_encoding_cache: dict[str, tuple[list[int], list[int]]] = {}
 
         for i in range(batch_size):
             prompt_token_ids = input_ids[i, :prompt_len][attention_mask[i, :prompt_len].bool()].tolist()
             valid_response_positions = response_mask[i].nonzero(as_tuple=False).flatten().tolist()
             valid_response_ids = responses[i, valid_response_positions].tolist()
-            selected_positions = self._select_step_end_positions(
-                tokenizer=tokenizer,
-                valid_response_ids=valid_response_ids,
-                valid_response_positions=valid_response_positions,
-                delimiter_token_ids=delimiter_token_ids,
-                delimiter_token_sequence=delimiter_token_sequence,
-                delimiter=delimiter,
-                step_interval=step_interval,
-                delimiter_step_marker_filter=delimiter_step_marker_filter,
-                delimiter_step_marker_lookahead=delimiter_step_marker_lookahead,
-                delimiter_step_marker_patterns=delimiter_step_marker_patterns,
-                delimiter_fallback_min_tokens=delimiter_fallback_min_tokens,
-                delimiter_max_steps_per_response=delimiter_max_steps_per_response,
+            selected_positions, selected_prefix_lengths = self._shared_step_prefixes(
+                response_mask[i],
+                step_end_mask[i],
             )
-            selected_prefix_lengths = [
-                bisect_right(valid_response_positions, position) for position in selected_positions
-            ]
 
             reward_model_data = data.non_tensor_batch["reward_model"][i]
             ground_truth = self._extract_ground_truth(reward_model_data)
@@ -1464,32 +1938,6 @@ class DataParallelPPOActor(BasePPOActor):
                     ground_truth,
                 )
             encoded_answer, encoded_answer_mask = ground_truth_encoding_cache[ground_truth]
-            encoded_wrong_answer = None
-            encoded_wrong_answer_mask = None
-            is_correct = None
-            if num_wrong_answers > 0:
-                wrong_answer = ""
-                if "pred" in data.non_tensor_batch:
-                    pred = data.non_tensor_batch["pred"][i]
-                    if hasattr(pred, "item"):
-                        pred = pred.item()
-                    if pred is not None:
-                        pred = str(pred).strip()
-                        if pred and pred != "[INVALID]":
-                            wrong_answer = self._strip_answer_prefix(pred, answer_prefix)
-                if not wrong_answer:
-                    response_text = tokenizer.decode(
-                        valid_response_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    wrong_answer = self._extract_answer_from_response_text(response_text, answer_prefix)
-                encoded_wrong_answer, encoded_wrong_answer_mask = self._encode_prefixed_answer(
-                    tokenizer,
-                    answer_prefix,
-                    wrong_answer,
-                )
-                is_correct = self._is_response_correct(data, i)
 
             sample_records.append(
                 {
@@ -1499,53 +1947,10 @@ class DataParallelPPOActor(BasePPOActor):
                     "selected_prefix_lengths": selected_prefix_lengths,
                     "encoded_answer": encoded_answer,
                     "encoded_answer_mask": encoded_answer_mask,
-                    "encoded_wrong_answer": encoded_wrong_answer,
-                    "encoded_wrong_answer_mask": encoded_wrong_answer_mask,
-                    "is_correct": is_correct,
                 }
             )
-            if num_wrong_answers > 0:
-                local_candidates.append((prompt_token_ids, encoded_wrong_answer, encoded_wrong_answer_mask, is_correct))
 
-        wrong_answers_by_prompt: dict[tuple[int, ...], list[tuple[list[int], list[int]]]] = {}
-        selected_wrong_answers_by_prompt: dict[tuple[int, ...], list[tuple[list[int], list[int]]]] = {}
-        if num_wrong_answers > 0:
-            global_candidates, _, _ = self._gather_answer_candidates(local_candidates)
-            seen_wrong_answers_by_prompt: dict[tuple[int, ...], set[tuple[int, ...]]] = {}
-            for prompt_token_ids, wrong_answer_ids, wrong_answer_mask, is_correct in global_candidates:
-                if is_correct:
-                    continue
-                prompt_key = tuple(prompt_token_ids)
-                answer_key = tuple(wrong_answer_ids)
-                seen_answers = seen_wrong_answers_by_prompt.setdefault(prompt_key, set())
-                if answer_key in seen_answers:
-                    continue
-                seen_answers.add(answer_key)
-                wrong_answers_by_prompt.setdefault(prompt_key, []).append((wrong_answer_ids, wrong_answer_mask))
-
-            if world_size > 1:
-                sample_seed = torch.zeros(1, dtype=torch.long, device=device)
-                if rank == 0:
-                    sample_seed[0] = int(np.random.randint(0, np.iinfo(np.int32).max))
-                torch.distributed.all_reduce(
-                    sample_seed,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=process_group,
-                )
-                sampling_rng = np.random.default_rng(int(sample_seed.item()))
-            else:
-                sampling_rng = np.random
-            for prompt_key, wrong_answers in wrong_answers_by_prompt.items():
-                selected_count = min(num_wrong_answers, len(wrong_answers))
-                if selected_count:
-                    selected_indices = sampling_rng.choice(len(wrong_answers), size=selected_count, replace=False)
-                    selected_wrong_answers_by_prompt[prompt_key] = [
-                        wrong_answers[idx] for idx in selected_indices.tolist()
-                    ]
-
-        local_items: list[tuple[list[int], list[int], list[int], tuple[int, int, int, int]]] = []
-        step_sample_indices: list[int] = []
-        step_positions: list[int] = []
+        local_items: list[tuple[list[int], list[int], list[int], tuple[int, int, int]]] = []
         for i, sample_record in enumerate(sample_records):
             prompt_token_ids = sample_record["prompt_token_ids"]
             valid_response_ids = sample_record["valid_response_ids"]
@@ -1553,31 +1958,11 @@ class DataParallelPPOActor(BasePPOActor):
             selected_prefix_lengths = sample_record["selected_prefix_lengths"]
             encoded_answer = sample_record["encoded_answer"]
             encoded_answer_mask = sample_record["encoded_answer_mask"]
-            local_items.append((prompt_token_ids, encoded_answer, encoded_answer_mask, (rank, i, 0, 1)))
-            selected_wrong_answers = selected_wrong_answers_by_prompt.get(tuple(prompt_token_ids), [])
-            for wrong_answer_ids, wrong_answer_mask in selected_wrong_answers:
-                local_items.append((prompt_token_ids, wrong_answer_ids, wrong_answer_mask, (rank, i, 0, -1)))
+            local_items.append((prompt_token_ids, encoded_answer, encoded_answer_mask, (rank, i, 0)))
 
-            step_sample_indices.extend([i] * len(selected_positions))
-            step_positions.extend(selected_positions)
             for pos, prefix_len in zip(selected_positions, selected_prefix_lengths, strict=True):
                 prefix_token_ids = prompt_token_ids + valid_response_ids[:prefix_len]
-                local_items.append(
-                    (prefix_token_ids, encoded_answer, encoded_answer_mask, (rank, i, pos + 1, 1))
-                )
-                for wrong_answer_ids, wrong_answer_mask in selected_wrong_answers:
-                    local_items.append(
-                        (prefix_token_ids, wrong_answer_ids, wrong_answer_mask, (rank, i, pos + 1, -1))
-                    )
-
-        if step_positions:
-            step_indices = torch.tensor(
-                [step_sample_indices, step_positions],
-                dtype=torch.long,
-                device=device,
-            )
-            step_mask[step_indices[0], step_indices[1]] = 1
-            computed_pos_mask[step_indices[0], step_indices[1] + 1] = True
+                local_items.append((prefix_token_ids, encoded_answer, encoded_answer_mask, (rank, i, pos + 1)))
 
         global_items, rank, world_size = self._gather_answer_items(local_items)
         assert len(global_items) > 0, "compute_answer_log_prob expects at least one derived answer item."
@@ -1625,27 +2010,26 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             micro_batch_indices = range(rank, padded_micro_batch_count, world_size)
 
-        with self._use_medium_policy():
-            for micro_batch_idx in micro_batch_indices:
-                is_dummy_micro_batch = (not replicated_compute) and micro_batch_idx >= global_micro_batch_count
-                micro_batch = dummy_micro_batch if is_dummy_micro_batch else micro_batches[micro_batch_idx]
-                micro_batch = micro_batch.to(get_device_id())
-                model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
-                with torch.no_grad():
-                    outputs = self._forward_micro_batch(
-                        model_inputs,
-                        temperature=temperature,
-                        calculate_entropy=False,
-                    )
-                if is_dummy_micro_batch:
-                    continue
-                answer_mask = model_inputs.get("answer_loss_mask", model_inputs["response_mask"]).to(
-                    outputs["log_probs"].dtype
+        for micro_batch_idx in micro_batch_indices:
+            is_dummy_micro_batch = (not replicated_compute) and micro_batch_idx >= global_micro_batch_count
+            micro_batch = dummy_micro_batch if is_dummy_micro_batch else micro_batches[micro_batch_idx]
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+            with torch.no_grad():
+                outputs = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
                 )
-                answer_token_count = answer_mask.sum(dim=-1).clamp_min(1.0)
-                answer_log_prob = (outputs["log_probs"] * answer_mask).sum(dim=-1) / answer_token_count
-                global_item_indices = torch.tensor(batch_idx_list[micro_batch_idx], dtype=torch.long, device=device)
-                global_answer_log_probs[global_item_indices] = answer_log_prob.to(torch.float32)
+            if is_dummy_micro_batch:
+                continue
+            answer_mask = model_inputs.get("answer_loss_mask", model_inputs["response_mask"]).to(
+                outputs["log_probs"].dtype
+            )
+            answer_token_count = answer_mask.sum(dim=-1).clamp_min(1.0)
+            answer_log_prob = (outputs["log_probs"] * answer_mask).sum(dim=-1) / answer_token_count
+            global_item_indices = torch.tensor(batch_idx_list[micro_batch_idx], dtype=torch.long, device=device)
+            global_answer_log_probs[global_item_indices] = answer_log_prob.to(torch.float32)
 
         if world_size > 1 and not self.use_ulysses_sp:
             torch.distributed.all_reduce(
@@ -1656,15 +2040,11 @@ class DataParallelPPOActor(BasePPOActor):
         owned_item_indices = []
         owned_sample_indices = []
         owned_answer_positions = []
-        owned_wrong_item_indices: dict[tuple[int, int], list[int]] = {}
-        for global_item_idx, (_, _, _, (owner_rank, sample_idx, answer_pos, answer_sign)) in enumerate(global_items):
+        for global_item_idx, (_, _, _, (owner_rank, sample_idx, answer_pos)) in enumerate(global_items):
             if owner_rank == rank:
-                if answer_sign > 0:
-                    owned_item_indices.append(global_item_idx)
-                    owned_sample_indices.append(sample_idx)
-                    owned_answer_positions.append(answer_pos)
-                else:
-                    owned_wrong_item_indices.setdefault((sample_idx, answer_pos), []).append(global_item_idx)
+                owned_item_indices.append(global_item_idx)
+                owned_sample_indices.append(sample_idx)
+                owned_answer_positions.append(answer_pos)
 
         if owned_item_indices:
             owned_item_indices = torch.tensor(owned_item_indices, dtype=torch.long, device=device)
@@ -1676,16 +2056,146 @@ class DataParallelPPOActor(BasePPOActor):
                 owned_answer_log_probs,
                 accumulate=True,
             )
-        for (sample_idx, answer_pos), wrong_item_indices in owned_wrong_item_indices.items():
-            wrong_item_indices = torch.tensor(wrong_item_indices, dtype=torch.long, device=device)
-            answer_log_probs[sample_idx, answer_pos] -= global_answer_log_probs[wrong_item_indices].mean()
 
         answer_pos_ids = torch.arange(response_len + 1, dtype=torch.long, device=device).unsqueeze(0)
         last_computed_pos = torch.where(computed_pos_mask, answer_pos_ids, torch.zeros_like(answer_pos_ids))
         last_computed_pos = last_computed_pos.cummax(dim=1).values
         answer_log_probs = answer_log_probs.gather(dim=1, index=last_computed_pos)
 
-        return {"log_probs": answer_log_probs, "step_mask": step_mask}
+        return {"log_probs": answer_log_probs}
+
+    @torch.no_grad()
+    def _precompute_dapo_reference_old_policy_topk(
+        self,
+        data: DataProto,
+        temperature: float,
+        top_k: int,
+        pad_token_id: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Cache privileged-context targets before any actor optimizer step."""
+
+        loss_mask = data.batch["dapo_reference_kl_loss_mask"].bool()
+        selected_rows = loss_mask.any(dim=-1)
+        selected_indices = selected_rows.nonzero(as_tuple=False).flatten()
+        teacher_micro_batches = []
+        if selected_indices.numel() > 0:
+            teacher_loss_mask = data.batch["dapo_reference_kl_loss_mask"][selected_indices]
+            teacher_data = DataProto.from_dict(
+                tensors={
+                    "responses": data.batch["responses"][selected_indices],
+                    "response_mask": teacher_loss_mask,
+                    "input_ids": data.batch["dapo_reference_teacher_input_ids"][selected_indices],
+                    "attention_mask": data.batch["dapo_reference_teacher_attention_mask"][selected_indices],
+                    "position_ids": data.batch["dapo_reference_teacher_position_ids"][selected_indices],
+                    "dapo_reference_kl_loss_mask": teacher_loss_mask,
+                    "dapo_reference_kl_row_id": data.batch["dapo_reference_kl_row_id"][selected_indices],
+                },
+                meta_info=data.meta_info,
+            )
+
+            if self.config.use_dynamic_bsz:
+                max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                teacher_micro_batches, _ = prepare_dynamic_batch(
+                    teacher_data,
+                    max_token_len=max_token_len,
+                    dp_group=None,
+                    same_micro_num_in_dp=False,
+                )
+            else:
+                teacher_micro_batches = teacher_data.split(self.config.ppo_micro_batch_size_per_gpu)
+
+        local_micro_batch_count = len(teacher_micro_batches)
+        sync_group = self._get_micro_batch_sync_group()
+        sync_device = "cpu"
+        if torch.distributed.is_initialized():
+            sync_backend = str(torch.distributed.get_backend(group=sync_group)).lower()
+            if sync_backend in {"nccl", "hccl"}:
+                sync_device = get_device_name()
+        synchronized_micro_batch_count = torch.tensor(
+            local_micro_batch_count,
+            dtype=torch.long,
+            device=sync_device,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                synchronized_micro_batch_count,
+                op=torch.distributed.ReduceOp.MAX,
+                group=sync_group,
+            )
+        synchronized_micro_batch_count = int(synchronized_micro_batch_count.item())
+        if synchronized_micro_batch_count == 0:
+            return {}
+
+        dummy_loss_mask = data.batch["response_mask"][:1]
+        dummy_teacher_data = DataProto.from_dict(
+            tensors={
+                "responses": data.batch["responses"][:1],
+                "response_mask": dummy_loss_mask,
+                "input_ids": data.batch["dapo_reference_teacher_input_ids"][:1],
+                "attention_mask": data.batch["dapo_reference_teacher_attention_mask"][:1],
+                "position_ids": data.batch["dapo_reference_teacher_position_ids"][:1],
+                "dapo_reference_kl_loss_mask": dummy_loss_mask,
+                "dapo_reference_kl_row_id": torch.full((1,), -1, dtype=torch.long),
+            },
+            meta_info=data.meta_info,
+        )
+
+        teacher_cache = {}
+        was_training = self.actor_module.training
+        try:
+            self.actor_module.eval()
+            for micro_batch_index in range(synchronized_micro_batch_count):
+                is_dummy_micro_batch = micro_batch_index >= local_micro_batch_count
+                teacher_micro_batch = (
+                    dummy_teacher_data if is_dummy_micro_batch else teacher_micro_batches[micro_batch_index]
+                )
+                teacher_micro_batch = teacher_micro_batch.to(get_device_id())
+                teacher_inputs = {
+                    **teacher_micro_batch.batch,
+                    **teacher_micro_batch.non_tensor_batch,
+                    "pad_token_id": pad_token_id,
+                }
+                teacher_logits = self._forward_micro_batch(
+                    teacher_inputs,
+                    temperature=temperature,
+                    return_valid_logits=True,
+                    valid_logits_only=True,
+                )["valid_logits"]
+                if is_dummy_micro_batch:
+                    teacher_micro_batch.to("cpu")
+                    del teacher_inputs, teacher_logits
+                    continue
+                top_indices, top_log_probs, tail_probs = summarize_dapo_reference_teacher_topk(
+                    teacher_logits,
+                    top_k,
+                )
+
+                row_ids = teacher_inputs["dapo_reference_kl_row_id"].detach().cpu().tolist()
+                token_counts = teacher_inputs["dapo_reference_kl_loss_mask"].sum(dim=-1).detach().cpu().tolist()
+                offset = 0
+                for row_id, token_count in zip(row_ids, token_counts, strict=True):
+                    row_id = int(row_id)
+                    token_count = int(token_count)
+                    end = offset + token_count
+                    if row_id in teacher_cache:
+                        raise ValueError(f"DAPO reference KL old-policy cache contains duplicate row {row_id}.")
+                    teacher_cache[row_id] = (
+                        top_indices[offset:end].to(device="cpu", dtype=torch.int32).contiguous(),
+                        top_log_probs[offset:end].to(device="cpu").contiguous(),
+                        tail_probs[offset:end].to(device="cpu").contiguous(),
+                    )
+                    offset = end
+                if offset != teacher_logits.shape[0]:
+                    raise ValueError("DAPO reference KL old-policy cache token counts do not match the teacher output.")
+                teacher_micro_batch.to("cpu")
+                del teacher_inputs, teacher_logits, top_indices, top_log_probs, tail_probs
+        finally:
+            self._reshard_model_after_forward(self.actor_module)
+            self.actor_module.train(was_training)
+
+        if len(teacher_cache) != int(selected_rows.sum().item()):
+            raise ValueError("DAPO reference KL old-policy cache is missing selected response rows.")
+        return teacher_cache
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -1694,6 +2204,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        reference_kl_enabled = bool(data.meta_info.get("dapo_reference_kl", False))
+        reference_kl_coef = float(data.meta_info.get("dapo_reference_kl_coef", 0.0))
+        reference_kl_temperature = float(data.meta_info.get("dapo_reference_kl_temperature", 1.0))
+        reference_kl_approximation = str(data.meta_info.get("dapo_reference_kl_approximation", "topk"))
+        reference_kl_top_k = int(data.meta_info.get("dapo_reference_kl_top_k", 100))
+        reference_kl_token_chunk_size = int(
+            data.meta_info.get("dapo_reference_kl_token_chunk_size", _DAPO_REFERENCE_KL_TOKEN_CHUNK_SIZE)
+        )
 
         select_keys = [
             "responses",
@@ -1704,11 +2222,22 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if reference_kl_enabled:
+            reference_kl_keys = [
+                "dapo_reference_teacher_input_ids",
+                "dapo_reference_teacher_attention_mask",
+                "dapo_reference_teacher_position_ids",
+                "dapo_reference_kl_loss_mask",
+            ]
+            missing_reference_kl_keys = [key for key in reference_kl_keys if key not in data.batch]
+            if missing_reference_kl_keys:
+                raise ValueError(f"DAPO reference KL actor update requires batch keys {missing_reference_kl_keys}.")
+            select_keys.extend(reference_kl_keys)
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         kl_loss_needs_ref = self.config.use_kl_loss and float(self.config.kl_loss_coef) != 0.0
-        if kl_loss_needs_ref or loss_mode in {"ours", "my", "my_future"}:
+        if kl_loss_needs_ref or loss_mode in {"ours", "my_future"}:
             select_keys.append("ref_log_prob")
         if loss_mode == "dgpo":
             select_keys.extend(["ref_logits", "ref_logits_indices"])
@@ -1731,6 +2260,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        reference_teacher_cache = {}
+        if reference_kl_enabled and reference_kl_coef != 0.0:
+            if reference_kl_approximation != "topk":
+                raise ValueError(
+                    "Old-policy DAPO reference KL requires approximation='topk' because full-vocabulary "
+                    "teacher logits cannot be cached for the complete prompt batch."
+                )
+            data.batch["dapo_reference_kl_row_id"] = torch.arange(len(data), dtype=torch.long)
+            reference_teacher_cache = self._precompute_dapo_reference_old_policy_topk(
+                data=data,
+                temperature=reference_kl_temperature,
+                top_k=reference_kl_top_k,
+                pad_token_id=pad_token_id,
+            )
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -1740,6 +2284,7 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            "actor/dapo_reference_kl_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -1768,10 +2313,28 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = (
-                        self.config.calculate_entropy
-                        or (entropy_coeff != 0)
-                        or loss_mode in {"ours", "dgpo"}
+                        self.config.calculate_entropy or (entropy_coeff != 0) or loss_mode in {"ours", "dgpo", "my"}
                     )
+
+                    reference_kl_mask = model_inputs.get("dapo_reference_kl_loss_mask")
+                    has_reference_kl = bool(
+                        reference_kl_enabled
+                        and reference_kl_coef != 0.0
+                        and reference_kl_mask is not None
+                        and reference_kl_mask.any().item()
+                    )
+                    teacher_top_indices = None
+                    teacher_top_log_probs = None
+                    teacher_tail_prob = None
+                    if has_reference_kl:
+                        teacher_top_indices, teacher_top_log_probs, teacher_tail_prob = (
+                            gather_dapo_reference_teacher_topk(
+                                teacher_cache=reference_teacher_cache,
+                                row_ids=model_inputs["dapo_reference_kl_row_id"],
+                                loss_mask=reference_kl_mask,
+                                device=reference_kl_mask.device,
+                            )
+                        )
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -1784,6 +2347,7 @@ class DataParallelPPOActor(BasePPOActor):
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
                         return_topk_logits=loss_mode == "dgpo",
+                        return_valid_logits=has_reference_kl,
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
@@ -1841,7 +2405,19 @@ class DataParallelPPOActor(BasePPOActor):
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
                         )
-                    elif loss_mode == "my" or loss_mode == "my_future":
+                    elif loss_mode == "my":
+                        pg_loss, pg_metrics, _ = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            entropy=entropy,
+                            vinfo_weights=model_inputs.get("vinfo_weights"),
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    elif loss_mode == "my_future":
                         ref_log_prob = model_inputs["ref_log_prob"]
                         pg_loss, pg_metrics = policy_loss_fn(
                             old_log_prob=old_log_prob,
@@ -1899,6 +2475,40 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    reference_kl_loss = policy_loss.new_zeros(())
+                    if has_reference_kl:
+                        student_logits = outputs["valid_logits"]
+                        if reference_kl_temperature != temperature:
+                            student_logits = student_logits * (temperature / reference_kl_temperature)
+                        valid_token_reference_kl = dapo_reference_topk_forward_kl(
+                            student_logits=student_logits,
+                            teacher_top_indices=teacher_top_indices,
+                            teacher_top_log_probs=teacher_top_log_probs,
+                            teacher_tail_prob=teacher_tail_prob,
+                            token_chunk_size=reference_kl_token_chunk_size,
+                        )
+                        token_reference_kl = torch.zeros_like(
+                            reference_kl_mask, dtype=valid_token_reference_kl.dtype
+                        ).masked_scatter(reference_kl_mask.bool(), valid_token_reference_kl)
+                        reference_kl_loss = agg_loss(
+                            loss_mat=token_reference_kl,
+                            loss_mask=reference_kl_mask,
+                            loss_agg_mode="token-mean",
+                        )
+                        metrics["actor/dapo_reference_kl_loss"] += reference_kl_loss.detach().item() * loss_scale_factor
+
+                    if reference_kl_enabled and reference_kl_coef != 0.0:
+                        policy_loss = mix_dapo_reference_kl_loss(
+                            dapo_loss=policy_loss,
+                            reference_kl_loss=reference_kl_loss,
+                            loss_coef=reference_kl_coef,
+                        )
+                        # This metric must be emitted for every synchronized micro-batch on every rank.
+                        # Omitting all-correct micro-batches creates ragged per-rank metric lists that
+                        # DataProto.concat cannot reduce with numpy.
+                        micro_batch_metrics["actor/dapo_reference_kl_tokens"] = int(reference_kl_mask.sum().item())
+                        micro_batch_metrics["actor/dapo_reference_kl_coef"] = reference_kl_coef
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
@@ -1916,5 +2526,4 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
-        self.update_medium_policy()
         return metrics

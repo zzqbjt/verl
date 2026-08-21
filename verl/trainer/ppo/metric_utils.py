@@ -101,7 +101,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
-            - actor/answer_step_count_mean: Mean answer step count (if answer_step_end_mask is present)
+            - actor/answer_step_count_mean: Mean shared step count (if step_end_mask is present)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -223,9 +223,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
-    if "answer_step_end_mask" in batch.batch:
-        answer_step_count = batch.batch["answer_step_end_mask"].sum(dim=-1).float()
-        metrics["actor/answer_step_count_mean"] = answer_step_count.mean().detach().item()
+    if "step_end_mask" in batch.batch:
+        step_count = batch.batch["step_end_mask"].sum(dim=-1).float()
+        metrics["actor/answer_step_count_mean"] = step_count.mean().detach().item()
 
     return metrics
 

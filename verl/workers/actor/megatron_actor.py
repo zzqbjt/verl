@@ -370,9 +370,12 @@ class MegatronPPOActor(BasePPOActor):
             "advantages",
         ]
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if self.config.use_kl_loss or loss_mode == "ours":
+        kl_loss_needs_ref = self.config.use_kl_loss and float(self.config.kl_loss_coef) != 0.0
+        if kl_loss_needs_ref or loss_mode == "ours":
             select_keys.append("ref_log_prob")
         if loss_mode == "ours":
+            select_keys.append("vinfo_weights")
+        elif loss_mode == "my" and "vinfo_weights" in data.batch:
             select_keys.append("vinfo_weights")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -533,6 +536,18 @@ class MegatronPPOActor(BasePPOActor):
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                elif loss_mode == "my":
+                    pg_loss, pg_metrics, _ = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        entropy=entropy,
+                        vinfo_weights=data.get("vinfo_weights"),
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                    )
                 else:
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
@@ -574,7 +589,8 @@ class MegatronPPOActor(BasePPOActor):
             if forward_only:
                 policy_loss = torch.tensor(1.0, device=device)
             else:
-                if self.config.use_kl_loss:
+                kl_loss_needs_ref = self.config.use_kl_loss and float(self.config.kl_loss_coef) != 0.0
+                if kl_loss_needs_ref:
                     ref_log_prob = data["ref_log_prob"]
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
@@ -804,7 +820,7 @@ class MegatronPPOActor(BasePPOActor):
                 chunk.zero_grad_buffer()
 
             loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-            calculate_entropy = self.config.entropy_coeff != 0 or loss_mode == "ours"
+            calculate_entropy = self.config.entropy_coeff != 0 or loss_mode in {"ours", "my"}
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:

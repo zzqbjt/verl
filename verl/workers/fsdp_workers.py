@@ -65,7 +65,6 @@ from verl.utils.fsdp_utils import (
     collect_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
-    get_fsdp_checkpoint_shard_info,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     get_shard_placement_fn,
@@ -365,7 +364,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
-        assert role in ["actor", "ref", "medium_policy"]
+        assert role in ["actor", "ref"]
 
         # TiledMLP requires FSDP2 for correct gradient computation
         if use_tiled_mlp and self.config.actor.strategy == "fsdp":
@@ -546,8 +545,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
 
-        # Apply identical QAT transforms to the actor and its EMA medium policy before FSDP wrapping.
-        if role in {"actor", "medium_policy"} and self._qat_enabled:
+        if role == "actor" and self._qat_enabled:
             actor_module = apply_qat(actor_module, self.qat_config)
             enable_qat_fuse(actor_module)
             if self.qat_config.mode == "w4a4":
@@ -921,29 +919,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.medium_policy_module_fsdp = None
-            if float(actor_cfg.medium_ema_alpha) < 1.0:
-                self.medium_policy_module_fsdp = self._build_model_optimizer(
-                    model_path=local_path,
-                    fsdp_config=fsdp_config,
-                    optim_config=None,
-                    override_model_config=override_model_config,
-                    use_remove_padding=use_remove_padding,
-                    use_fused_kernels=use_fused_kernels,
-                    enable_gradient_checkpointing=False,
-                    trust_remote_code=self.config.model.get("trust_remote_code", False),
-                    use_liger=self.config.model.get("use_liger", False),
-                    role="medium_policy",
-                    enable_activation_offload=False,
-                    use_prefix_grouper=self.config.actor.get("use_prefix_grouper", False),
-                    use_tiled_mlp=use_tiled_mlp,
-                    tiled_mlp_shards=tiled_mlp_shards,
-                )[0]
             self.actor = DataParallelPPOActor(
                 config=actor_cfg,
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer,
-                medium_policy_module=self.medium_policy_module_fsdp,
             )
 
         if self._is_rollout:
@@ -1128,6 +1107,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         is_lora = data.meta_info.pop("is_lora", False)
         return_topk_logits = data.meta_info.pop("return_topk_logits", False)
+        # Deprecated compatibility alias; current trainers emit the explicit
+        # provider request below.
+        legacy_probe_request = bool(data.meta_info.pop("compute_step_value", False))
+        compute_step_value_probe = bool(data.meta_info.pop("compute_step_value_probe", legacy_probe_request))
+        compute_similarity_step_embeddings = bool(data.meta_info.pop("compute_similarity_step_embeddings", False))
+        if compute_step_value_probe and compute_similarity_step_embeddings:
+            raise ValueError("Probe values and similarity embeddings cannot be requested together.")
+        if compute_step_value_probe and is_lora:
+            raise ValueError("compute_step_value_probe is supported only on the actor old-log-prob path.")
+        if compute_step_value_probe and not self.actor.has_step_value_probe:
+            raise ValueError("compute_step_value_probe=True requires actor.step_value_probe.enabled=True.")
+        if compute_similarity_step_embeddings and is_lora:
+            raise ValueError("Similarity step embeddings are supported only on the actor old-log-prob path.")
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
@@ -1144,6 +1136,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     data=data,
                     calculate_entropy=calculate_entropy,
                     return_topk_logits=return_topk_logits,
+                    compute_step_value_probe=compute_step_value_probe,
+                    compute_similarity_step_embeddings=compute_similarity_step_embeddings,
                 )
             if not is_lora:
                 tensors = {"old_log_probs": outputs["log_probs"]}
@@ -1157,6 +1151,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 key_prefix = "ref_" if is_lora else ""
                 tensors[f"{key_prefix}logits"] = outputs["logits"]
                 tensors[f"{key_prefix}logits_indices"] = outputs["logits_indices"]
+            if compute_step_value_probe:
+                tensors.update(
+                    {
+                        "step_values": outputs["step_values"],
+                        "step_value_trajectory_logit_mean": outputs["step_value_trajectory_logit_mean"],
+                        "step_value_ready": outputs["step_value_ready"],
+                        "step_value_probe_loss": outputs["step_value_probe_loss"],
+                        "step_value_probe_grad_norm": outputs["step_value_probe_grad_norm"],
+                    }
+                )
+                for audit_key in (
+                    "step_value_audit_trajectory_logit_mean",
+                    "step_value_audit_endpoint_count",
+                    "step_value_audit_ready_next",
+                    "step_value_forward_row_id",
+                ):
+                    if audit_key in outputs:
+                        tensors[audit_key] = outputs[audit_key]
+            if compute_similarity_step_embeddings:
+                tensors["similarity_step_embeddings"] = outputs["similarity_step_embeddings"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1176,40 +1190,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="blue", role="actor_compute_medium_log_prob")
-    def compute_medium_log_prob(self, data: DataProto):
-        """Compute response-token log probabilities with the EMA medium policy."""
-        assert self._is_actor
-        if not self.actor.has_medium_policy:
-            raise ValueError(
-                "compute_medium_log_prob requires an EMA model; "
-                "set actor.medium_ema_alpha to a value in [0, 1)."
-            )
-
-        config_source = self.config.rollout
-        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-
-        with self.ulysses_sharding_manager:
-            with self.actor._use_medium_policy():
-                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(
-                tensors={"medium_log_prob": outputs["log_probs"].float()},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
-
-        return output.to("cpu")
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_answer_log_prob")
     def compute_answer_log_prob(self, data: DataProto):
         assert self._is_actor
         actor_config = self.config.actor
-        use_medium_policy = self.actor.has_medium_policy
-        if self._is_offload_param and not use_medium_policy:
+        if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         data.meta_info["micro_batch_size"] = actor_config.answer_log_prob_batch_size
@@ -1221,37 +1206,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if actor_config.answer_log_prob_use_dynamic_bsz is not None
             else actor_config.use_dynamic_bsz
         )
-        data.meta_info["answer_log_prob_num_wrong_answers"] = actor_config.get(
-            "answer_log_prob_num_wrong_answers", 1
-        )
         data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["delimiter"] = actor_config.delimiter
-        data.meta_info["delimiter_step_marker_filter"] = actor_config.delimiter_step_marker_filter
-        data.meta_info["delimiter_step_marker_lookahead"] = actor_config.delimiter_step_marker_lookahead
-        data.meta_info["delimiter_fallback_min_tokens"] = actor_config.delimiter_fallback_min_tokens
-        data.meta_info["delimiter_max_steps_per_response"] = actor_config.delimiter_max_steps_per_response
-        data.meta_info["delimiter_step_marker_patterns"] = actor_config.delimiter_step_marker_patterns
         data.meta_info["answer_prefix"] = actor_config.answer_prefix
-        data.meta_info["step_interval"] = actor_config.step_interval
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0)
 
         try:
             with self.ulysses_sharding_manager:
                 outputs = self.actor.compute_answer_log_prob(data=data, tokenizer=self.tokenizer)
                 output = DataProto.from_dict(
-                    tensors={
-                        "answer_log_prob": outputs["log_probs"].float(),
-                        "answer_step_end_mask": outputs["step_mask"],
-                    },
+                    tensors={"answer_log_prob": outputs["log_probs"].float()},
                     meta_info={"temperature": self.config.rollout.temperature},
                 )
 
             output = output.to("cpu")
 
-            if not use_medium_policy and self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
                 self.actor.actor_module._handle.reshard(True)
         finally:
-            if self._is_offload_param and not use_medium_policy:
+            if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
                 log_gpu_memory_usage("After offload model during compute_answer_log_prob", logger=logger)
 
@@ -1314,31 +1286,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
-        if self.actor.has_medium_policy and self.actor.save_medium_policy_checkpoint:
-            medium_world_size, medium_rank, medium_writer_rank = get_fsdp_checkpoint_shard_info(
-                self.device_mesh, self.rank
+        if self.actor.has_step_value_probe and self.actor.config.step_value_probe.save_checkpoint and self.rank == 0:
+            step_value_probe_path = os.path.join(local_path, "step_value_probe.pt")
+            torch.save(self.actor.step_value_probe_state_dict(), step_value_probe_path)
+            log_with_rank(
+                f"Saved step-value probe to {os.path.abspath(step_value_probe_path)}",
+                rank=self.rank,
+                logger=logger,
             )
-            if self.rank == medium_writer_rank:
-                # Medium-policy buffers are copied from the online actor after
-                # restore, so only the EMA parameters need a separate checkpoint.
-                medium_policy_state = self.actor.medium_policy_state_dict(include_buffers=False)
-                medium_policy_state.update(
-                    {
-                        "format_version": 2,
-                        "shard_world_size": medium_world_size,
-                        "shard_rank": medium_rank,
-                    }
-                )
-                medium_policy_path = os.path.join(
-                    local_path,
-                    f"medium_policy_world_size_{medium_world_size}_rank_{medium_rank}.pt",
-                )
-                torch.save(medium_policy_state, medium_policy_path)
-                log_with_rank(
-                    f"Saved medium-policy shard to {os.path.abspath(medium_policy_path)}",
-                    rank=self.rank,
-                    logger=logger,
-                )
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
@@ -1398,47 +1353,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         if self._is_actor:
-            medium_policy_state = None
-            if self.actor.has_medium_policy and self.actor.save_medium_policy_checkpoint:
-                local_medium_policy_path_to_delete = None
-                medium_world_size, medium_rank, _ = get_fsdp_checkpoint_shard_info(
-                    self.device_mesh, self.rank
-                )
-                # New checkpoints contain only one copy of each unique FSDP shard.
-                # Fall back to the old per-global-rank name for backward compatibility.
-                medium_policy_paths = [
-                    os.path.join(
-                        local_path,
-                        f"medium_policy_world_size_{medium_world_size}_rank_{medium_rank}.pt",
-                    ),
-                    os.path.join(
-                        local_path,
-                        f"medium_policy_world_size_{self.world_size}_rank_{self.rank}.pt",
-                    ),
-                ]
-                medium_policy_path = next(
-                    (path for path in dict.fromkeys(medium_policy_paths) if exists(path)),
-                    None,
-                )
-                if medium_policy_path:
-                    local_medium_policy_path = copy_to_local(medium_policy_path)
-                    medium_policy_state = torch.load(
-                        local_medium_policy_path,
+            step_value_probe_state = None
+            local_step_value_probe_path_to_delete = None
+            if self.actor.has_step_value_probe and self.actor.config.step_value_probe.save_checkpoint:
+                step_value_probe_path = os.path.join(local_path, "step_value_probe.pt")
+                if self.rank == 0 and exists(step_value_probe_path):
+                    local_step_value_probe_path = copy_to_local(step_value_probe_path)
+                    step_value_probe_state = torch.load(
+                        local_step_value_probe_path,
                         map_location="cpu",
                         weights_only=False,
                     )
-                    if del_local_after_load and is_non_local(medium_policy_path):
-                        local_medium_policy_path_to_delete = local_medium_policy_path
-                if del_local_after_load:
-                    # New-format replica ranks may share one cached shard path.
-                    # Wait until every rank has finished torch.load before removing it.
-                    dist.barrier()
-                    if local_medium_policy_path_to_delete is not None:
-                        try:
-                            os.remove(local_medium_policy_path_to_delete)
-                        except FileNotFoundError:
-                            pass
-            self.actor.load_medium_policy_state_dict(medium_policy_state)
+                    if del_local_after_load and is_non_local(step_value_probe_path):
+                        local_step_value_probe_path_to_delete = local_step_value_probe_path
+                probe_state_payload = [step_value_probe_state]
+                dist.broadcast_object_list(probe_state_payload, src=0)
+                step_value_probe_state = probe_state_payload[0]
+            self.actor.load_step_value_probe_state_dict(step_value_probe_state)
+
+            if del_local_after_load:
+                dist.barrier()
+                if self.rank == 0 and local_step_value_probe_path_to_delete is not None:
+                    try:
+                        os.remove(local_step_value_probe_path_to_delete)
+                    except FileNotFoundError:
+                        pass
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

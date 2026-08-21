@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from verl.trainer.config import AlgoConfig, KLControlConfig
+from verl.trainer.config import AlgoConfig, KLControlConfig, StepSplitConfig, StepValueAdvantageConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -39,6 +39,14 @@ class TestAlgoConfig(unittest.TestCase):
             "lam": 0.95,
             "adv_estimator": "gae",
             "norm_adv_by_std_in_grpo": True,
+            "step_value": {
+                "_target_": "verl.trainer.config.StepValueAdvantageConfig",
+                "provider": "similarity",
+                "lam": 0.8,
+                "norm_by_group_std": False,
+                "target_key": "acc",
+                "task_reward_key": "score",
+            },
             "use_kl_in_reward": True,
             "kl_penalty": "kl",
             "kl_ctrl": {
@@ -85,6 +93,14 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertEqual(config.kl_ctrl.horizon, 5000)
         self.assertEqual(config.kl_ctrl.target_kl, 0.05)
 
+        # Test step-value advantage config
+        self.assertIsInstance(config.step_value, StepValueAdvantageConfig)
+        self.assertEqual(config.step_value.provider, "similarity")
+        self.assertEqual(config.step_value.lam, 0.8)
+        self.assertFalse(config.step_value.norm_by_group_std)
+        self.assertEqual(config.step_value.target_key, "acc")
+        self.assertEqual(config.step_value.task_reward_key, "score")
+
         # Test PF PPO config
         self.assertEqual(config.pf_ppo.get("reweight_method"), "max_min")
         self.assertEqual(config.pf_ppo.get("weight_pow"), 3.0)
@@ -99,6 +115,30 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertEqual(config.length_adaptive_gae_alpha, 1.0)
         self.assertEqual(config.adv_estimator, "gae")  # default value
         self.assertTrue(config.norm_adv_by_std_in_grpo)  # default value
+        self.assertIsInstance(config.step_split, StepSplitConfig)
+        self.assertFalse(config.step_split.enabled)
+        self.assertEqual(config.step_split.lookahead_tokens, 10)
+        self.assertFalse(config.step_split.separate_preamble)
+        self.assertIsInstance(config.step_value, StepValueAdvantageConfig)
+        self.assertEqual(config.step_value.provider, "probe")
+        self.assertEqual(config.step_value.lam, 0.9)
+        self.assertTrue(config.step_value.norm_by_group_std)
+        self.assertTrue(config.step_value.zero_when_group_uniform)
+        self.assertEqual(config.step_value.target_key, "acc")
+        self.assertEqual(config.step_value.task_reward_key, "score")
+        self.assertFalse(config.step_value.prompt_center_calibration_enabled)
+        self.assertEqual(config.step_value.prompt_center_calibration_slope, 1.0)
+        self.assertEqual(config.step_value.prompt_center_calibration_intercept, 0.0)
+        self.assertFalse(config.step_value.prompt_center_audit_enabled)
+        self.assertEqual(config.step_value.prompt_center_audit_groups, 16)
+        self.assertEqual(config.step_value.prompt_center_audit_window, 2)
+        self.assertEqual(config.step_value.prompt_center_audit_seed, 0)
+        self.assertEqual(config.step_value.similarity_top_k, 3)
+        self.assertEqual(config.step_value.similarity_tau, 0.002)
+        self.assertEqual(config.step_value.similarity_position_window, 0.2)
+        self.assertEqual(config.step_value.similarity_iterations, 1)
+        self.assertIsNone(config.step_value.lookahead_tokens)
+        self.assertIsNone(config.step_value.separate_preamble)
         self.assertEqual(config.ratio_value_critic["a_init"], 1.0)
         self.assertEqual(config.ratio_value_critic["weight_decay"], 1e-2)
         self.assertFalse(config.use_kl_in_reward)  # default value
@@ -138,6 +178,60 @@ class TestAlgoConfig(unittest.TestCase):
         from verl.trainer.config import AlgoConfig
 
         assert isinstance(algo_config, AlgoConfig)
+        assert isinstance(algo_config.step_split, StepSplitConfig)
+        assert isinstance(algo_config.step_value, StepValueAdvantageConfig)
+
+    def test_step_split_config_validation(self):
+        """Step splitting is independently configurable without a probe."""
+        config = StepSplitConfig(enabled=True, lookahead_tokens=4, separate_preamble=True)
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.lookahead_tokens, 4)
+        self.assertTrue(config.separate_preamble)
+
+        invalid_cases = [
+            ({"enabled": 1}, "step_split.enabled"),
+            ({"lookahead_tokens": 0}, "step_split.lookahead_tokens"),
+            ({"separate_preamble": 1}, "step_split.separate_preamble"),
+        ]
+        for kwargs, expected_message in invalid_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_message):
+                StepSplitConfig(**kwargs)
+
+    def test_step_value_advantage_config_validation(self):
+        """Reject invalid step-value advantage settings."""
+        invalid_cases = [
+            ({"provider": "unknown"}, "step_value.provider"),
+            ({"lam": -0.1}, "step_value.lam"),
+            ({"lam": 1.1}, "step_value.lam"),
+            ({"norm_by_group_std": 1}, "step_value.norm_by_group_std"),
+            ({"zero_when_group_uniform": 1}, "step_value.zero_when_group_uniform"),
+            ({"target_key": "  "}, "step_value.target_key"),
+            ({"task_reward_key": "  "}, "step_value.task_reward_key"),
+            ({"prompt_center_calibration_enabled": 1}, "step_value.prompt_center_calibration_enabled"),
+            ({"prompt_center_calibration_slope": 0.0}, "step_value.prompt_center_calibration_slope"),
+            ({"prompt_center_calibration_slope": float("inf")}, "step_value.prompt_center_calibration_slope"),
+            (
+                {"prompt_center_calibration_intercept": float("nan")},
+                "step_value.prompt_center_calibration_intercept",
+            ),
+            ({"prompt_center_audit_enabled": 1}, "step_value.prompt_center_audit_enabled"),
+            ({"prompt_center_audit_groups": 0}, "step_value.prompt_center_audit_groups"),
+            ({"prompt_center_audit_window": 0}, "step_value.prompt_center_audit_window"),
+            ({"prompt_center_audit_seed": -1}, "step_value.prompt_center_audit_seed"),
+            (
+                {"prompt_center_audit_enabled": True, "prompt_center_calibration_enabled": True},
+                "mutually exclusive",
+            ),
+            ({"similarity_top_k": 0}, "step_value.similarity_top_k"),
+            ({"similarity_tau": 0.0}, "step_value.similarity_tau"),
+            ({"similarity_position_window": 1.1}, "step_value.similarity_position_window"),
+            ({"similarity_iterations": 0}, "step_value.similarity_iterations"),
+            ({"lookahead_tokens": 0}, "step_value.lookahead_tokens"),
+            ({"separate_preamble": 1}, "step_value.separate_preamble"),
+        ]
+        for kwargs, expected_message in invalid_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_message):
+                StepValueAdvantageConfig(**kwargs)
 
 
 class TestAlgoCompute(unittest.TestCase):

@@ -74,16 +74,12 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy."""
     policy_loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-    policy_loss_needs_ref = policy_loss_mode in {"dgpo", "ours", "my", "my_future"}
+    policy_loss_needs_ref = policy_loss_mode in {"dgpo", "ours", "my_future"}
     critic_config = config.get("critic", {})
     critic_free_gae_needs_ref = (
         config.algorithm.get("adv_estimator", None)
         in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
         and critic_config.get("enable", None) is False
-    )
-    my_advantage_needs_ref = config.algorithm.get("adv_estimator", None) in (
-        AdvantageEstimator.MY,
-        AdvantageEstimator.MY.value,
     )
     kl_loss_needs_ref = (
         config.actor_rollout_ref.actor.use_kl_loss
@@ -94,7 +90,6 @@ def need_reference_policy(
         or kl_loss_needs_ref
         or policy_loss_needs_ref
         or critic_free_gae_needs_ref
-        or my_advantage_needs_ref
     )
 
 

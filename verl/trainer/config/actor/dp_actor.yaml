@@ -49,9 +49,6 @@ calculate_sum_pi_squared: False
 # Enable gradient checkpointing for sum_pi_squared computation (saves memory)
 sum_pi_squared_checkpointing: False
 
-# Number of wrong answers sampled for the answer-log-prob margin
-answer_log_prob_num_wrong_answers: 1
-
 # QAT (Quantization-Aware Training) configuration
 # When enabled:
 #   - QAT is automatically applied to actor model during training

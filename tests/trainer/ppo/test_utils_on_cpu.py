@@ -34,12 +34,12 @@ def test_dgpo_needs_reference_policy():
     assert need_reference_policy(config)
 
 
-def _make_gae_config(critic_enable, adv_estimator="gae"):
+def _make_gae_config(critic_enable, adv_estimator="gae", policy_loss_mode="vanilla"):
     return OmegaConf.create(
         {
             "actor_rollout_ref": {
                 "actor": {
-                    "policy_loss": {"loss_mode": "vanilla"},
+                    "policy_loss": {"loss_mode": policy_loss_mode},
                     "use_kl_loss": False,
                     "kl_loss_coef": 0.0,
                 }
@@ -66,8 +66,16 @@ def test_standard_gae_does_not_need_reference_policy():
     assert not need_reference_policy(_make_gae_config(critic_enable=None))
 
 
-def test_my_advantage_needs_reference_policy():
-    assert need_reference_policy(_make_gae_config(critic_enable=False, adv_estimator="my"))
+def test_my_policy_loss_does_not_need_reference_policy():
+    config = _make_gae_config(critic_enable=None, adv_estimator="grpo", policy_loss_mode="my")
+    assert not need_reference_policy(config)
+
+
+def test_my_policy_loss_with_zero_kl_coefficient_does_not_need_reference_policy():
+    config = _make_gae_config(critic_enable=None, adv_estimator="grpo", policy_loss_mode="my")
+    config.actor_rollout_ref.actor.use_kl_loss = True
+    config.actor_rollout_ref.actor.kl_loss_coef = 0.0
+    assert not need_reference_policy(config)
 
 
 def test_length_adaptive_gae_uses_standard_critic_by_default():

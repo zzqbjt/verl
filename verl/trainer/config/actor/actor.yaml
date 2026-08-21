@@ -78,33 +78,38 @@ policy_loss:
   # Temperature divisor for token weights in the "my" loss
   tau: 0.5
 
-# Step delimiter used to split a response into reasoning steps
-delimiter: "\n\n"
+# Lightweight step-end value probe configuration
+step_value_probe:
 
-# Whether delimiters must be followed by a strong step marker to count as boundaries
-delimiter_step_marker_filter: false
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.StepValueProbeConfig
 
-# Token lookahead window after each delimiter for finding step markers
-delimiter_step_marker_lookahead: 10
+  # Whether to compute and train step-end value predictions
+  enabled: false
 
-# Minimum token interval for delimiter fallback; non-positive values disable fallback
-delimiter_fallback_min_tokens: 0
+  # Hidden width of the two-layer probe MLP
+  hidden_dim: 256
 
-# Maximum selected boundaries per response; non-positive values disable the cap
-delimiter_max_steps_per_response: 0
+  # AdamW learning rate for the probe
+  lr: 1e-3
 
-# Regex patterns searched within the decoded lookahead window after a delimiter
-delimiter_step_marker_patterns:
+  # AdamW decoupled weight decay for the probe
+  weight_decay: 0.0
 
-  - "(?i)\\bStep\\s*\\d+\\b"
-  - "\\b\\d+\\.\\s"
-  - "(?i)^(?:[#*_]+[ \\t]+)*[#*_]*[ \\t]*(?:First|Firstly|Second|Secondly|Third|Thirdly|Next|Then|Finally|Similarly)\\b"
+  # Probe optimization epochs during each warmup update
+  warmup_epochs: 10
+
+  # Probe optimization epochs after warmup
+  update_epochs: 1
+
+  # Number of policy updates that only train the probe before step values are enabled
+  warmup_updates: 1
+
+  # Whether to save the probe and its optimizer state in actor checkpoints
+  save_checkpoint: true
 
 # Prefix prepended to the ground-truth answer string
 answer_prefix: "Answer: "
-
-# Compute answer log probability every N selected steps, always including the final step
-step_interval: 1
 
 # Local per-GPU micro batch size for answer log probability inference
 answer_log_prob_batch_size: 16
@@ -114,15 +119,6 @@ answer_log_prob_use_dynamic_bsz: null
 
 # Max tokens per GPU for answer log probability inference; null follows actor.ppo_max_token_len_per_gpu
 answer_log_prob_max_token_len_per_gpu: null
-
-# Number of distinct wrong answers sampled per prompt for answer-log-prob margins; 0 scores only the ground truth.
-answer_log_prob_num_wrong_answers: 1
-
-# EMA update rate for the medium policy; 1.0 uses the current actor (the previous behavior)
-medium_ema_alpha: 1.0
-
-# Whether to persist the independent EMA medium policy alongside actor checkpoints
-save_medium_policy_checkpoint: true
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

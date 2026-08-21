@@ -28,7 +28,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_vectorized_outcome_advantage,
     compute_length_adaptive_gae_advantage_return,
     compute_log_prob_values,
-    compute_my_outcome_advantage,
+    compute_normalized_rloo_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_vinfo_outcome_advantage,
@@ -418,268 +418,136 @@ def test_compute_log_prob_values_rejects_shape_mismatch():
         )
 
 
-def test_compute_policy_loss_my_rejects_nonpositive_tau():
-    config = OmegaConf.create(
+def _make_my_policy_loss_config():
+    return OmegaConf.create(
         {
             "clip_ratio": 0.2,
             "clip_ratio_low": 0.2,
             "clip_ratio_high": 0.2,
             "clip_ratio_c": 3.0,
-            "policy_loss": {"tau": 0.0},
+            "global_batch_info": {},
         }
     )
+
+
+def test_compute_policy_loss_my_requires_entropy():
     zeros = torch.zeros(1, 2)
     ones = torch.ones(1, 2)
 
-    with pytest.raises(ValueError, match="tau must be positive"):
+    with pytest.raises(ValueError, match="requires entropy"):
         verl.trainer.ppo.core_algos.compute_policy_loss_my(
             old_log_prob=zeros,
             log_prob=zeros,
-            ref_log_prob=zeros,
-            entropy=ones,
+            entropy=None,
             advantages=ones,
             response_mask=ones,
-            config=config,
+            config=_make_my_policy_loss_config(),
         )
 
 
-def test_compute_policy_loss_my_does_not_require_discount_config():
-    config = OmegaConf.create(
-        {
-            "clip_ratio": 0.2,
-            "clip_ratio_low": 0.2,
-            "clip_ratio_high": 0.2,
-            "clip_ratio_c": 3.0,
-            "policy_loss": {"tau": 0.5},
-            "global_batch_info": {},
-        }
-    )
+def test_compute_policy_loss_my_does_not_require_ref_log_prob():
     zeros = torch.zeros(2, 2)
     ones = torch.ones(2, 2)
 
-    loss, metrics = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+    loss, metrics, weights = verl.trainer.ppo.core_algos.compute_policy_loss_my(
         old_log_prob=zeros,
         log_prob=zeros,
-        ref_log_prob=zeros,
         entropy=ones,
         advantages=ones,
         response_mask=ones,
-        config=config,
+        config=_make_my_policy_loss_config(),
     )
 
     assert torch.isfinite(loss)
+    torch.testing.assert_close(weights, ones)
     assert all(np.isfinite(value) for value in metrics.values())
-    assert metrics["actor/delta_old/mean"] == 0.0
-    assert metrics["actor/delta_old/std"] == 0.0
-    assert metrics["actor/delta_new/mean"] == 0.0
-    assert metrics["actor/delta_new/std"] == 0.0
-    assert metrics["actor/delta_old_delta_new/same_sign_ratio"] == 0.0
-    assert metrics["actor/w_coeff/pearson_corr"] == 0.0
-    assert metrics["actor/w_normalized_entropy/pearson_corr"] == 0.0
+    assert set(metrics) == {
+        "actor/pg_clipfrac",
+        "actor/ppo_kl",
+        "actor/pg_clipfrac_lower",
+        "actor/w/max",
+        "actor/w/min",
+        "actor/w/std",
+    }
 
 
-def test_compute_policy_loss_my_reports_delta_and_pearson_metrics():
-    config = OmegaConf.create(
-        {
-            "clip_ratio": 0.2,
-            "clip_ratio_low": 0.2,
-            "clip_ratio_high": 0.2,
-            "clip_ratio_c": 3.0,
-            "policy_loss": {"tau": 0.5},
-            "global_batch_info": {},
-        }
-    )
-    ref_log_prob = torch.zeros(2, 2)
+def test_compute_policy_loss_my_reports_entropy_weight_metrics():
     old_log_prob = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
-    delta_new = torch.tensor([[0.05, -0.1], [0.2, -0.3]])
-    log_prob = old_log_prob + delta_new
+    log_prob = old_log_prob + torch.tensor([[0.05, -0.1], [0.2, -0.3]])
     entropy = torch.tensor([[1.0, 2.0], [3.0, 1.0]])
     response_mask = torch.ones(2, 2)
 
-    _, metrics = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+    _, metrics, returned_weights = verl.trainer.ppo.core_algos.compute_policy_loss_my(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
-        ref_log_prob=ref_log_prob,
         entropy=entropy,
         advantages=torch.ones_like(response_mask),
         response_mask=response_mask,
-        config=config,
+        config=_make_my_policy_loss_config(),
     )
 
-    delta_old = old_log_prob - ref_log_prob
-    coeff = (torch.sigmoid(3.5 * delta_old) + torch.sigmoid(3.5 * delta_new)) / 2.0
     normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
-    w = torch.softmax(coeff * normalized_entropy / 0.5, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
-
-    assert metrics["actor/delta_old/mean"] == pytest.approx(delta_old.mean().item())
-    assert metrics["actor/delta_old/std"] == pytest.approx(delta_old.std(unbiased=False).item())
-    assert metrics["actor/delta_new/mean"] == pytest.approx(delta_new.mean().item())
-    assert metrics["actor/delta_new/std"] == pytest.approx(delta_new.std(unbiased=False).item())
-    assert metrics["actor/delta_old_delta_new/same_sign_ratio"] == pytest.approx(
-        ((delta_old * delta_new) > 0).float().mean().item()
-    )
-    assert metrics["actor/w_coeff/pearson_corr"] == pytest.approx(
-        torch.corrcoef(torch.stack((w.flatten(), coeff.flatten())))[0, 1].item()
-    )
-    assert metrics["actor/w_normalized_entropy/pearson_corr"] == pytest.approx(
-        torch.corrcoef(torch.stack((w.flatten(), normalized_entropy.flatten())))[0, 1].item()
-    )
+    weights = torch.softmax(normalized_entropy, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(returned_weights, weights)
+    valid_weights = weights[response_mask.bool()]
+    assert metrics["actor/w/max"] == pytest.approx(valid_weights.max().item())
+    assert metrics["actor/w/min"] == pytest.approx(valid_weights.min().item())
+    assert metrics["actor/w/std"] == pytest.approx(valid_weights.std().item())
 
 
-def test_compute_my_outcome_advantage_returns_step_weighted_token_coefficients():
-    response_mask = torch.ones(2, 8)
-    token_level_rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0] * 8])
-    actor_medium_token_delta = torch.tensor(
-        [[0.0, 1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 9.0], [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]]
+def test_compute_policy_loss_my_reports_response_balanced_vinfo_spearman_correlation():
+    entropy = torch.tensor(
+        [
+            [1.0, 2.0, 3.0],
+            [3.0, 2.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ]
     )
-    medium_log_prob = torch.tensor(
-        [[1.0, 2.0, 4.0, 4.0, 6.0, 8.0, 10.0, 12.0], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0]]
-    )
-    old_log_prob = medium_log_prob + actor_medium_token_delta
-    ref_log_prob = torch.zeros_like(old_log_prob)
-    entropy = torch.tensor([[0.0, 9.0, 0.0, 8.0, 0.0, 7.0, 0.0, 0.0], [0.0, 0.0, 6.0, 0.0, 5.0, 0.0, 4.0, 0.0]])
-
-    advantages, returns, w, metrics = compute_my_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=np.array(["group", "group"]),
-        old_log_prob=old_log_prob,
-        ref_log_prob=ref_log_prob,
-        medium_log_prob=medium_log_prob,
-        entropy=entropy,
-        d=2.0,
-        d_min=1,
-        step_lambda=0.6,
-    )
-
-    assert advantages.shape == returns.shape == w.shape == response_mask.shape
-    assert torch.equal(advantages, returns)
-    assert torch.isfinite(w[response_mask.bool()]).all()
-    step_ids = torch.tensor([[0, 1, 1, 2, 2, 3, 3, 3], [4, 4, 5, 5, 6, 6, 7, 7]])
-    raw_actor_medium_delta = torch.tensor([0.0, 2.0, 3.0, 7.0, 3.0, 7.0, 11.0, 15.0])
-    raw_medium_ref_delta = torch.tensor([1.0, 3.0, 5.0, 10.0, 1.0, 5.0, 9.0, 13.0])
-    actor_medium_delta = (raw_actor_medium_delta - raw_actor_medium_delta.mean()) / (
-        raw_actor_medium_delta.std() + 1e-6
-    )
-    medium_ref_delta = (raw_medium_ref_delta - raw_medium_ref_delta.mean()) / (
-        raw_medium_ref_delta.std() + 1e-6
-    )
-    expected_importance = (torch.tanh(actor_medium_delta) + torch.tanh(medium_ref_delta)) / 2.0
-    expected_step_w = torch.cat(
+    response_mask = torch.ones_like(entropy)
+    normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
+    expected_weights = torch.softmax(normalized_entropy, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
+    vinfo_weights = torch.stack(
         (
-            torch.softmax(expected_importance[:4] / 0.5, dim=0) * 4,
-            torch.softmax(expected_importance[4:] / 0.5, dim=0) * 4,
+            torch.tensor([1.0, 2.0, 100.0]),
+            torch.tensor([1.0, 2.0, 100.0]),
+            torch.ones_like(expected_weights[2]),
         )
     )
-    expected_c = torch.tensor(
-        [[1.6, 1.6, 0.4, 1.6, 0.4, 1.6, 0.7, 0.7], [1.6, 0.4, 1.6, 0.4, 1.6, 0.4, 1.6, 0.4]]
-    )
-    expected_w = expected_step_w[step_ids] * expected_c
-    torch.testing.assert_close(w, expected_w)
-    assert w[0, 1] / w[0, 2] == pytest.approx(4.0)
-    assert w[0, 5] / w[0, 6] == pytest.approx(1.6 / 0.7)
 
-    expected_final_step_w = torch.zeros_like(expected_step_w)
-    expected_final_step_w.index_add_(0, step_ids.flatten(), expected_w.flatten())
-    expected_final_step_w /= torch.bincount(step_ids.flatten()).float()
-
-    def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
-        return torch.corrcoef(torch.stack((x.flatten(), y.flatten())))[0, 1].item()
-
-    assert metrics == pytest.approx(
-        {
-            "actor/actor_medium_delta/mean": raw_actor_medium_delta.mean().item(),
-            "actor/actor_medium_delta/std": raw_actor_medium_delta.std(unbiased=False).item(),
-            "actor/medium_ref_delta/mean": raw_medium_ref_delta.mean().item(),
-            "actor/medium_ref_delta/std": raw_medium_ref_delta.std(unbiased=False).item(),
-            "actor/importance/mean": expected_importance.mean().item(),
-            "actor/importance/std": expected_importance.std(unbiased=False).item(),
-            "actor/actor_medium_delta_medium_ref_delta/pearson_corr": pearson_correlation(
-                raw_actor_medium_delta, raw_medium_ref_delta
-            ),
-            "actor/actor_medium_delta_medium_ref_delta/same_sign_ratio": (
-                (raw_actor_medium_delta * raw_medium_ref_delta) > 0
-            )
-            .float()
-            .mean()
-            .item(),
-            "actor/w/max": expected_final_step_w.max().item(),
-            "actor/w/min": expected_final_step_w.min().item(),
-            "actor/w/std": expected_final_step_w.std(unbiased=False).item(),
-            "actor/entropy_local_maxima_count/mean": 3.0,
-        }
-    )
-
-
-def test_compute_my_outcome_advantage_constant_inputs_have_finite_correlations():
-    response_mask = torch.ones(2, 2)
-    zeros = torch.zeros_like(response_mask)
-
-    _, _, w, metrics = compute_my_outcome_advantage(
-        token_level_rewards=zeros,
-        response_mask=response_mask,
-        index=np.array(["group", "group"]),
-        old_log_prob=zeros,
-        ref_log_prob=zeros,
-        medium_log_prob=zeros,
-        entropy=torch.ones_like(response_mask),
-    )
-
-    torch.testing.assert_close(w, torch.ones_like(w))
-    correlation_metrics = {key: value for key, value in metrics.items() if key.endswith("/pearson_corr")}
-    assert correlation_metrics
-    assert all(value == 0.0 for value in correlation_metrics.values())
-    assert metrics["actor/actor_medium_delta_medium_ref_delta/same_sign_ratio"] == 0.0
-    assert metrics["actor/w/std"] == 0.0
-    assert metrics["actor/entropy_local_maxima_count/mean"] == 0.0
-
-
-def test_compute_my_outcome_advantage_suppresses_nearby_entropy_peaks():
-    response_mask = torch.ones(2, 10)
-    zeros = torch.zeros_like(response_mask)
-    medium_log_prob = torch.zeros_like(response_mask)
-    old_log_prob = torch.arange(10, dtype=torch.float32).repeat(2, 1)
-    entropy = torch.tensor([[0.0, 9.0, 0.0, 8.0, 0.0, 7.0, 0.0, 6.0, 0.0, 0.0]]).repeat(2, 1)
-
-    _, _, w, metrics = compute_my_outcome_advantage(
-        token_level_rewards=zeros,
-        response_mask=response_mask,
-        index=np.array(["group", "group"]),
-        old_log_prob=old_log_prob,
-        ref_log_prob=zeros,
-        medium_log_prob=medium_log_prob,
+    _, metrics, returned_weights = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+        old_log_prob=torch.zeros_like(entropy),
+        log_prob=torch.zeros_like(entropy),
         entropy=entropy,
-        d=2.0,
-        d_min=2,
-    )
-
-    # The target is four cuts, but greedy suppression keeps only peaks 1 and 5.
-    torch.testing.assert_close(w[:, :1], w[:, :1].expand(-1, 1))
-    torch.testing.assert_close(w[:, 1:5], w[:, 1:2].expand(-1, 4))
-    torch.testing.assert_close(w[:, 5:], w[:, 5:6].expand(-1, 5))
-    assert metrics["actor/entropy_local_maxima_count/mean"] == 4.0
-
-
-def test_compute_my_outcome_advantage_ignores_padding_when_splitting_steps():
-    response_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0]]).repeat(2, 1)
-    zeros = torch.zeros_like(response_mask)
-    old_log_prob = torch.arange(6, dtype=torch.float32).repeat(2, 1)
-    entropy = torch.tensor([[0.0, 4.0, 0.0, 0.0, 100.0, 200.0]]).repeat(2, 1)
-
-    _, _, w, _ = compute_my_outcome_advantage(
-        token_level_rewards=zeros,
+        advantages=torch.ones_like(entropy),
         response_mask=response_mask,
-        index=np.array(["group", "group"]),
-        old_log_prob=old_log_prob,
-        ref_log_prob=zeros,
-        medium_log_prob=zeros,
-        entropy=entropy,
-        d=2.0,
-        d_min=0,
+        vinfo_weights=vinfo_weights,
+        config=_make_my_policy_loss_config(),
     )
 
-    assert torch.count_nonzero(w[:, 4:]) == 0
-    torch.testing.assert_close(w[:, 1:4], w[:, 1:2].expand(-1, 3))
+    torch.testing.assert_close(returned_weights, expected_weights)
+    assert metrics["actor/w_vinfo/spearman_corr_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["actor/w_vinfo/spearman_valid_response_ratio"] == pytest.approx(2.0 / 3.0)
+
+
+def test_compute_policy_loss_my_vinfo_spearman_uses_all_valid_tokens():
+    entropy = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 1000.0]])
+    response_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0]])
+    vinfo_weights = torch.tensor([[4.0, 3.0, 2.0, 1.0, 5.0, -1000.0]])
+
+    _, metrics, _ = verl.trainer.ppo.core_algos.compute_policy_loss_my(
+        old_log_prob=torch.zeros_like(entropy),
+        log_prob=torch.zeros_like(entropy),
+        entropy=entropy,
+        advantages=torch.ones_like(entropy),
+        response_mask=response_mask,
+        vinfo_weights=vinfo_weights,
+        config=_make_my_policy_loss_config(),
+    )
+
+    # The highest-ranked valid token agrees, but the rank correlation across all
+    # five valid tokens is zero. The masked sixth token must not affect it.
+    assert metrics["actor/w_vinfo/spearman_corr_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["actor/w_vinfo/spearman_valid_response_ratio"] == pytest.approx(1.0)
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:
@@ -744,6 +612,103 @@ def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
 
 
+def test_normalized_rloo_is_eight_sevenths_of_grpo_for_groups_of_eight():
+    token_level_rewards = torch.zeros(8, 3)
+    token_level_rewards[:, 0] = torch.tensor([1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0])
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["prompt"] * 8)
+
+    normalized_rloo, returns = compute_normalized_rloo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    grpo, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    torch.testing.assert_close(normalized_rloo, grpo * (8.0 / 7.0))
+    torch.testing.assert_close(returns, normalized_rloo)
+    assert normalized_rloo[0, 0].item() == pytest.approx(2.82842, abs=1e-5)
+
+
+def test_normalized_rloo_handles_multiple_groups_and_response_mask():
+    token_level_rewards = torch.zeros(5, 4)
+    token_level_rewards[:, 0] = torch.tensor([1.0, 0.0, 3.0, 2.0, 4.0])
+    response_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ]
+    )
+    index = np.array(["two", "three", "two", "three", "three"])
+
+    advantages, returns = compute_normalized_rloo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    expected_scalars = torch.tensor([-2.0**0.5, -1.5, 2.0**0.5, 0.0, 1.5])
+    expected = expected_scalars.unsqueeze(-1) * response_mask
+
+    torch.testing.assert_close(advantages, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(returns, expected, rtol=1e-5, atol=1e-6)
+    assert torch.count_nonzero(advantages[response_mask == 0]) == 0
+
+
+def test_normalized_rloo_singleton_and_uniform_groups_are_zero():
+    token_level_rewards = torch.tensor([[5.0, 0.0], [2.0, 0.0], [2.0, 0.0]])
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["singleton", "uniform", "uniform"])
+
+    advantages, returns = compute_normalized_rloo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    torch.testing.assert_close(advantages, torch.zeros_like(advantages))
+    torch.testing.assert_close(returns, advantages)
+    assert torch.isfinite(advantages).all()
+
+
+def test_normalized_rloo_can_disable_group_std_via_config():
+    token_level_rewards = torch.tensor([[1.0, 0.0], [3.0, 0.0]])
+    response_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+
+    advantages, _ = compute_normalized_rloo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=np.array([0, 0]),
+        config=OmegaConf.create({"norm_adv_by_std_in_grpo": False}),
+    )
+
+    torch.testing.assert_close(advantages, torch.tensor([[-2.0, 0.0], [2.0, 2.0]]))
+
+
+@pytest.mark.parametrize(
+    "token_level_rewards,response_mask,index,error",
+    [
+        (torch.zeros(2), torch.zeros(2), np.array([0, 0]), "rank-2"),
+        (torch.zeros(2, 2), torch.zeros(2, 3), np.array([0, 0]), "must match"),
+        (torch.zeros(2, 2), torch.zeros(2, 2), np.array([0]), "must contain 2"),
+        (torch.tensor([[float("nan")], [0.0]]), torch.ones(2, 1), np.array([0, 0]), "must be finite"),
+    ],
+)
+def test_normalized_rloo_rejects_invalid_inputs(token_level_rewards, response_mask, index, error):
+    with pytest.raises(ValueError, match=error):
+        compute_normalized_rloo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+        )
+
+
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_groups,seed",
     [
@@ -803,7 +768,7 @@ def test_vinfo_returns_unmodified_grpo_advantage_and_weights():
     token_level_rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
     index = np.array([0, 0])
     answer_log_prob = torch.tensor([[0.0, 0.2, 0.4, 0.6], [0.0, -0.2, -0.4, -0.6]])
-    answer_step_end_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.bool)
+    step_end_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.bool)
 
     expected_advantages, expected_returns = compute_grpo_outcome_advantage(
         token_level_rewards=token_level_rewards,
@@ -815,11 +780,11 @@ def test_vinfo_returns_unmodified_grpo_advantage_and_weights():
         response_mask=response_mask,
         index=index,
         answer_log_prob=answer_log_prob,
-        answer_step_end_mask=answer_step_end_mask,
+        step_end_mask=step_end_mask,
     )
 
-    assert torch.equal(advantages, expected_advantages)
-    assert torch.equal(returns, expected_returns)
+    torch.testing.assert_close(advantages, expected_advantages)
+    torch.testing.assert_close(returns, expected_returns)
     assert w.shape == advantages.shape
 
 

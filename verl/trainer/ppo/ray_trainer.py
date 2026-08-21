@@ -42,6 +42,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.dapo_reference_kl import prepare_dapo_reference_kl_inputs
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -50,6 +51,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.step_value_prompt_center import (
+    LaggedPromptCenterAuditState,
+    apply_rank_preserving_prompt_center_calibration,
+)
+from verl.trainer.ppo.step_value_similarity import (
+    compute_similarity_step_value_diagnostics,
+    compute_similarity_step_values,
+)
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -60,6 +69,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.step_split import build_step_end_mask, build_step_start_mask
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
@@ -124,6 +134,154 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def _compute_step_value_diagnostics(
+    step_values: torch.Tensor,
+    step_end_mask: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    ece_bins: int = 10,
+) -> dict[str, float]:
+    """Return pre-update Probe diagnostics over nonterminal endpoints only."""
+
+    values = step_values.detach().float().cpu()
+    end_mask = step_end_mask.detach().bool().cpu()
+    labels = targets.detach().float().reshape(-1).cpu()
+    if values.ndim != 2 or end_mask.shape != values.shape:
+        raise ValueError("step-value diagnostics require step_values and step_end_mask with the same 2-D shape")
+    if labels.numel() != values.shape[0]:
+        raise ValueError("step-value diagnostics require one target per trajectory")
+    if ece_bins <= 0:
+        raise ValueError("step-value diagnostic bin count must be positive")
+    if not torch.isfinite(labels).all() or ((labels < 0.0) | (labels > 1.0)).any():
+        raise ValueError("step-value diagnostic targets must be finite and lie in [0, 1]")
+    if ((labels != 0.0) & (labels != 1.0)).any():
+        raise ValueError("step-value diagnostic targets must be binary values in {0, 1}")
+
+    avg_steps_per_response = float(end_mask.sum(dim=-1).float().mean().item())
+    endpoint_values = []
+    endpoint_labels = []
+    endpoint_weights = []
+    trajectory_values = []
+    trajectory_labels = []
+    delta_values = []
+    delta_weights = []
+    early_brier_rows = []
+    late_brier_rows = []
+    eligible_trajectory_count = 0
+
+    for row in range(values.shape[0]):
+        all_row_values = values[row][end_mask[row]]
+        if all_row_values.numel() == 0:
+            raise ValueError(f"step-value diagnostics found no step end for trajectory {row}")
+        if not torch.isfinite(all_row_values).all() or ((all_row_values < 0.0) | (all_row_values > 1.0)).any():
+            raise ValueError("active step-value predictions must be finite and lie in [0, 1]")
+
+        # The final endpoint observes the complete response.  Even before the
+        # terminal Y anchor is applied, scoring it would measure outcome
+        # recognition rather than process-value quality.
+        if all_row_values.numel() == 1:
+            continue
+        row_values = all_row_values[:-1]
+        eligible_trajectory_count += 1
+
+        step_count = row_values.numel()
+        row_label = labels[row]
+        endpoint_values.append(row_values)
+        endpoint_labels.append(row_label.expand(step_count))
+        endpoint_weights.append(torch.full((step_count,), 1.0 / step_count))
+        trajectory_values.append(row_values.mean())
+        trajectory_labels.append(row_label)
+
+        if step_count > 1:
+            row_deltas = row_values[1:] - row_values[:-1]
+            delta_values.append(row_deltas)
+            delta_weights.append(torch.full_like(row_deltas, 1.0 / row_deltas.numel()))
+
+        # Keep only an early-versus-late check.  Each side contains at least
+        # one endpoint, even for responses with fewer than four steps.
+        quarter_size = max(1, (step_count + 3) // 4)
+        early_brier_rows.append(((row_values[:quarter_size] - row_label) ** 2).mean())
+        late_brier_rows.append(((row_values[-quarter_size:] - row_label) ** 2).mean())
+
+    diagnostic_coverage = eligible_trajectory_count / values.shape[0] if values.shape[0] > 0 else 0.0
+    positive_fraction = float(labels.mean().item()) if labels.numel() > 0 else 0.0
+    if not endpoint_values:
+        return {
+            "step_value/avg_steps_per_response": avg_steps_per_response,
+            "step_value/target_positive_fraction": positive_fraction,
+            "step_value/preupdate_nonterminal_coverage": diagnostic_coverage,
+            "step_value/preupdate_accuracy": 0.0,
+            "step_value/preupdate_brier_skill": 0.0,
+            f"step_value/preupdate_ece_{ece_bins}": 0.0,
+            "step_value/value_separation": 0.0,
+            "step_value/depth_q1_brier": 0.0,
+            "step_value/depth_q4_brier": 0.0,
+            "step_value/delta_abs_mean": 0.0,
+            "step_value/delta_near_zero_fraction": 0.0,
+        }
+
+    flat_values = torch.cat(endpoint_values)
+    flat_labels = torch.cat(endpoint_labels)
+    flat_weights = torch.cat(endpoint_weights)
+    trajectory_values_tensor = torch.stack(trajectory_values)
+    trajectory_labels_tensor = torch.stack(trajectory_labels)
+    total_weight = float(flat_weights.sum().item())
+
+    brier = float((((flat_values - flat_labels) ** 2) * flat_weights).sum().item() / total_weight)
+    accuracy = float(
+        (((flat_values >= 0.5) == (flat_labels >= 0.5)).float() * flat_weights).sum().item() / total_weight
+    )
+    ece = 0.0
+    calibration_bins = torch.clamp((flat_values * ece_bins).long(), max=ece_bins - 1)
+    for bin_index in range(ece_bins):
+        in_bin = calibration_bins == bin_index
+        if not in_bin.any():
+            continue
+        bin_weights = flat_weights[in_bin]
+        bin_mass = float(bin_weights.sum().item())
+        mean_prediction = float((flat_values[in_bin] * bin_weights).sum().item() / bin_mass)
+        mean_target = float((flat_labels[in_bin] * bin_weights).sum().item() / bin_mass)
+        ece += (bin_mass / total_weight) * abs(mean_prediction - mean_target)
+
+    positive = trajectory_labels_tensor >= 0.5
+    negative = ~positive
+    positive_mean = float(trajectory_values_tensor[positive].mean().item()) if positive.any() else 0.0
+    negative_mean = float(trajectory_values_tensor[negative].mean().item()) if negative.any() else 0.0
+    separation_valid = bool(positive.any() and negative.any())
+    separation = positive_mean - negative_mean if separation_valid else 0.0
+    diagnostic_positive_fraction = float(trajectory_labels_tensor.mean().item())
+    brier_baseline = diagnostic_positive_fraction * (1.0 - diagnostic_positive_fraction)
+    brier_skill_valid = brier_baseline > 0.0
+    brier_skill = 1.0 - brier / brier_baseline if brier_skill_valid else 0.0
+
+    if delta_values:
+        flat_deltas = torch.cat(delta_values)
+        flat_delta_weights = torch.cat(delta_weights)
+        delta_total_weight = float(flat_delta_weights.sum().item())
+        delta_epsilon = 1e-3
+        delta_abs_mean = float((flat_deltas.abs() * flat_delta_weights).sum().item() / delta_total_weight)
+        delta_near_zero_fraction = float(
+            ((flat_deltas.abs() <= delta_epsilon).float() * flat_delta_weights).sum().item() / delta_total_weight
+        )
+    else:
+        delta_abs_mean = 0.0
+        delta_near_zero_fraction = 0.0
+
+    return {
+        "step_value/avg_steps_per_response": avg_steps_per_response,
+        "step_value/target_positive_fraction": positive_fraction,
+        "step_value/preupdate_nonterminal_coverage": diagnostic_coverage,
+        "step_value/preupdate_accuracy": accuracy,
+        "step_value/preupdate_brier_skill": brier_skill,
+        f"step_value/preupdate_ece_{ece_bins}": ece,
+        "step_value/value_separation": separation,
+        "step_value/depth_q1_brier": float(torch.stack(early_brier_rows).mean().item()),
+        "step_value/depth_q4_brier": float(torch.stack(late_brier_rows).mean().item()),
+        "step_value/delta_abs_mean": delta_abs_mean,
+        "step_value/delta_near_zero_fraction": delta_near_zero_fraction,
+    }
 
 
 def compute_advantage(
@@ -200,48 +358,55 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    elif adv_estimator in (AdvantageEstimator.MY, AdvantageEstimator.MY.value):
-        required_batch_keys = ("old_log_probs", "ref_log_prob", "medium_log_prob", "entropys")
-        missing_batch_keys = [key for key in required_batch_keys if key not in data.batch]
-        if missing_batch_keys:
-            raise ValueError(f"my advantage requires data.batch keys {missing_batch_keys}")
-        if "uid" not in data.non_tensor_batch:
-            raise ValueError("my advantage requires data.non_tensor_batch['uid']")
-
-        advantages, returns, _, advantage_metrics = core_algos.compute_my_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            old_log_prob=data.batch["old_log_probs"],
-            ref_log_prob=data.batch["ref_log_prob"],
-            medium_log_prob=data.batch["medium_log_prob"],
-            entropy=data.batch["entropys"],
-            tau=0.5 if config is None else float(config.get("tau", 0.5)),
-            d=128.0 if config is None else float(config.get("d", 128.0)),
-            d_min=8 if config is None else config.get("d_min", 8),
-            step_lambda=0.0 if config is None else float(config.get("step_lambda", 0.0)),
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            config=config,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-
-        data.meta_info["my_advantage_metrics"] = advantage_metrics
     elif adv_estimator in (AdvantageEstimator.V_INFO, AdvantageEstimator.V_INFO.value):
         grpo_calculation_mask = data.batch["response_mask"]
-        if "answer_log_prob" not in data.batch or "answer_step_end_mask" not in data.batch:
-            raise ValueError("v_info requires answer_log_prob and answer_step_end_mask in data.batch.")
+        if "answer_log_prob" not in data.batch or "step_end_mask" not in data.batch:
+            raise ValueError("v_info requires answer_log_prob and shared step_end_mask in data.batch.")
         advantages, returns, vinfo_weights = core_algos.compute_vinfo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             answer_log_prob=data.batch["answer_log_prob"],
-            answer_step_end_mask=data.batch["answer_step_end_mask"],
+            step_end_mask=data.batch["step_end_mask"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.batch["vinfo_weights"] = vinfo_weights
+    elif adv_estimator in (AdvantageEstimator.STEP_VALUE, AdvantageEstimator.STEP_VALUE.value):
+        required_batch_keys = (
+            "step_values",
+            "step_end_mask",
+            "step_value_initial_values",
+            "step_value_scales",
+            "step_value_active",
+            "step_value_task_rewards",
+            "step_value_ready",
+        )
+        missing_batch_keys = [key for key in required_batch_keys if key not in data.batch]
+        if missing_batch_keys:
+            raise ValueError(f"step_value advantage requires data.batch keys {missing_batch_keys}")
+        if "uid" not in data.non_tensor_batch:
+            raise ValueError("step_value advantage requires data.non_tensor_batch['uid']")
+
+        step_value_config = {} if config is None else config.get("step_value", {})
+        advantages, returns = core_algos.compute_step_value_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            step_values=data.batch["step_values"],
+            step_end_mask=data.batch["step_end_mask"],
+            step_value_initial_values=data.batch["step_value_initial_values"],
+            step_value_scales=data.batch["step_value_scales"],
+            step_value_active=data.batch["step_value_active"],
+            step_value_task_rewards=data.batch["step_value_task_rewards"],
+            step_value_ready=data.batch["step_value_ready"],
+            lam=float(step_value_config.get("lam", 0.9)),
+            norm_by_group_std=bool(step_value_config.get("norm_by_group_std", True)),
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -336,13 +501,17 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
 
+        reference_kl_config = self.config.algorithm.get("dapo_reference_kl", {})
+        self.use_dapo_reference_kl = bool(
+            reference_kl_config.get("enabled", False) and reference_kl_config.get("loss_coef", 0.0) > 0.0
+        )
+
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
-        self.use_ratio_value_critic = (
-            not self.use_critic
-            and self.config.algorithm.adv_estimator
-            in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
+        self.use_ratio_value_critic = not self.use_critic and self.config.algorithm.adv_estimator in (
+            AdvantageEstimator.GAE,
+            AdvantageEstimator.LENGTH_ADAPTIVE_GAE,
         )
         self.ratio_value_critic = None
         self.ratio_value_critic_optimizer = None
@@ -389,10 +558,455 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self.use_step_value = self.config.algorithm.adv_estimator in (
+            AdvantageEstimator.STEP_VALUE,
+            AdvantageEstimator.STEP_VALUE.value,
+        )
+        self.use_v_info = self.config.algorithm.adv_estimator in (
+            AdvantageEstimator.V_INFO,
+            AdvantageEstimator.V_INFO.value,
+        )
+        step_value_config = self.config.algorithm.get("step_value", {})
+        self.step_value_provider = str(step_value_config.get("provider", "probe"))
+        probe_config = self.config.actor_rollout_ref.actor.get("step_value_probe", {})
+        prompt_center_audit_requested = bool(step_value_config.get("prompt_center_audit_enabled", False))
+        if prompt_center_audit_requested and not self.use_step_value:
+            raise ValueError("Prompt-center audit calibration requires algorithm.adv_estimator=step_value")
+        self.use_step_value_probe = (
+            self.use_step_value and self.step_value_provider == "probe" and bool(probe_config.get("enabled", False))
+        )
+        self.use_step_value_prompt_center_audit = self.use_step_value_probe and prompt_center_audit_requested
+        self._prompt_center_audit_state: LaggedPromptCenterAuditState | None = None
+        step_split_config = self.config.algorithm.get("step_split", {})
+        self.use_step_split = self.use_step_value or self.use_v_info or bool(step_split_config.get("enabled", False))
+        if self.use_dapo_reference_kl:
+            self._validate_dapo_reference_kl_runtime()
+        if self.use_step_value:
+            self._validate_step_value_runtime()
+        if self.use_step_value_probe:
+            self._validate_step_value_probe_runtime()
+        if self.use_step_value_prompt_center_audit:
+            self._prompt_center_audit_state = LaggedPromptCenterAuditState(
+                initial_slope=float(step_value_config.get("prompt_center_calibration_slope", 1.0)),
+                initial_intercept=float(step_value_config.get("prompt_center_calibration_intercept", 0.0)),
+                target_key=str(step_value_config.get("target_key", "acc")),
+                group_size=int(self.config.actor_rollout_ref.rollout.n),
+                audit_groups=int(step_value_config.get("prompt_center_audit_groups", 16)),
+                rolling_window=int(step_value_config.get("prompt_center_audit_window", 2)),
+                seed=int(step_value_config.get("prompt_center_audit_seed", 0)),
+            )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _validate_dapo_reference_kl_runtime(self) -> None:
+        """Validate constraints of the DAPO privileged-context KL auxiliary loss."""
+
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("DAPO reference KL currently requires trainer.use_legacy_worker_impl=enable or auto.")
+        actor_config = self.config.actor_rollout_ref.actor
+        strategy = str(actor_config.get("strategy", "")).lower()
+        if strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError("DAPO reference KL currently supports actor strategy 'fsdp' or 'fsdp2'.")
+        if bool(actor_config.get("use_fused_kernels", False)):
+            raise ValueError("DAPO reference KL requires actor.use_fused_kernels=false.")
+        if int(actor_config.get("ulysses_sequence_parallel_size", 1)) != 1:
+            raise ValueError("DAPO reference KL currently requires ulysses_sequence_parallel_size=1.")
+        if bool(actor_config.get("use_prefix_grouper", False)):
+            raise ValueError("DAPO reference KL currently requires actor.use_prefix_grouper=false.")
+        filter_groups_config = self.config.algorithm.get("filter_groups")
+        if filter_groups_config is None or not bool(filter_groups_config.get("enable", False)):
+            raise ValueError(
+                "DAPO reference KL requires DAPO dynamic sampling via algorithm.filter_groups.enable=true."
+            )
+        if not str(filter_groups_config.get("metric", "")):
+            raise ValueError("DAPO reference KL requires a non-empty algorithm.filter_groups.metric.")
+        if int(self.config.actor_rollout_ref.rollout.n) < 2:
+            raise ValueError("DAPO reference KL requires rollout.n >= 2 to form mixed-outcome groups.")
+        if str(self.config.algorithm.dapo_reference_kl.approximation) != "topk":
+            raise ValueError(
+                "Old-policy DAPO reference KL requires algorithm.dapo_reference_kl.approximation=topk "
+                "so teacher targets can be cached before actor updates."
+            )
+
+    def _validate_step_value_runtime(self) -> None:
+        """Validate provider-specific execution constraints."""
+
+        provider = getattr(
+            self,
+            "step_value_provider",
+            str(self.config.algorithm.get("step_value", {}).get("provider", "probe")),
+        )
+        if provider not in {"probe", "similarity"}:
+            raise ValueError(f"Unsupported algorithm.step_value.provider={provider!r}")
+        step_config = self.config.algorithm.get("step_value", {})
+        if bool(step_config.get("prompt_center_calibration_enabled", False)) and provider != "probe":
+            raise ValueError("prompt-center calibration requires algorithm.step_value.provider=probe")
+        audit_enabled = bool(step_config.get("prompt_center_audit_enabled", False))
+        if audit_enabled and provider != "probe":
+            raise ValueError("prompt-center audit calibration requires algorithm.step_value.provider=probe")
+        if audit_enabled and bool(step_config.get("prompt_center_calibration_enabled", False)):
+            raise ValueError(
+                "Frozen prompt-center calibration and prompt-center audit calibration are mutually exclusive"
+            )
+        if audit_enabled:
+            probe_config = self.config.actor_rollout_ref.actor.get("step_value_probe", {})
+            if not bool(probe_config.get("enabled", False)):
+                raise ValueError("Prompt-center audit calibration requires actor.step_value_probe.enabled=true")
+            if not self._supports_step_value_prompt_center_audit():
+                raise ValueError("Prompt-center audit calibration is currently supported only by RayDAPOTrainer")
+            filter_config = self.config.algorithm.get("filter_groups", {})
+            if not bool(filter_config.get("enable", False)):
+                raise ValueError("Prompt-center audit calibration requires algorithm.filter_groups.enable=true")
+            target_key = str(step_config.get("target_key", "acc"))
+            if str(filter_config.get("metric", "")) != target_key:
+                raise ValueError(
+                    "Prompt-center audit calibration requires algorithm.filter_groups.metric "
+                    "to equal algorithm.step_value.target_key"
+                )
+            if self.config.algorithm.use_kl_in_reward:
+                raise ValueError("Prompt-center audit calibration requires algorithm.use_kl_in_reward=false")
+            if int(self.config.actor_rollout_ref.rollout.n) != 8:
+                raise ValueError("Prompt-center audit calibration currently requires rollout.n=8 complete trajectories")
+            audit_groups = int(step_config.get("prompt_center_audit_groups", 16))
+            if int(self.config.data.train_batch_size) < audit_groups:
+                raise ValueError("data.train_batch_size must be at least prompt_center_audit_groups")
+        if provider != "similarity":
+            return
+
+        actor_config = self.config.actor_rollout_ref.actor
+        if bool(actor_config.get("step_value_probe", {}).get("enabled", False)):
+            raise ValueError("similarity step values require actor.step_value_probe.enabled=false")
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("similarity step values require the legacy FSDP actor worker API")
+        if str(actor_config.get("strategy", "")).lower() not in {"fsdp", "fsdp2"}:
+            raise ValueError("similarity step values support only actor strategy 'fsdp' or 'fsdp2'")
+        if int(actor_config.get("ulysses_sequence_parallel_size", 1)) != 1:
+            raise ValueError("similarity step values require ulysses_sequence_parallel_size=1")
+        if bool(actor_config.get("use_prefix_grouper", False)):
+            raise ValueError("similarity step values are not compatible with use_prefix_grouper")
+        if bool(actor_config.get("use_fused_kernels", False)):
+            raise ValueError("similarity step values are not validated with use_fused_kernels")
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError("similarity step values require algorithm.use_kl_in_reward=false")
+        rollout_correction = self.config.algorithm.get("rollout_correction", None)
+        if rollout_correction and rollout_correction.get("bypass_mode", False):
+            raise ValueError("similarity step values require recomputing old log probabilities")
+        multi_turn = self.config.actor_rollout_ref.rollout.get("multi_turn", {})
+        if bool(multi_turn.get("enable", False)):
+            raise ValueError("similarity step values currently support single-turn text rollouts only")
+        if int(self.config.actor_rollout_ref.rollout.get("n", 1)) < 2:
+            raise ValueError("similarity step values require at least two responses per prompt")
+
+    def _validate_step_value_probe_runtime(self) -> None:
+        """Reject execution paths unsupported by the actor-probe provider."""
+
+        actor_config = self.config.actor_rollout_ref.actor
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("step_value_probe currently requires the legacy FSDP actor worker API")
+        if str(actor_config.get("strategy", "")).lower() not in {"fsdp", "fsdp2"}:
+            raise ValueError("step_value_probe currently supports only actor strategy 'fsdp' or 'fsdp2'")
+        if int(actor_config.get("ulysses_sequence_parallel_size", 1)) != 1:
+            raise ValueError("step_value_probe currently requires ulysses_sequence_parallel_size=1")
+        if bool(actor_config.get("use_prefix_grouper", False)):
+            raise ValueError("step_value_probe is not compatible with use_prefix_grouper")
+        if bool(actor_config.get("use_fused_kernels", False)):
+            raise ValueError("step_value_probe is not yet validated with use_fused_kernels")
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError(
+                "step_value_probe currently requires algorithm.use_kl_in_reward=false; "
+                "known auxiliary outcome rewards are handled separately"
+            )
+        rollout_correction = self.config.algorithm.get("rollout_correction", None)
+        if rollout_correction and rollout_correction.get("bypass_mode", False):
+            raise ValueError("step_value_probe requires recomputing old log probabilities and cannot use bypass_mode")
+        multi_turn = self.config.actor_rollout_ref.rollout.get("multi_turn", {})
+        if bool(multi_turn.get("enable", False)):
+            raise ValueError("step_value_probe currently supports single-turn text rollouts only")
+
+    def _supports_step_value_prompt_center_audit(self) -> bool:
+        """Whether this trainer implements the uncensored DAPO audit stream."""
+
+        return False
+
+    def _step_split_options(self) -> tuple[int, bool]:
+        """Resolve shared split settings with legacy step-value aliases."""
+
+        split_config = self.config.algorithm.get("step_split", {})
+        legacy_config = self.config.algorithm.get("step_value", {})
+        legacy_lookahead = legacy_config.get("lookahead_tokens", None)
+        legacy_separate_preamble = legacy_config.get("separate_preamble", None)
+
+        # Legacy aliases apply only to the step-value estimator. V-Info always
+        # takes its boundary options from the shared step_split namespace.
+        use_legacy_aliases = self.use_step_value and not bool(split_config.get("enabled", False))
+        if use_legacy_aliases and legacy_lookahead is not None:
+            lookahead_tokens = int(legacy_lookahead)
+        else:
+            lookahead_tokens = int(split_config.get("lookahead_tokens", 10))
+        if use_legacy_aliases and legacy_separate_preamble is not None:
+            separate_preamble = bool(legacy_separate_preamble)
+        else:
+            separate_preamble = bool(split_config.get("separate_preamble", False))
+        return lookahead_tokens, separate_preamble
+
+    def _prepare_step_inputs(self, batch: DataProto) -> None:
+        """Attach exact step boundaries without enabling or invoking a probe."""
+
+        use_v_info = self.config.algorithm.get("adv_estimator") in (
+            AdvantageEstimator.V_INFO,
+            AdvantageEstimator.V_INFO.value,
+        )
+        use_step_split = getattr(self, "use_step_split", self.use_step_value or use_v_info)
+        if not use_step_split:
+            return
+        if "response_mask" not in batch.batch:
+            batch.batch["response_mask"] = compute_response_mask(batch)
+
+        if "step_end_mask" in batch.batch:
+            return
+        lookahead_tokens, separate_preamble = self._step_split_options()
+        batch.batch["step_end_mask"] = build_step_end_mask(
+            tokenizer=self.tokenizer,
+            responses=batch.batch["responses"],
+            response_mask=batch.batch["response_mask"],
+            lookahead_tokens=lookahead_tokens,
+            separate_preamble=separate_preamble,
+        )
+
+    def _prepare_step_value_inputs(self, batch: DataProto) -> None:
+        """Prepare the selected provider's value-space context."""
+
+        if not self.use_step_value:
+            return
+        # Preserve direct-call compatibility while keeping boundary creation in
+        # the provider-independent method above.
+        self._prepare_step_inputs(batch)
+
+        step_config = self.config.algorithm.get("step_value", {})
+        provider = getattr(self, "step_value_provider", str(step_config.get("provider", "probe")))
+
+        if provider == "similarity":
+            reward_tensor_key = "token_level_rewards" if "token_level_rewards" in batch.batch else "token_level_scores"
+            if reward_tensor_key not in batch.batch:
+                raise ValueError("similarity step values require token_level_rewards or token_level_scores")
+            target = batch.batch[reward_tensor_key].detach().float().sum(dim=-1)
+            if target.numel() != len(batch.batch) or not torch.isfinite(target).all():
+                raise ValueError("similarity final rewards must contain one finite value per response")
+            task_rewards = target
+        else:
+
+            def get_reward_field(key: str, description: str) -> torch.Tensor:
+                if key in batch.batch:
+                    value = batch.batch[key].detach().float().reshape(-1)
+                elif key in batch.non_tensor_batch:
+                    raw_value = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                    value = torch.as_tensor(
+                        raw_value,
+                        dtype=torch.float32,
+                        device=batch.batch["responses"].device,
+                    ).reshape(-1)
+                else:
+                    raise ValueError(f"step_value {description} {key!r} was not produced by the reward function")
+                if value.numel() != len(batch.batch):
+                    raise ValueError(
+                        f"step_value {description} {key!r} has {value.numel()} entries "
+                        f"for batch size {len(batch.batch)}"
+                    )
+                if not torch.isfinite(value).all():
+                    raise ValueError(f"step_value {description} {key!r} must be finite")
+                return value
+
+            target_key = str(step_config.get("target_key", "acc"))
+            target = get_reward_field(target_key, "target")
+            if torch.any((target < 0.0) | (target > 1.0)):
+                raise ValueError(f"step_value target {target_key!r} must be binary or lie in [0, 1]")
+            if torch.any((target != 0.0) & (target != 1.0)):
+                raise ValueError(f"step_value target {target_key!r} must contain only binary values 0 or 1")
+
+            task_reward_key = str(step_config.get("task_reward_key", "score"))
+            task_rewards = get_reward_field(task_reward_key, "task reward")
+
+        batch.batch["step_value_targets"] = target
+        batch.batch["step_value_task_rewards"] = task_rewards
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("step_value requires batch.non_tensor_batch['uid'] to prepare V_0")
+        initial_values, scales, active = core_algos.prepare_step_value_context(
+            target,
+            batch.non_tensor_batch["uid"],
+            norm_by_group_std=bool(step_config.get("norm_by_group_std", True)),
+            zero_when_group_uniform=bool(step_config.get("zero_when_group_uniform", True)),
+        )
+        batch.batch["step_value_initial_values"] = initial_values
+        batch.batch["step_value_scales"] = scales
+        batch.batch["step_value_active"] = active
+        self._prepare_step_value_provider_inputs(batch)
+
+    def _prepare_step_value_provider_inputs(self, batch: DataProto) -> None:
+        """Request outputs from the configured step-value provider, if any."""
+
+        if getattr(self, "use_step_value_probe", False):
+            batch.meta_info["global_steps"] = int(self.global_steps)
+            batch.meta_info["compute_step_value_probe"] = True
+            return
+        provider = getattr(
+            self,
+            "step_value_provider",
+            str(self.config.algorithm.get("step_value", {}).get("provider", "probe")),
+        )
+        if provider == "similarity":
+            batch.batch["step_start_mask"] = build_step_start_mask(
+                batch.batch["step_end_mask"],
+                batch.batch["response_mask"],
+            )
+            batch.meta_info["similarity_max_steps"] = int(batch.batch["step_end_mask"].sum(dim=-1).max().item())
+            batch.meta_info["compute_similarity_step_embeddings"] = True
+
+    def _complete_step_value_estimation(
+        self,
+        batch: DataProto,
+        *,
+        prompt_center_parameters: tuple[float, float] | None = None,
+    ) -> None:
+        """Convert the selected provider's old-policy outputs into step values."""
+
+        if not self.use_step_value:
+            return
+        provider = getattr(self, "step_value_provider", "probe")
+        step_config = self.config.algorithm.get("step_value", {})
+        if provider == "probe":
+            audit_enabled = bool(step_config.get("prompt_center_audit_enabled", False))
+            calibration_enabled = bool(step_config.get("prompt_center_calibration_enabled", False)) or audit_enabled
+            if not calibration_enabled:
+                if prompt_center_parameters is not None:
+                    raise RuntimeError("Prompt-center parameters were supplied while calibration is disabled")
+                return
+            if audit_enabled:
+                state = getattr(self, "_prompt_center_audit_state", None)
+                if state is None:
+                    raise RuntimeError("Prompt-center audit calibration is enabled but its driver state is missing")
+                slope, intercept = (
+                    state.active_parameters if prompt_center_parameters is None else prompt_center_parameters
+                )
+            else:
+                if prompt_center_parameters is not None:
+                    raise RuntimeError("Frozen prompt-center calibration cannot accept online audit parameters")
+                slope = float(step_config.get("prompt_center_calibration_slope", 1.0))
+                intercept = float(step_config.get("prompt_center_calibration_intercept", 0.0))
+            required_keys = {
+                "step_values",
+                "step_end_mask",
+                "step_value_trajectory_logit_mean",
+                "step_value_targets",
+            }
+            missing_keys = sorted(required_keys - set(batch.batch.keys()))
+            if missing_keys:
+                raise RuntimeError(f"Prompt-center calibration requires actor batch keys {missing_keys}")
+            if "uid" not in batch.non_tensor_batch:
+                raise RuntimeError("Prompt-center calibration requires batch.non_tensor_batch['uid']")
+            calibrated, calibration_metrics = apply_rank_preserving_prompt_center_calibration(
+                step_values=batch.batch["step_values"],
+                step_end_mask=batch.batch["step_end_mask"],
+                trajectory_endpoint_logit_means=batch.batch["step_value_trajectory_logit_mean"],
+                prompt_ids=batch.non_tensor_batch["uid"],
+                terminal_targets=batch.batch["step_value_targets"],
+                enabled=True,
+                slope=float(slope),
+                intercept=float(intercept),
+            )
+            calibration_metrics["audit_active"] = float(audit_enabled)
+            calibration_metrics["active_slope"] = float(slope)
+            calibration_metrics["active_intercept"] = float(intercept)
+            batch.batch["step_values"] = calibrated
+            batch.meta_info["prompt_center_calibration_metrics"] = calibration_metrics
+            return
+        if provider != "similarity":
+            raise RuntimeError(f"Unsupported step-value provider {provider!r}")
+        if "similarity_step_embeddings" not in batch.batch:
+            raise RuntimeError("Actor worker did not return similarity_step_embeddings")
+        step_values, retrieval_metrics = compute_similarity_step_values(
+            packed_step_embeddings=batch.batch["similarity_step_embeddings"],
+            step_start_mask=batch.batch["step_start_mask"],
+            step_end_mask=batch.batch["step_end_mask"],
+            response_mask=batch.batch["response_mask"],
+            outcomes=batch.batch["step_value_task_rewards"],
+            prompt_ids=batch.non_tensor_batch["uid"],
+            top_k=int(step_config.get("similarity_top_k", 3)),
+            tau=float(step_config.get("similarity_tau", 0.002)),
+            position_window=float(step_config.get("similarity_position_window", 0.2)),
+            iterations=int(step_config.get("similarity_iterations", 1)),
+        )
+        batch.batch["step_values"] = step_values
+        batch.batch["step_value_ready"] = torch.ones(
+            len(batch.batch),
+            dtype=torch.bool,
+            device=step_values.device,
+        )
+        batch.pop(batch_keys=["similarity_step_embeddings"])
+        batch.meta_info["similarity_retrieval_metrics"] = retrieval_metrics
+        batch.meta_info.pop("compute_similarity_step_embeddings", None)
+
+    def _finalize_step_value_batch(self, batch: DataProto, metrics: dict[str, Any]) -> None:
+        """Log provider outputs and remove tensors no longer needed by actor PPO."""
+
+        if not self.use_step_value:
+            return
+        provider = getattr(self, "step_value_provider", "probe")
+        metrics.update(batch.meta_info.pop("similarity_retrieval_metrics", {}))
+        calibration_metrics = batch.meta_info.pop("prompt_center_calibration_metrics", {})
+        metrics.update(
+            {f"step_value/prompt_center_calibration_{key}": value for key, value in calibration_metrics.items()}
+        )
+        diagnostic_keys = {"step_values", "step_end_mask", "step_value_targets"}
+        if provider == "similarity" and diagnostic_keys.issubset(batch.batch.keys()):
+            metrics.update(
+                compute_similarity_step_value_diagnostics(
+                    step_values=batch.batch["step_values"],
+                    step_end_mask=batch.batch["step_end_mask"],
+                    final_rewards=batch.batch["step_value_targets"],
+                )
+            )
+        elif provider == "probe" and diagnostic_keys.issubset(batch.batch.keys()):
+            metrics.update(
+                _compute_step_value_diagnostics(
+                    step_values=batch.batch["step_values"],
+                    step_end_mask=batch.batch["step_end_mask"],
+                    targets=batch.batch["step_value_targets"],
+                )
+            )
+        if "step_value_probe_loss" in batch.batch:
+            metrics["step_value/probe_loss"] = batch.batch["step_value_probe_loss"].float().mean().item()
+        if "step_value_ready" in batch.batch:
+            metrics["step_value/ready"] = batch.batch["step_value_ready"].float().mean().item()
+        if "step_value_probe_grad_norm" in batch.batch:
+            metrics["step_value/probe_grad_norm"] = batch.batch["step_value_probe_grad_norm"].float().mean().item()
+        removable = [
+            key
+            for key in (
+                "step_values",
+                "step_end_mask",
+                "step_value_targets",
+                "step_value_task_rewards",
+                "step_value_initial_values",
+                "step_value_scales",
+                "step_value_active",
+                "step_value_ready",
+                "step_value_trajectory_logit_mean",
+                "step_value_probe_loss",
+                "step_value_probe_grad_norm",
+                "step_start_mask",
+                "similarity_step_embeddings",
+            )
+            if key in batch.batch
+        ]
+        if removable:
+            batch.pop(batch_keys=removable)
+        batch.meta_info.pop("compute_step_value_probe", None)
+        batch.meta_info.pop("global_steps", None)
+        batch.meta_info.pop("similarity_max_steps", None)
+        batch.meta_info.pop("compute_similarity_step_embeddings", None)
+        batch.meta_info.pop("prompt_center_calibration_metrics", None)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -631,14 +1245,16 @@ class RayPPOTrainer:
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
-                # for colocate reward models, we need to sleep rollout model
-                # to spare GPU memory for reward model
-                self.checkpoint_manager.sleep_replicas()
+                # A colocated model-based reward needs rollout GPUs to be
+                # released while it runs.
+                if self.use_rm:
+                    self.checkpoint_manager.sleep_replicas()
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
-                # wake up rollout model
-                # replace with wake_up method once supported
-                self.checkpoint_manager.update_weights(self.global_steps)
+                if self.use_rm:
+                    # wake up rollout model
+                    # replace with wake_up method once supported
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -936,6 +1552,12 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+    def _save_trainer_extra_state(self, local_global_step_folder: str) -> None:
+        """Hook for driver-owned state that must precede the latest-checkpoint marker."""
+
+    def _load_trainer_extra_state(self, global_step_folder: str) -> None:
+        """Hook for strict restoration of driver-owned trainer state."""
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -998,6 +1620,7 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        self._save_trainer_extra_state(local_global_step_folder)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1083,6 +1706,7 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        self._load_trainer_extra_state(global_step_folder)
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1273,16 +1897,23 @@ class RayPPOTrainer:
             raise NotImplementedError("compute_answer_log_prob is not implemented for the new worker API yet.")
         return self.actor_rollout_wg.compute_answer_log_prob(batch)
 
-    def _compute_medium_log_prob(self, batch: DataProto) -> DataProto:
-        if self.use_legacy_worker_impl == "disable":
-            raise NotImplementedError("EMA medium log-probability is not implemented for the new worker API yet.")
-        return self.actor_rollout_wg.compute_medium_log_prob(batch)
-
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        if self.use_dapo_reference_kl:
+            reference_kl_config = self.config.algorithm.dapo_reference_kl
+            batch.meta_info.update(
+                {
+                    "dapo_reference_kl": True,
+                    "dapo_reference_kl_coef": float(reference_kl_config.loss_coef),
+                    "dapo_reference_kl_temperature": float(reference_kl_config.temperature),
+                    "dapo_reference_kl_approximation": str(reference_kl_config.approximation),
+                    "dapo_reference_kl_top_k": int(reference_kl_config.top_k),
+                    "dapo_reference_kl_token_chunk_size": int(reference_kl_config.token_chunk_size),
+                }
+            )
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1579,6 +2210,17 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    # Materialize reusable step boundaries before the old-policy
+                    # forward. Probe-specific targets are attached separately
+                    # only when the step-value estimator is active.
+                    batch.batch["token_level_scores"] = reward_tensor
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update(
+                            {key: np.array(values) for key, values in reward_extra_infos_dict.items()}
+                        )
+                    self._prepare_step_inputs(batch)
+                    self._prepare_step_value_inputs(batch)
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1597,7 +2239,7 @@ class RayPPOTrainer:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
-                            batch.batch['entropys'] = entropys.detach()
+                            batch.batch["entropys"] = entropys.detach()
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
@@ -1621,6 +2263,7 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            self._complete_step_value_estimation(batch)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
@@ -1634,14 +2277,6 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
-                    if self.config.algorithm.adv_estimator in (
-                        AdvantageEstimator.MY,
-                        AdvantageEstimator.MY.value,
-                    ):
-                        with marked_timer("medium_log_prob", timing_raw, color="blue"):
-                            medium_log_prob = self._compute_medium_log_prob(batch)
-                            batch = batch.union(medium_log_prob)
 
                     if self.config.algorithm.adv_estimator in (
                         AdvantageEstimator.V_INFO,
@@ -1658,13 +2293,15 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
+                        if self.use_dapo_reference_kl:
+                            metrics.update(
+                                prepare_dapo_reference_kl_inputs(
+                                    batch,
+                                    tokenizer=self.tokenizer,
+                                    config=self.config.algorithm.dapo_reference_kl,
+                                    metric_key=self.config.algorithm.filter_groups.metric,
+                                )
+                            )
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1706,10 +2343,10 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        metrics.update(batch.meta_info.pop("my_advantage_metrics", {}))
-
                         if self.use_ratio_value_critic:
                             metrics.update(self._update_ratio_value_critic(batch))
+
+                        self._finalize_step_value_batch(batch, metrics)
 
                     # update critic
                     if self.use_critic:
