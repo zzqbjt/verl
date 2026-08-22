@@ -13,11 +13,25 @@
 # limitations under the License.
 
 import inspect
+import itertools
+
+import ray
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
+
+
+@ray.remote(num_cpus=1)
+class RewardComputeWorker:
+    """Run synchronous reward functions in a Ray process main thread."""
+
+    def __init__(self, compute_score_fn):
+        self.compute_score_fn = compute_score_fn
+
+    def compute_score(self, **kwargs) -> dict:
+        return self.compute_score_fn(**kwargs)
 
 
 @register("dapo")
@@ -49,6 +63,22 @@ class DAPORewardManager(RewardManagerBase):
                 "To disable the overlong penalty, set overlong_buffer.enable = False"
             )
 
+        if not self.is_async_reward_score:
+            num_reward_workers = config.reward.num_workers
+            self.reward_worker = [
+                RewardComputeWorker.options(
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=ray.get_runtime_context().get_node_id(),
+                        soft=True,
+                    ),
+                ).remote(self.compute_score)
+                for _ in range(num_reward_workers)
+            ]
+            self.reward_worker_pool = itertools.cycle(self.reward_worker)
+
+    def choose_reward_worker(self):
+        return next(self.reward_worker_pool)
+
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
@@ -59,7 +89,13 @@ class DAPORewardManager(RewardManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        extra_info = dict(data_item.non_tensor_batch.get("extra_info", {}))
+        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
+        if tool_extra_fields is not None:
+            extra_info.update(tool_extra_fields.items())
+
+        extra_info["num_turns"] = data_item.non_tensor_batch.get("__num_turns__", None)
+        extra_info["rollout_reward_scores"] = data_item.non_tensor_batch.get("reward_scores", {})
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
@@ -72,25 +108,13 @@ class DAPORewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
-        if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
-                None,
-                lambda: self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                    **extra_reward_kwargs,
-                ),
-            )
+        result = await self._compute_score(
+            data_source=data_source,
+            solution_str=response_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            **extra_reward_kwargs,
+        )
 
         reward_extra_info = {}
 
@@ -117,3 +141,10 @@ class DAPORewardManager(RewardManagerBase):
                 reward_extra_info["overlong"] = overlong_reward < 0
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
+
+    async def _compute_score(self, **kwargs):
+        """Run sync scoring in Ray; retain direct support for async scorers."""
+        if self.is_async_reward_score:
+            return await self.compute_score(**kwargs)
+        reward_worker = self.choose_reward_worker()
+        return await reward_worker.compute_score.remote(**kwargs)

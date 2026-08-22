@@ -12,81 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""math_verify-based reward for the unified ``rlvr`` math data source."""
+"""math_verify reward for the unified ``rlvr`` data source.
+
+With the DAPO reward manager, each synchronous call runs in the main thread of
+a Ray actor process, where math_verify's native POSIX timeouts work without an
+additional process pool.
+"""
 
 from __future__ import annotations
 
-import multiprocessing
 import re
-import threading
-from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from typing import Any
 
-from math_verify import parse, verify
+from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 
-ANSWER_LINE_PATTERN = re.compile(
+_GOLD_EXTRACTION_CONFIG = (LatexExtractionConfig(),)
+_PRED_EXTRACTION_CONFIG = (ExprExtractionConfig(), LatexExtractionConfig())
+_ANSWER_LINE_PATTERN = re.compile(
     r"(?im)^\s*(?:\*\*)?(?:Final\s+)?Answer(?:\*\*)?\s*:\s*(.*?)\s*$"
 )
-BOX_COMMANDS = ("\\boxed{", "\\fbox{")
-
-_PROCESS_POOL_WORKERS = 4
-_PROCESS_POOL: ProcessPoolExecutor | None = None
-_PROCESS_POOL_LOCK = threading.Lock()
-
-
-def _parse_math(text: str) -> list[Any]:
-    """Parse math with math_verify's bounded, process-safe timeout."""
-    return parse(text, parsing_timeout=5)
-
-
-def extract_answer_candidate(solution_str: str) -> str | None:
-    """Extract the last non-empty explicit Answer line, if one exists."""
-    matches = ANSWER_LINE_PATTERN.findall(solution_str)
-    for match in reversed(matches):
-        candidate = match.strip()
-        if candidate:
-            return _strip_outer_formatting(candidate)
-    return None
-
-
-def extract_last_boxed(solution_str: str) -> str | None:
-    """Extract the last balanced ``\boxed{...}`` or ``\fbox{...}``."""
-    starts = [solution_str.rfind(command) for command in BOX_COMMANDS]
-    start = max(starts)
-    if start < 0:
-        return None
-
-    opening_brace = solution_str.find("{", start)
-    depth = 0
-    for index in range(opening_brace, len(solution_str)):
-        character = solution_str[index]
-        if character == "{" and (index == 0 or solution_str[index - 1] != "\\"):
-            depth += 1
-        elif character == "}" and (index == 0 or solution_str[index - 1] != "\\"):
-            depth -= 1
-            if depth == 0:
-                return solution_str[start : index + 1]
-    return None
-
-
-def _strip_outer_formatting(candidate: str) -> str:
-    candidate = candidate.strip()
-    if candidate.startswith("**") and candidate.endswith("**") and len(candidate) > 4:
-        candidate = candidate[2:-2].strip()
-
-    delimiter_pairs = (("$$", "$$"), ("$", "$"), ("\\(", "\\)"), ("\\[", "\\]"))
-    for left, right in delimiter_pairs:
-        if candidate.startswith(left) and candidate.endswith(right) and len(candidate) > len(left) + len(right):
-            candidate = candidate[len(left) : -len(right)].strip()
-            break
-
-    # DAPO-style generations often contain an unmatched opening dollar sign.
-    if candidate.startswith("$"):
-        candidate = candidate[1:].strip()
-    if candidate.endswith("."):
-        candidate = candidate[:-1].rstrip()
-    return candidate
+_MAX_SOLUTION_CHARS = 4096
 
 
 @lru_cache(maxsize=4096)
@@ -96,70 +42,66 @@ def _parse_ground_truth(ground_truth: str) -> list[Any]:
         gold_text = ground_truth
     else:
         gold_text = "\\boxed{" + ground_truth + "}"
-    return _parse_math(gold_text)
+    return parse(
+        gold_text,
+        extraction_config=_GOLD_EXTRACTION_CONFIG,
+        parsing_timeout=5,
+    )
 
 
-def _parse_prediction(solution_str: str) -> tuple[list[Any], str | None]:
-    candidate = extract_answer_candidate(solution_str)
+def _extract_answer_candidate(solution_str: str) -> str | None:
+    """Return everything after the last explicit answer label.
+
+    Keeping the suffix rather than only one line supports multiline LaTeX such
+    as matrices and ``\\text{...}`` answers containing an embedded newline.
+    """
+    for match in reversed(list(_ANSWER_LINE_PATTERN.finditer(solution_str))):
+        candidate = solution_str[match.start(1) :].strip()
+        if not candidate:
+            continue
+        if candidate.startswith("**") and candidate.endswith("**") and len(candidate) > 4:
+            candidate = candidate[2:-2].strip()
+        if candidate.startswith("$") and not candidate.endswith("$"):
+            candidate = candidate[1:].strip()
+        if candidate.endswith("."):
+            candidate = candidate[:-1].rstrip()
+        return candidate or None
+    return None
+
+
+def _parse_prediction(solution_str: str) -> list[Any]:
+    solution_tail = solution_str[-_MAX_SOLUTION_CHARS:]
+    candidate = _extract_answer_candidate(solution_tail)
     if candidate:
-        if candidate.startswith("\\boxed{"):
-            prediction = _parse_math(candidate)
+        if candidate.startswith(("$", "\\(", "\\[", "\\boxed{", "\\fbox{")):
+            candidate_text = candidate
         else:
-            # Boxing makes bare LaTeX intervals, matrices, text, and symbolic
-            # expressions parseable while retaining math_verify semantics.
-            prediction = _parse_math("\\boxed{" + candidate + "}")
+            candidate_text = "\\boxed{" + candidate + "}"
+        prediction = parse(
+            candidate_text,
+            extraction_config=_PRED_EXTRACTION_CONFIG,
+            parsing_timeout=5,
+        )
         if prediction:
-            return prediction, candidate
+            return prediction
 
-    boxed = extract_last_boxed(solution_str)
-    if boxed:
-        prediction = _parse_math(boxed)
-        if prediction:
-            return prediction, boxed
-
-    prediction = _parse_math(solution_str)
-    prediction_text = str(prediction[0]) if prediction else candidate
-    return prediction, prediction_text
+    return parse(
+        solution_tail,
+        extraction_config=_PRED_EXTRACTION_CONFIG,
+        parsing_timeout=5,
+    )
 
 
-def _verify_solution_local(solution_str: str, ground_truth: str) -> tuple[bool, str | None]:
+def verify_solution(solution_str: str, ground_truth: str) -> bool:
+    """Return whether the generated final answer matches the ground truth."""
     try:
         gold = _parse_ground_truth(ground_truth)
-        prediction, prediction_text = _parse_prediction(solution_str)
+        prediction = _parse_prediction(solution_str)
         if not gold or not prediction:
-            return False, prediction_text
-        return bool(verify(gold, prediction, timeout_seconds=5)), prediction_text
+            return False
+        return bool(verify(gold, prediction, timeout_seconds=5))
     except Exception:
-        return False, None
-
-
-def _get_process_pool() -> ProcessPoolExecutor:
-    """Return a per-reward-worker pool whose workers can use signal timeouts."""
-    global _PROCESS_POOL
-    if _PROCESS_POOL is None:
-        with _PROCESS_POOL_LOCK:
-            if _PROCESS_POOL is None:
-                _PROCESS_POOL = ProcessPoolExecutor(
-                    max_workers=_PROCESS_POOL_WORKERS,
-                    mp_context=multiprocessing.get_context("spawn"),
-                    max_tasks_per_child=1000,
-                )
-    return _PROCESS_POOL
-
-
-def verify_solution(solution_str: str, ground_truth: str) -> tuple[bool, str | None]:
-    """Return equivalence without running signal-based timeouts in a thread."""
-    if threading.current_thread() is threading.main_thread():
-        return _verify_solution_local(solution_str, ground_truth)
-
-    try:
-        return _get_process_pool().submit(
-            _verify_solution_local,
-            solution_str,
-            ground_truth,
-        ).result()
-    except Exception:
-        return False, None
+        return False
 
 
 def compute_score(solution_str: str, ground_truth: str) -> dict[str, Any]:
@@ -167,9 +109,8 @@ def compute_score(solution_str: str, ground_truth: str) -> dict[str, Any]:
 
     The return shape intentionally matches ``math_dapo.compute_score``.
     """
-    correct, prediction = verify_solution(solution_str, ground_truth)
+    correct = verify_solution(solution_str, ground_truth)
     return {
         "score": 1.0 if correct else -1.0,
         "acc": correct,
-        "pred": prediction,
     }
