@@ -69,56 +69,10 @@ algorithm:
   # Trade-off between bias and variance in the GAE estimator
   lam: 1.0
 
-  # Alpha for length-adaptive GAE: lambda_i = 1 - 1 / max(alpha * response_length_i, 1)
-  length_adaptive_gae_alpha: 1.0
 
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
-  # Add a privileged-context forward KL on incorrect rollouts while retaining the normal DAPO loss
-  dapo_reference_kl:
-
-    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-    _target_: verl.trainer.config.DapoReferenceKLConfig
-
-    # Whether to enable the auxiliary KL term
-    enabled: false
-
-    # Convex-mixture weight: total loss = (1 - loss_coef) * DAPO loss + loss_coef * reference KL loss
-    loss_coef: 0.0
-
-    # Privileged prompt; the reference solution is another verified-correct rollout from the same uid group
-    teacher_prompt_template: "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n{question}\n\nRemember to put your answer on its own line after \"Answer:\".\n\nHere is a reference solution: {reference_solution}"
-
-    # Preferred key in extra_info; raw_prompt's last user message is used as fallback
-    question_key: question
-
-    # Exact prefix stripped from DAPO-style student prompts before filling {question}
-    student_prompt_prefix: "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
-
-    # Exact suffix stripped from DAPO-style student prompts before filling {question}
-    student_prompt_suffix: "\n\nRemember to put your answer on its own line after \"Answer:\"."
-
-    # Maximum teacher prompt tokens before appending the student response
-    max_teacher_prompt_length: 2048
-
-    # Behavior for an overlong teacher prompt: error, left, or right
-    truncation: error
-
-    # Softmax temperature used by both teacher and student KL distributions
-    temperature: 1.0
-
-    # Old-policy teacher cache approximation; retains top-k entries and one tail bucket
-    approximation: topk
-
-    # Number of teacher vocabulary entries retained by the topk approximation
-    top_k: 100
-
-    # Number of student response tokens per activation-checkpointed KL chunk
-    token_chunk_size: 512
-
-    # Extra keyword arguments passed to tokenizer.apply_chat_template for the teacher
-    teacher_chat_template_kwargs: {}
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
@@ -129,7 +83,7 @@ algorithm:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.trainer.config.StepSplitConfig
 
-    # Whether to attach step_end_mask for methods that do not require it; V-Info and step-value enable it automatically
+    # Whether to attach step_end_mask to rollout batches
     enabled: false
 
     # Tokens inspected after a delimiter for an explicit numeric step marker
@@ -138,86 +92,74 @@ algorithm:
     # Whether text before an explicit Step 1 marker is a separate step
     separate_preamble: false
 
-  # Provider-supplied step values consumed by the shared advantage estimator
-  step_value:
+  # Entropy-sampled Monte-Carlo step credit with a detached actor-side regression head
+  sparse_counterfactual_credit:
 
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-    _target_: verl.trainer.config.StepValueAdvantageConfig
+    _target_: verl.trainer.config.SparseCounterfactualCreditConfig
 
-    # Step-value estimator: probe or similarity
-    provider: probe
+    # Whether to add sparse counterfactual step credit to the base GRPO advantage
+    enabled: false
 
-    # Decay applied to future step-value differences
-    lam: 0.9
+    # Fraction of the highest-entropy tokens averaged within each semantic step
+    entropy_top_ratio: 0.2
 
-    # Whether to normalize by the provider target's prompt-group standard deviation
-    norm_by_group_std: true
+    # Number of step anchors sampled without replacement per uid group
+    anchors_per_group: 2
 
-    # Whether groups uniform in the provider's target space receive zero advantage
-    zero_when_group_uniform: true
+    # Temperature of the step-entropy sampling softmax
+    sampling_temperature: 1.0
 
-    # Reward-manager output key used as the probe target
-    target_key: acc
+    # Mixture weight assigned to the uniform step distribution
+    uniform_mix: 0.1
 
-    # Reward-manager output key for the verifier's raw task reward
-    task_reward_key: score
+    # Fresh retained-step continuations per anchor; the original suffix is one additional free Q sample
+    num_q_samples: 1
 
-    # Frozen rank-preserving calibration of the Probe's prompt-wide logit center
-    prompt_center_calibration_enabled: false
+    # Fresh prefix-before-step continuations per anchor
+    num_v_samples: 2
 
-    # Positive slope used by the frozen prompt-center calibration map
-    prompt_center_calibration_slope: 1.0
+    # Raw verifier output used for Q and V targets
+    correctness_key: acc
 
-    # Intercept used by the frozen prompt-center calibration map
-    prompt_center_calibration_intercept: 0.0
+    # Delta of the credit head's Huber regression loss
+    huber_delta: 1.0
 
-    # Whether to learn a causally lagged map from complete, uncensored first-generation DAPO groups
-    prompt_center_audit_enabled: false
+    # Whether to weight anchor losses by the inverse entropy-mixture probability
+    use_inverse_propensity: true
 
-    # Number of complete first-generation prompt groups audited per update
-    prompt_center_audit_groups: 16
+    # Maximum inverse-propensity weight
+    inverse_propensity_clip: 5.0
 
-    # Number of completed audit updates retained by the online fit
-    prompt_center_audit_window: 2
+    # Maximum coefficient of the centered credit residual
+    advantage_coef: 0.3
 
-    # Seed for the outcome-independent first-generation group selection
-    prompt_center_audit_seed: 0
+    # Fraction of total actor updates used to linearly warm up the residual coefficient
+    warmup_ratio: 0.1
 
-    # Same-prompt semantic-retrieval settings (used only by provider=similarity)
-    similarity_top_k: 3
+    # Whether to divide centered residuals by their token-weighted population standard deviation
+    normalize_batch_std: true
 
-    # Softmax temperature applied to retrieved step similarities
-    similarity_tau: 0.002
+    # Numerical epsilon for batch residual normalization
+    epsilon: 1.0e-6
 
-    # Maximum normalized response-position distance for candidate neighbors
-    similarity_position_window: 0.2
+    # Deterministic anchor-sampling seed, offset by the trainer global step
+    selection_seed: 42
 
-    # Number of synchronous semantic value-propagation rounds
-    similarity_iterations: 1
+    # Sampling temperature for fresh Q and V suffixes
+    temperature: 1.0
 
-    # Deprecated compatibility alias for algorithm.step_split.lookahead_tokens
-    lookahead_tokens: null
+    # Nucleus sampling threshold for fresh Q and V suffixes
+    top_p: 1.0
 
-    # Deprecated compatibility alias for algorithm.step_split.separate_preamble
-    separate_preamble: null
+    # Top-k sampling cutoff; -1 disables it
+    top_k: -1
 
-  # Lightweight shifted-prefix-ratio value critic used by critic-free GAE variants
-  ratio_value_critic:
+    # Repetition penalty for fresh Q and V suffixes
+    repetition_penalty: 1.0
 
-    # Initial slope in tanh(a * prefix_ratio + b)
-    a_init: 1.0
-
-    # Initial bias in tanh(a * prefix_ratio + b)
-    b_init: 0.0
-
-    # AdamW learning rate
-    lr: 1e-2
-
-    # AdamW decoupled weight decay
-    weight_decay: 1e-2
-
-    # Number of optimizer steps per rollout batch
-    update_steps: 1
+    # Optional hard cap for fresh suffixes; null uses data.max_response_length minus response-prefix tokens
+    max_new_tokens: null
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False

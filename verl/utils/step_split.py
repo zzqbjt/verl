@@ -25,6 +25,7 @@ import torch
 # explicit step markers.
 STEP_MARKER_RE = re.compile(
     r"""
+    \A[ \t\r\n]*                # marker must begin the next visible block
     (?:\#{1,6}\s*)?             # optional Markdown heading
     (?:\*{1,2}\s*)?             # optional opening emphasis
     (?:step|步骤)
@@ -37,7 +38,10 @@ STEP_MARKER_RE = re.compile(
 
 ORDINARY_NUMBER_MARKER_RE = re.compile(
     r"""
-    (?<![\w.])
+    \A[ \t\r\n]*                # marker must begin the next visible block
+    (?:\#{1,6}[ \t]*)?          # optional Markdown heading
+    (?:\*{1,2}[ \t]*)?          # optional opening emphasis
+    (?:[(（][ \t]*)?             # optional opening parenthesis
     (?:
         (?P<arabic>[1-9]\d*)[ \t]*(?:[)）]|[.．](?!\d)|、)
         |
@@ -121,8 +125,8 @@ def _step_end_indices(
             input_ids[token_index + 1 : lookahead_end],
             response_index=response_index,
         )
-        explicit_match = STEP_MARKER_RE.search(following_text)
-        ordinary_match = ORDINARY_NUMBER_MARKER_RE.search(following_text)
+        explicit_match = STEP_MARKER_RE.match(following_text)
+        ordinary_match = ORDINARY_NUMBER_MARKER_RE.match(following_text)
         marker_candidates = []
         if explicit_match is not None:
             marker_candidates.append((explicit_match.start(), int(explicit_match.group("number"))))
@@ -213,11 +217,16 @@ def build_step_end_mask(
     the canonical tokenization produced by encoding their decoded text.
 
     A delimiter is accepted only when one original token's decoded text
-    contains a literal double newline and the following ``lookahead_tokens``
-    tokens contain either a numeric ``Step``/``步骤`` marker or an ordinary
-    numbered marker. The delimiter belongs to the preceding step. The last
-    non-EOS response token always ends the final step. If a valid completion
-    immediately emits EOS, that EOS action is its sole step endpoint.
+    contains a literal double newline and the following block begins with
+    either a numeric ``Step``/``步骤`` marker or an ordinary numbered marker.
+    Leading whitespace and Markdown heading/emphasis syntax are allowed, but
+    non-whitespace blocks such as a Markdown horizontal rule are not skipped.
+    Thus, when ``---`` separates two steps, only the delimiter after that rule
+    and immediately before the next marker can become a boundary. The marker
+    must be fully recognizable within ``lookahead_tokens``; markers appearing
+    later in prose are not searched for. The delimiter belongs to the preceding
+    step. The last non-EOS response token always ends the final step. If a valid
+    completion immediately emits EOS, that EOS action is its sole step endpoint.
     """
 
     if not isinstance(responses, torch.Tensor) or not isinstance(response_mask, torch.Tensor):

@@ -23,6 +23,9 @@ ppo_micro_batch_size: null
 # Local per-GPU micro batch size
 ppo_micro_batch_size_per_gpu: null
 
+# Local per-GPU micro batch size for actor inference-only auxiliary passes
+ppo_infer_micro_batch_size_per_gpu: null
+
 # Whether to automatically adjust batch size at runtime
 # oc.select: the default val for ref.log_prob_use_dynamic_bsz
 use_dynamic_bsz: false
@@ -31,6 +34,9 @@ use_dynamic_bsz: false
 # Typically it should be: n * ${data.max_prompt_length} + ${data.max_response_length}
 # oc.select: the default val for ref.log_prob_max_token_len_per_gpu
 ppo_max_token_len_per_gpu: 16384
+
+# Max tokens per GPU for actor inference-only auxiliary passes
+ppo_infer_max_token_len_per_gpu: 16384
 
 # PPO clip ratio
 clip_ratio: 0.2
@@ -78,52 +84,33 @@ policy_loss:
   # Temperature divisor for token weights in the "my" loss
   tau: 0.5
 
-# Lightweight step-end value probe configuration
-step_value_probe:
+# Detached sparse-counterfactual step-credit head configuration
+counterfactual_credit_head:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.workers.config.StepValueProbeConfig
+  _target_: verl.workers.config.CounterfactualCreditHeadConfig
 
-  # Whether to compute and train step-end value predictions
+  # Whether to build and train the sparse-credit head
   enabled: false
 
-  # Hidden width of the two-layer probe MLP
-  hidden_dim: 256
+  # Hidden width of the 2H -> hidden_dim -> 1 MLP
+  hidden_dim: 512
 
-  # AdamW learning rate for the probe
+  # AdamW learning rate, independent of the policy optimizer
   lr: 1e-3
 
-  # AdamW decoupled weight decay for the probe
+  # AdamW decoupled weight decay
   weight_decay: 0.0
 
-  # Probe optimization epochs during each warmup update
-  warmup_epochs: 10
-
-  # Probe optimization epochs after warmup
-  update_epochs: 1
-
-  # Number of policy updates that only train the probe before step values are enabled
-  warmup_updates: 1
-
-  # Whether to save the probe and its optimizer state in actor checkpoints
+  # Whether to save head and optimizer state in actor checkpoints
   save_checkpoint: true
 
-# Prefix prepended to the ground-truth answer string
-answer_prefix: "Answer: "
-
-# Local per-GPU micro batch size for answer log probability inference
-answer_log_prob_batch_size: 16
-
-# Whether to use dynamic batching for answer log probability inference; null follows actor.use_dynamic_bsz
-answer_log_prob_use_dynamic_bsz: null
-
-# Max tokens per GPU for answer log probability inference; null follows actor.ppo_max_token_len_per_gpu
-answer_log_prob_max_token_len_per_gpu: null
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
-# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", or "seq-mean-token-sum-norm"
+# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean",
+# or "seq-mean-token-sum-norm".
 loss_agg_mode: token-mean
 
 # Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.

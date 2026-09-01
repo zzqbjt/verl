@@ -119,8 +119,6 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
   lam: 1.0
-  # Alpha for length-adaptive GAE: lambda_i = 1 - 1 / max(alpha * response_length_i, 1)
-  length_adaptive_gae_alpha: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: True
   # Reusable reasoning-step boundary detection, independent of value probes
@@ -129,7 +127,7 @@ algorithm:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.trainer.config.StepSplitConfig
 
-    # Whether to attach step_end_mask for methods that do not require it; V-Info and step-value enable it automatically
+    # Whether to attach step_end_mask to rollout batches
     enabled: false
 
     # Tokens inspected after a delimiter for an explicit numeric step marker
@@ -138,71 +136,6 @@ algorithm:
     # Whether text before an explicit Step 1 marker is a separate step
     separate_preamble: false
 
-  # Provider-supplied step values consumed by the shared advantage estimator
-  step_value:
-
-    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-    _target_: verl.trainer.config.StepValueAdvantageConfig
-
-    # Step-value estimator: probe or similarity
-    provider: probe
-
-    # Decay applied to future step-value differences
-    lam: 0.9
-
-    # Whether to normalize by the provider target's prompt-group standard deviation
-    norm_by_group_std: true
-
-    # Whether groups uniform in the provider's target space receive zero advantage
-    zero_when_group_uniform: true
-
-    # Reward-manager output key used as the probe target
-    target_key: acc
-
-    # Reward-manager output key for the verifier's raw task reward
-    task_reward_key: score
-
-    # Frozen rank-preserving calibration of the Probe's prompt-wide logit center
-    prompt_center_calibration_enabled: false
-    prompt_center_calibration_slope: 1.0
-    prompt_center_calibration_intercept: 0.0
-
-    # Causally lagged calibration from complete, uncensored first-generation DAPO groups
-    prompt_center_audit_enabled: false
-    prompt_center_audit_groups: 16
-    prompt_center_audit_window: 2
-    prompt_center_audit_seed: 0
-    # One-time opt-in when resuming a legacy checkpoint that has no audit state sidecar
-
-    # Same-prompt semantic-retrieval settings (used only by provider=similarity)
-    similarity_top_k: 3
-    similarity_tau: 0.002
-    similarity_position_window: 0.2
-    similarity_iterations: 1
-
-    # Deprecated compatibility alias for algorithm.step_split.lookahead_tokens
-    lookahead_tokens: null
-
-    # Deprecated compatibility alias for algorithm.step_split.separate_preamble
-    separate_preamble: null
-
-  # Lightweight shifted-prefix-ratio value critic used by critic-free GAE variants
-  ratio_value_critic:
-
-    # Initial slope in tanh(a * prefix_ratio + b)
-    a_init: 1.0
-
-    # Initial bias in tanh(a * prefix_ratio + b)
-    b_init: 0.0
-
-    # AdamW learning rate
-    lr: 1e-2
-
-    # AdamW decoupled weight decay
-    weight_decay: 1e-2
-
-    # Number of optimizer steps per rollout batch
-    update_steps: 1
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence
   kl_ctrl:

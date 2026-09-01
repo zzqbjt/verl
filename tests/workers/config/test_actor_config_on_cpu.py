@@ -21,7 +21,6 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
-    StepValueProbeConfig,
 )
 
 
@@ -75,10 +74,6 @@ class TestActorConfig(unittest.TestCase):
 
         self.assertIsInstance(config, ActorConfig)
         self.assertEqual(config.strategy, "fsdp")
-        self.assertIsInstance(config.step_value_probe, StepValueProbeConfig)
-        self.assertFalse(config.step_value_probe.enabled)
-        self.assertEqual(config.step_value_probe.lr, 1e-3)
-        self.assertEqual(config.step_value_probe.warmup_updates, 1)
 
     def test_fsdp_actor_config_from_yaml(self):
         """Test creating FSDPActorConfig from YAML file."""
@@ -218,35 +213,6 @@ class TestActorConfig(unittest.TestCase):
             rollout_n=1,
         )
         self.assertIsNotNone(config)  # Should not raise an exception
-
-    def test_step_value_probe_config_defaults_and_validation(self):
-        """Test defaults and reject invalid step-value probe hyperparameters."""
-        config = StepValueProbeConfig()
-
-        self.assertFalse(config.enabled)
-        self.assertEqual(config.hidden_dim, 256)
-        self.assertEqual(config.lr, 1e-3)
-        self.assertEqual(config.weight_decay, 0.0)
-        self.assertEqual(config.warmup_epochs, 10)
-        self.assertEqual(config.update_epochs, 1)
-        self.assertEqual(config.warmup_updates, 1)
-        self.assertTrue(config.save_checkpoint)
-
-        invalid_cases = [
-            ({"hidden_dim": 0}, "step_value_probe.hidden_dim"),
-            ({"hidden_dim": 256.0}, "step_value_probe.hidden_dim"),
-            ({"hidden_dim": True}, "step_value_probe.hidden_dim"),
-            ({"lr": 0.0}, "step_value_probe.lr"),
-            ({"weight_decay": -0.1}, "step_value_probe.weight_decay"),
-            ({"warmup_epochs": 0}, "step_value_probe.warmup_epochs"),
-            ({"update_epochs": 0}, "step_value_probe.update_epochs"),
-            ({"warmup_updates": 0}, "step_value_probe.warmup_updates"),
-            ({"enabled": 1}, "step_value_probe.enabled"),
-            ({"save_checkpoint": 1}, "step_value_probe.save_checkpoint"),
-        ]
-        for kwargs, expected_message in invalid_cases:
-            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_message):
-                StepValueProbeConfig(**kwargs)
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""

@@ -74,23 +74,12 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy."""
     policy_loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-    policy_loss_needs_ref = policy_loss_mode in {"dgpo", "ours", "my_future"}
-    critic_config = config.get("critic", {})
-    critic_free_gae_needs_ref = (
-        config.algorithm.get("adv_estimator", None)
-        in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE)
-        and critic_config.get("enable", None) is False
-    )
+    policy_loss_needs_ref = policy_loss_mode == "dgpo"
     kl_loss_needs_ref = (
         config.actor_rollout_ref.actor.use_kl_loss
         and float(config.actor_rollout_ref.actor.get("kl_loss_coef", 0.0)) != 0.0
     )
-    return (
-        config.algorithm.use_kl_in_reward
-        or kl_loss_needs_ref
-        or policy_loss_needs_ref
-        or critic_free_gae_needs_ref
-    )
+    return config.algorithm.use_kl_in_reward or kl_loss_needs_ref or policy_loss_needs_ref
 
 
 def need_reward_model(
@@ -104,7 +93,7 @@ def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
     if config.critic.enable is not None:
         return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator in (AdvantageEstimator.GAE, AdvantageEstimator.LENGTH_ADAPTIVE_GAE):
+    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
         return True
     else:
         warnings.warn(

@@ -138,7 +138,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         if entropy is None:
             raise ValueError("policy_loss='my' requires entropy in the model output.")
         policy_loss_kwargs["entropy"] = entropy
-        policy_loss_kwargs["vinfo_weights"] = data.get("vinfo_weights", None)
     policy_loss_output = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,

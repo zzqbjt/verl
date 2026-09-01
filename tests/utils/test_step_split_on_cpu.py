@@ -194,24 +194,55 @@ def test_any_token_containing_double_newline_can_be_a_delimiter(delimiter_piece)
     [
         "**Step 3**: body",
         "### **Step 3**: body",
-        "prefix before **Step 3**: body",
         "3. ordinary step",
         "3) ordinary step",
         "(3) ordinary step",
         "3、普通步骤",
         "### **3. ordinary step**",
-        "prefix before **3. ordinary step**",
         "B. alphabetic step",
         "二、中文步骤",
     ],
 )
-def test_supported_step_marker_forms_are_found_inside_lookahead(marker_piece):
+def test_supported_step_marker_forms_are_found_at_block_start(marker_piece):
     tokenizer = PieceTokenizer({0: "First.\n\n", 1: marker_piece})
     responses = torch.tensor([[0, 1]])
 
     step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
 
     assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 1]]
+
+
+@pytest.mark.parametrize(
+    "later_marker",
+    [
+        "prefix before **Step 3**: body",
+        "prefix before **3. ordinary step**",
+    ],
+)
+def test_marker_later_in_prose_is_not_an_explicit_step_boundary(later_marker):
+    tokenizer = PieceTokenizer({0: "First.\n\n", 1: later_marker})
+    responses = torch.tensor([[0, 1]])
+
+    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
+
+    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1]]
+
+
+@pytest.mark.parametrize("marker", ["### **Step 2: next**", "### **2. next**"])
+def test_only_delimiter_after_markdown_horizontal_rule_precedes_marker(marker):
+    tokenizer = PieceTokenizer(
+        {
+            0: "First.\n\n",
+            1: "---",
+            2: "\n\n",
+            3: marker,
+        }
+    )
+    responses = torch.tensor([[0, 1, 2, 3]])
+
+    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
+
+    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 2], [0, 3]]
 
 
 @pytest.mark.parametrize(
@@ -283,25 +314,24 @@ def test_non_eos_whitespace_only_response_is_one_step():
     assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1]]
 
 
-def test_marker_must_fall_inside_token_lookahead():
+def test_explicit_marker_must_be_fully_recognizable_inside_token_lookahead():
     tokenizer = PieceTokenizer(
         {
             0: "First.\n\n",
-            1: "filler-a ",
-            2: "filler-b ",
-            3: "Step ",
-            4: "2",
-            5: " body",
+            1: "### ",
+            2: "Step ",
+            3: "2",
+            4: " body",
         }
     )
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5]])
+    responses = torch.tensor([[0, 1, 2, 3, 4]])
     response_mask = torch.ones_like(responses)
 
     short_mask = build_step_end_mask(tokenizer, responses, response_mask, lookahead_tokens=2)
-    long_mask = build_step_end_mask(tokenizer, responses, response_mask, lookahead_tokens=4)
+    long_mask = build_step_end_mask(tokenizer, responses, response_mask, lookahead_tokens=3)
 
-    assert short_mask.nonzero(as_tuple=False).tolist() == [[0, 5]]
-    assert long_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 5]]
+    assert short_mask.nonzero(as_tuple=False).tolist() == [[0, 4]]
+    assert long_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 4]]
 
 
 def test_maps_steps_back_to_original_masked_positions_and_removes_all_trailing_eos():

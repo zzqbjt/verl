@@ -22,16 +22,11 @@ from omegaconf import OmegaConf
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
-    RatioValueCritic,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
-    compute_length_adaptive_gae_advantage_return,
-    compute_log_prob_values,
-    compute_normalized_rloo_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
-    compute_vinfo_outcome_advantage,
     get_adv_estimator_fn,
     register_adv_est,
 )
@@ -203,221 +198,6 @@ def test_multi_turn_compute_gae_advantage_return():
     print(f" [CORRECT] \n\n{adv1=}, \n\n{ret1=}")
 
 
-def test_length_adaptive_gae_matches_per_response_lambda():
-    rewards = torch.tensor([[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
-    values = torch.tensor([[0.2, 0.4, 0.0, 0.0], [0.1, 0.2, 0.3, 0.4]])
-    response_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
-
-    actual_advantages, actual_returns = compute_length_adaptive_gae_advantage_return(
-        token_level_rewards=rewards,
-        values=values,
-        response_mask=response_mask,
-        gamma=0.9,
-        alpha=1.0,
-    )
-    expected_advantages, expected_returns = compute_gae_advantage_return(
-        token_level_rewards=rewards,
-        values=values,
-        response_mask=response_mask,
-        gamma=0.9,
-        lam=torch.tensor([0.5, 0.75]),
-    )
-
-    torch.testing.assert_close(actual_advantages, expected_advantages)
-    torch.testing.assert_close(actual_returns, expected_returns)
-
-
-@pytest.mark.parametrize("alpha", [0.0, -1.0])
-def test_length_adaptive_gae_rejects_nonpositive_alpha(alpha):
-    ones = torch.ones(1, 2)
-    with pytest.raises(ValueError, match="alpha > 0"):
-        compute_length_adaptive_gae_advantage_return(
-            token_level_rewards=ones,
-            values=ones,
-            response_mask=ones,
-            gamma=1.0,
-            alpha=alpha,
-        )
-
-
-def test_length_adaptive_gae_clamps_scaled_length_to_one():
-    ones = torch.ones(1, 2)
-    actual = compute_length_adaptive_gae_advantage_return(
-        token_level_rewards=ones,
-        values=ones,
-        response_mask=ones,
-        gamma=1.0,
-        alpha=0.4,
-    )
-    expected = compute_gae_advantage_return(
-        token_level_rewards=ones,
-        values=ones,
-        response_mask=ones,
-        gamma=1.0,
-        lam=0.0,
-    )
-
-    torch.testing.assert_close(actual[0], expected[0])
-    torch.testing.assert_close(actual[1], expected[1])
-
-
-def test_length_adaptive_gae_rejects_empty_response():
-    zeros = torch.zeros(1, 2)
-    with pytest.raises(ValueError, match="at least one valid token"):
-        compute_length_adaptive_gae_advantage_return(
-            token_level_rewards=zeros,
-            values=zeros,
-            response_mask=zeros,
-            gamma=1.0,
-            alpha=1.0,
-        )
-
-
-def test_compute_log_prob_values():
-    ratio = torch.tensor(
-        [
-            [0.2, 0.3, 0.4, 99.0],
-            [99.0, -0.1, 0.5, 0.2],
-            [0.7, -0.2, 0.1, 99.0],
-            [-0.4, 0.6, 0.3, 99.0],
-        ]
-    )
-    old_log_prob = ratio.clone().requires_grad_(True)
-    ref_log_prob = torch.zeros_like(ratio, requires_grad=True)
-    token_level_rewards = torch.tensor(
-        [
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, -1.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, -1.0, 0.0],
-        ]
-    )
-    response_mask = torch.tensor(
-        [
-            [1.0, 1.0, 1.0, 0.0],
-            [0.0, 1.0, 1.0, 1.0],
-            [1.0, 1.0, 1.0, 0.0],
-            [1.0, 1.0, 1.0, 0.0],
-        ]
-    )
-    group_ids = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
-
-    values, actual_target = compute_log_prob_values(
-        old_log_prob,
-        ref_log_prob,
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        a=torch.tensor(1.0),
-        b=torch.tensor(0.0),
-        group_ids=group_ids,
-    )
-
-    expected_values = torch.tensor(
-        [
-            [-1.0, torch.tanh(torch.tensor(0.2)), torch.tanh(torch.tensor(0.5)), 0.0],
-            [0.0, 1.0, torch.tanh(torch.tensor(-0.1)), torch.tanh(torch.tensor(0.4))],
-            [-1.0, torch.tanh(torch.tensor(0.7)), torch.tanh(torch.tensor(0.5)), 0.0],
-            [1.0, torch.tanh(torch.tensor(-0.4)), torch.tanh(torch.tensor(0.2)), 0.0],
-        ]
-    )
-    expected_target = token_level_rewards.sum(dim=-1, keepdim=True).expand_as(ratio)
-
-    torch.testing.assert_close(values, expected_values)
-    torch.testing.assert_close(actual_target, expected_target)
-
-
-def test_compute_log_prob_values_singleton_group_keeps_tanh_b_at_v0():
-    ratio = torch.tensor([[99.0, 0.4, 0.2]])
-    response_mask = torch.tensor([[0.0, 1.0, 1.0]])
-
-    values, _ = compute_log_prob_values(
-        old_log_prob=ratio,
-        ref_log_prob=torch.zeros_like(ratio),
-        token_level_rewards=torch.tensor([[0.0, 0.0, 1.0]]),
-        response_mask=response_mask,
-        a=torch.tensor(2.0),
-        b=torch.tensor(0.25),
-        group_ids=np.array(["singleton"], dtype=object),
-    )
-
-    expected = torch.tensor(
-        [[0.0, torch.tanh(torch.tensor(0.25)), torch.tanh(torch.tensor(1.05))]]
-    )
-    torch.testing.assert_close(values, expected)
-
-
-def test_ratio_value_critic_initialization():
-    critic = RatioValueCritic()
-
-    torch.testing.assert_close(critic.a, torch.tensor(1.0))
-    torch.testing.assert_close(critic.b, torch.tensor(0.0))
-
-
-def test_ratio_value_critic_adamw_update_reduces_masked_mse():
-    critic = RatioValueCritic()
-    optimizer = torch.optim.AdamW(critic.parameters(), lr=0.1, weight_decay=0.01)
-    ratio = torch.tensor([[-0.2, -0.1], [0.1, 0.2]])
-    old_log_prob = ratio - 1.0
-    ref_log_prob = torch.full_like(ratio, -1.0)
-    token_level_rewards = torch.tensor([[0.0, -1.0], [0.0, 1.0]])
-    response_mask = torch.ones_like(ratio)
-
-    loss_before, _, _ = critic.loss(
-        old_log_prob,
-        ref_log_prob,
-        token_level_rewards,
-        response_mask,
-        group_ids=np.array(["prompt", "prompt"], dtype=object),
-    )
-    optimizer.zero_grad()
-    loss_before.backward()
-    optimizer.step()
-    loss_after, _, _ = critic.loss(
-        old_log_prob,
-        ref_log_prob,
-        token_level_rewards,
-        response_mask,
-        group_ids=np.array(["prompt", "prompt"], dtype=object),
-    )
-
-    assert optimizer.param_groups[0]["weight_decay"] == 0.01
-    assert loss_after < loss_before
-
-
-def test_ratio_value_critic_loss_ignores_masked_tokens():
-    critic = RatioValueCritic()
-    old_log_prob = torch.tensor([[0.0, 0.0, 100.0], [0.0, 0.0, -100.0]])
-    ref_log_prob = torch.zeros_like(old_log_prob)
-    token_level_rewards = torch.tensor([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]])
-    response_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
-
-    value_loss, values, target = critic.loss(
-        old_log_prob,
-        ref_log_prob,
-        token_level_rewards,
-        response_mask,
-        group_ids=np.array(["prompt", "prompt"], dtype=object),
-    )
-
-    # LOO V0 values are deliberately very different from their own targets.
-    # The loss is exactly 1 because only the second valid token participates.
-    torch.testing.assert_close(values, torch.tensor([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
-    torch.testing.assert_close(target, torch.tensor([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]]))
-    torch.testing.assert_close(value_loss, torch.tensor(1.0))
-
-
-def test_compute_log_prob_values_rejects_shape_mismatch():
-    with pytest.raises(ValueError, match="must have the same shape"):
-        compute_log_prob_values(
-            torch.zeros(2, 3),
-            torch.zeros(2, 4),
-            token_level_rewards=torch.zeros(2, 3),
-            response_mask=torch.ones(2, 3),
-            a=torch.tensor(1.0),
-            b=torch.tensor(0.0),
-        )
-
-
 def _make_my_policy_loss_config():
     return OmegaConf.create(
         {
@@ -428,6 +208,12 @@ def _make_my_policy_loss_config():
             "global_batch_info": {},
         }
     )
+
+
+def _make_dgpo_policy_loss_config(tau: float = 0.5):
+    config = _make_my_policy_loss_config()
+    config.policy_loss = {"tau": tau}
+    return config
 
 
 def test_compute_policy_loss_my_requires_entropy():
@@ -495,59 +281,81 @@ def test_compute_policy_loss_my_reports_entropy_weight_metrics():
     assert metrics["actor/w/std"] == pytest.approx(valid_weights.std().item())
 
 
-def test_compute_policy_loss_my_reports_response_balanced_vinfo_spearman_correlation():
-    entropy = torch.tensor(
-        [
-            [1.0, 2.0, 3.0],
-            [3.0, 2.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ]
+def test_approximate_squared_hellinger_from_log_probs_matches_binary_projection():
+    policy_prob = torch.tensor([[0.1, 0.5, 0.9]])
+    reference_prob = torch.tensor([[0.9, 0.5, 0.1]])
+
+    actual = verl.trainer.ppo.core_algos.approximate_squared_hellinger_from_log_probs(
+        policy_prob.log(),
+        reference_prob.log(),
     )
-    response_mask = torch.ones_like(entropy)
-    normalized_entropy = entropy / entropy.max(dim=-1, keepdim=True).values
-    expected_weights = torch.softmax(normalized_entropy, dim=-1) * response_mask.sum(dim=-1, keepdim=True)
-    vinfo_weights = torch.stack(
-        (
-            torch.tensor([1.0, 2.0, 100.0]),
-            torch.tensor([1.0, 2.0, 100.0]),
-            torch.ones_like(expected_weights[2]),
+    expected = 1.0 - torch.sqrt(policy_prob * reference_prob) - torch.sqrt((1.0 - policy_prob) * (1.0 - reference_prob))
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[:, 1], torch.zeros(1))
+    assert torch.all((actual >= 0.0) & (actual <= 1.0))
+
+
+def test_approximate_squared_hellinger_from_log_probs_is_symmetric():
+    log_prob = torch.tensor([[-0.1, -1.0, -10.0]])
+    ref_log_prob = torch.tensor([[-2.0, -1.0, -0.2]])
+
+    forward = verl.trainer.ppo.core_algos.approximate_squared_hellinger_from_log_probs(
+        log_prob,
+        ref_log_prob,
+    )
+    reverse = verl.trainer.ppo.core_algos.approximate_squared_hellinger_from_log_probs(
+        ref_log_prob,
+        log_prob,
+    )
+
+    torch.testing.assert_close(forward, reverse)
+
+
+def test_approximate_squared_hellinger_from_log_probs_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="must have the same shape"):
+        verl.trainer.ppo.core_algos.approximate_squared_hellinger_from_log_probs(
+            torch.zeros(2, 3),
+            torch.zeros(2, 4),
         )
-    )
-
-    _, metrics, returned_weights = verl.trainer.ppo.core_algos.compute_policy_loss_my(
-        old_log_prob=torch.zeros_like(entropy),
-        log_prob=torch.zeros_like(entropy),
-        entropy=entropy,
-        advantages=torch.ones_like(entropy),
-        response_mask=response_mask,
-        vinfo_weights=vinfo_weights,
-        config=_make_my_policy_loss_config(),
-    )
-
-    torch.testing.assert_close(returned_weights, expected_weights)
-    assert metrics["actor/w_vinfo/spearman_corr_mean"] == pytest.approx(0.0, abs=1e-6)
-    assert metrics["actor/w_vinfo/spearman_valid_response_ratio"] == pytest.approx(2.0 / 3.0)
 
 
-def test_compute_policy_loss_my_vinfo_spearman_uses_all_valid_tokens():
-    entropy = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 1000.0]])
-    response_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0]])
-    vinfo_weights = torch.tensor([[4.0, 3.0, 2.0, 1.0, 5.0, -1000.0]])
+def _compute_dgpo_test_loss(*, tau: float, vocab_size: int) -> torch.Tensor:
+    policy_prob = torch.tensor([[0.9, 0.2]])
+    reference_prob = torch.tensor([[0.1, 0.2]])
+    log_prob = policy_prob.log()
+    return verl.trainer.ppo.core_algos.compute_policy_loss_dgpo(
+        old_log_prob=log_prob,
+        log_prob=log_prob,
+        ref_log_prob=reference_prob.log(),
+        advantages=torch.tensor([[1.0, 3.0]]),
+        response_mask=torch.ones(1, 2),
+        entropy=torch.full((1, 2), 0.5),
+        vocab_size=vocab_size,
+        config=_make_dgpo_policy_loss_config(tau),
+    )[0]
 
-    _, metrics, _ = verl.trainer.ppo.core_algos.compute_policy_loss_my(
-        old_log_prob=torch.zeros_like(entropy),
-        log_prob=torch.zeros_like(entropy),
-        entropy=entropy,
-        advantages=torch.ones_like(entropy),
-        response_mask=response_mask,
-        vinfo_weights=vinfo_weights,
-        config=_make_my_policy_loss_config(),
-    )
 
-    # The highest-ranked valid token agrees, but the rank correlation across all
-    # five valid tokens is zero. The masked sixth token must not affect it.
-    assert metrics["actor/w_vinfo/spearman_corr_mean"] == pytest.approx(0.0, abs=1e-6)
-    assert metrics["actor/w_vinfo/spearman_valid_response_ratio"] == pytest.approx(1.0)
+def test_compute_policy_loss_dgpo_reads_nested_policy_loss_tau():
+    low_temperature_loss = _compute_dgpo_test_loss(tau=0.1, vocab_size=1000)
+    high_temperature_loss = _compute_dgpo_test_loss(tau=1.0, vocab_size=1000)
+
+    assert low_temperature_loss > high_temperature_loss
+    assert not torch.isclose(low_temperature_loss, high_temperature_loss)
+
+
+def test_compute_policy_loss_dgpo_normalizes_entropy_by_dynamic_vocab_size():
+    small_vocab_loss = _compute_dgpo_test_loss(tau=0.5, vocab_size=2)
+    large_vocab_loss = _compute_dgpo_test_loss(tau=0.5, vocab_size=1000)
+
+    assert small_vocab_loss > large_vocab_loss
+    assert not torch.isclose(small_vocab_loss, large_vocab_loss)
+
+
+@pytest.mark.parametrize(("tau", "vocab_size", "message"), [(0.0, 1000, "tau"), (0.5, 1, "vocab_size")])
+def test_compute_policy_loss_dgpo_rejects_invalid_normalization_inputs(tau, vocab_size, message):
+    with pytest.raises(ValueError, match=message):
+        _compute_dgpo_test_loss(tau=tau, vocab_size=vocab_size)
 
 
 def _make_group_index(batch_size: int, num_groups: int) -> np.ndarray:
@@ -612,103 +420,6 @@ def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
 
 
-def test_normalized_rloo_is_eight_sevenths_of_grpo_for_groups_of_eight():
-    token_level_rewards = torch.zeros(8, 3)
-    token_level_rewards[:, 0] = torch.tensor([1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0])
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["prompt"] * 8)
-
-    normalized_rloo, returns = compute_normalized_rloo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-    )
-    grpo, _ = compute_grpo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-    )
-
-    torch.testing.assert_close(normalized_rloo, grpo * (8.0 / 7.0))
-    torch.testing.assert_close(returns, normalized_rloo)
-    assert normalized_rloo[0, 0].item() == pytest.approx(2.82842, abs=1e-5)
-
-
-def test_normalized_rloo_handles_multiple_groups_and_response_mask():
-    token_level_rewards = torch.zeros(5, 4)
-    token_level_rewards[:, 0] = torch.tensor([1.0, 0.0, 3.0, 2.0, 4.0])
-    response_mask = torch.tensor(
-        [
-            [1.0, 1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0, 1.0],
-        ]
-    )
-    index = np.array(["two", "three", "two", "three", "three"])
-
-    advantages, returns = compute_normalized_rloo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-    )
-    expected_scalars = torch.tensor([-2.0**0.5, -1.5, 2.0**0.5, 0.0, 1.5])
-    expected = expected_scalars.unsqueeze(-1) * response_mask
-
-    torch.testing.assert_close(advantages, expected, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(returns, expected, rtol=1e-5, atol=1e-6)
-    assert torch.count_nonzero(advantages[response_mask == 0]) == 0
-
-
-def test_normalized_rloo_singleton_and_uniform_groups_are_zero():
-    token_level_rewards = torch.tensor([[5.0, 0.0], [2.0, 0.0], [2.0, 0.0]])
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["singleton", "uniform", "uniform"])
-
-    advantages, returns = compute_normalized_rloo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-    )
-
-    torch.testing.assert_close(advantages, torch.zeros_like(advantages))
-    torch.testing.assert_close(returns, advantages)
-    assert torch.isfinite(advantages).all()
-
-
-def test_normalized_rloo_can_disable_group_std_via_config():
-    token_level_rewards = torch.tensor([[1.0, 0.0], [3.0, 0.0]])
-    response_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
-
-    advantages, _ = compute_normalized_rloo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=np.array([0, 0]),
-        config=OmegaConf.create({"norm_adv_by_std_in_grpo": False}),
-    )
-
-    torch.testing.assert_close(advantages, torch.tensor([[-2.0, 0.0], [2.0, 2.0]]))
-
-
-@pytest.mark.parametrize(
-    "token_level_rewards,response_mask,index,error",
-    [
-        (torch.zeros(2), torch.zeros(2), np.array([0, 0]), "rank-2"),
-        (torch.zeros(2, 2), torch.zeros(2, 3), np.array([0, 0]), "must match"),
-        (torch.zeros(2, 2), torch.zeros(2, 2), np.array([0]), "must contain 2"),
-        (torch.tensor([[float("nan")], [0.0]]), torch.ones(2, 1), np.array([0, 0]), "must be finite"),
-    ],
-)
-def test_normalized_rloo_rejects_invalid_inputs(token_level_rewards, response_mask, index, error):
-    with pytest.raises(ValueError, match=error):
-        compute_normalized_rloo_outcome_advantage(
-            token_level_rewards=token_level_rewards,
-            response_mask=response_mask,
-            index=index,
-        )
-
-
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_groups,seed",
     [
@@ -761,31 +472,6 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
-
-
-def test_vinfo_returns_unmodified_grpo_advantage_and_weights():
-    response_mask = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.float32)
-    token_level_rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
-    index = np.array([0, 0])
-    answer_log_prob = torch.tensor([[0.0, 0.2, 0.4, 0.6], [0.0, -0.2, -0.4, -0.6]])
-    step_end_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.bool)
-
-    expected_advantages, expected_returns = compute_grpo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-    )
-    advantages, returns, w = compute_vinfo_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        answer_log_prob=answer_log_prob,
-        step_end_mask=step_end_mask,
-    )
-
-    torch.testing.assert_close(advantages, expected_advantages)
-    torch.testing.assert_close(returns, expected_returns)
-    assert w.shape == advantages.shape
 
 
 if __name__ == "__main__":

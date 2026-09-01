@@ -210,30 +210,6 @@ class TestDataParallelPPOActor(unittest.TestCase):
         self.assertNotIn("logits", outputs)
         self.assertNotIn("logits_indices", outputs)
 
-    def test_compute_log_prob_with_topk_logits(self):
-        """Top-k logits are returned only when requested by losses such as DGPO."""
-        original_use_remove_padding = self.actor.use_remove_padding
-        try:
-            for use_remove_padding in (False, True):
-                with self.subTest(use_remove_padding=use_remove_padding):
-                    self.actor.use_remove_padding = use_remove_padding
-                    data = self._create_test_data_for_compute_log_prob()
-                    outputs = self.actor.compute_log_prob(
-                        data,
-                        calculate_entropy=False,
-                        return_topk_logits=True,
-                    )
-
-                    batch_size, response_length = data.batch["responses"].shape
-                    expected_topk = min(100, self.mock_model.vocab_size)
-                    self.assertEqual(outputs["logits"].shape, (batch_size, response_length, expected_topk))
-                    self.assertEqual(outputs["logits_indices"].shape, outputs["logits"].shape)
-                    self.assertFalse(outputs["logits"].requires_grad)
-                    self.assertTrue(torch.all(outputs["logits_indices"] >= 0))
-                    self.assertTrue(torch.all(outputs["logits_indices"] < self.mock_model.vocab_size))
-        finally:
-            self.actor.use_remove_padding = original_use_remove_padding
-
     def test_update_policy(self):
         """Test update_policy method"""
         data = self._create_test_data_for_update_policy()
@@ -259,7 +235,7 @@ class TestDataParallelPPOActor(unittest.TestCase):
                 self.assertTrue(torch.isfinite(torch.tensor(metrics[key])))
 
     def test_update_policy_with_dgpo(self):
-        """DGPO requests current top-k logits and consumes reference top-k logits."""
+        """DGPO consumes only sampled-token reference log-probabilities."""
         self.config = replace(
             self.config,
             policy_loss=PolicyLossConfig(loss_mode="dgpo"),
@@ -280,15 +256,13 @@ class TestDataParallelPPOActor(unittest.TestCase):
             ref_outputs = self.actor.compute_log_prob(
                 ref_data,
                 calculate_entropy=False,
-                return_topk_logits=True,
             )
-            data.batch["ref_logits"] = ref_outputs["logits"]
-            data.batch["ref_logits_indices"] = ref_outputs["logits_indices"]
+            data.batch["ref_log_prob"] = ref_outputs["log_probs"]
 
             metrics = self.actor.update_policy(data)
 
-        self.assertIn("actor/intersection_ratio", metrics)
         self.assertIn("actor/hellinger_dist/mean", metrics)
+        self.assertNotIn("actor/intersection_ratio", metrics)
         self.assertTrue(torch.isfinite(torch.tensor(metrics["actor/pg_loss"])))
 
     def test_dataparallelppoactor_initialization(self):

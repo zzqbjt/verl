@@ -960,6 +960,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_tiled_mlp=ref_use_tiled_mlp,
                 tiled_mlp_shards=ref_tiled_mlp_shards,
             )[0]
+            if torch.distributed.get_world_size() == 1 and fsdp_version(self.ref_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.ref_module_fsdp,
+                    state_dict_type=StateDictType.FULL_STATE_DICT,
+                    state_dict_config=FullStateDictConfig(),
+                )
+            elif fsdp_version(self.ref_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.ref_module_fsdp,
+                    state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                    state_dict_config=ShardedStateDictConfig(),
+                )
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
@@ -1106,20 +1118,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        return_topk_logits = data.meta_info.pop("return_topk_logits", False)
-        # Deprecated compatibility alias; current trainers emit the explicit
-        # provider request below.
-        legacy_probe_request = bool(data.meta_info.pop("compute_step_value", False))
-        compute_step_value_probe = bool(data.meta_info.pop("compute_step_value_probe", legacy_probe_request))
-        compute_similarity_step_embeddings = bool(data.meta_info.pop("compute_similarity_step_embeddings", False))
-        if compute_step_value_probe and compute_similarity_step_embeddings:
-            raise ValueError("Probe values and similarity embeddings cannot be requested together.")
-        if compute_step_value_probe and is_lora:
-            raise ValueError("compute_step_value_probe is supported only on the actor old-log-prob path.")
-        if compute_step_value_probe and not self.actor.has_step_value_probe:
-            raise ValueError("compute_step_value_probe=True requires actor.step_value_probe.enabled=True.")
-        if compute_similarity_step_embeddings and is_lora:
-            raise ValueError("Similarity step embeddings are supported only on the actor old-log-prob path.")
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
@@ -1129,15 +1127,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
-        calculate_entropy = not is_lora
+        calculate_entropy = bool(data.meta_info.pop("calculate_entropy", not is_lora))
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(
                     data=data,
                     calculate_entropy=calculate_entropy,
-                    return_topk_logits=return_topk_logits,
-                    compute_step_value_probe=compute_step_value_probe,
-                    compute_similarity_step_embeddings=compute_similarity_step_embeddings,
                 )
             if not is_lora:
                 tensors = {"old_log_probs": outputs["log_probs"]}
@@ -1147,30 +1142,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["entropys"] = outputs["entropys"]
             if "sum_pi_squared" in outputs:
                 tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
-            if return_topk_logits:
-                key_prefix = "ref_" if is_lora else ""
-                tensors[f"{key_prefix}logits"] = outputs["logits"]
-                tensors[f"{key_prefix}logits_indices"] = outputs["logits_indices"]
-            if compute_step_value_probe:
-                tensors.update(
-                    {
-                        "step_values": outputs["step_values"],
-                        "step_value_trajectory_logit_mean": outputs["step_value_trajectory_logit_mean"],
-                        "step_value_ready": outputs["step_value_ready"],
-                        "step_value_probe_loss": outputs["step_value_probe_loss"],
-                        "step_value_probe_grad_norm": outputs["step_value_probe_grad_norm"],
-                    }
-                )
-                for audit_key in (
-                    "step_value_audit_trajectory_logit_mean",
-                    "step_value_audit_endpoint_count",
-                    "step_value_audit_ready_next",
-                    "step_value_forward_row_id",
-                ):
-                    if audit_key in outputs:
-                        tensors[audit_key] = outputs[audit_key]
-            if compute_similarity_step_embeddings:
-                tensors["similarity_step_embeddings"] = outputs["similarity_step_embeddings"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1190,54 +1161,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="blue", role="actor_compute_answer_log_prob")
-    def compute_answer_log_prob(self, data: DataProto):
+    @DistProfiler.annotate(color="purple", role="actor_counterfactual_credit")
+    def update_counterfactual_credit(self, data: DataProto):
+        """Fit the replicated detached credit head and return dense step predictions."""
+
         assert self._is_actor
-        actor_config = self.config.actor
+        if not self.actor.has_counterfactual_credit_head:
+            raise ValueError("update_counterfactual_credit requires actor.counterfactual_credit_head.enabled=True.")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-        data.meta_info["micro_batch_size"] = actor_config.answer_log_prob_batch_size
-        data.meta_info["max_token_len"] = (
-            actor_config.answer_log_prob_max_token_len_per_gpu or actor_config.ppo_max_token_len_per_gpu
+        actor_config = self.config.actor
+        data.meta_info["micro_batch_size"] = (
+            actor_config.ppo_infer_micro_batch_size_per_gpu or self.config.rollout.log_prob_micro_batch_size_per_gpu
         )
-        data.meta_info["use_dynamic_bsz"] = (
-            actor_config.answer_log_prob_use_dynamic_bsz
-            if actor_config.answer_log_prob_use_dynamic_bsz is not None
-            else actor_config.use_dynamic_bsz
-        )
+        data.meta_info["max_token_len"] = actor_config.ppo_infer_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = actor_config.use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["answer_prefix"] = actor_config.answer_prefix
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0)
-
         try:
             with self.ulysses_sharding_manager:
-                outputs = self.actor.compute_answer_log_prob(data=data, tokenizer=self.tokenizer)
-                output = DataProto.from_dict(
-                    tensors={"answer_log_prob": outputs["log_probs"].float()},
-                    meta_info={"temperature": self.config.rollout.temperature},
-                )
-
+                outputs = self.actor.compute_counterfactual_credit(data)
+                output = DataProto.from_dict(tensors=outputs)
             output = output.to("cpu")
-
-            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-                self.actor.actor_module._handle.reshard(True)
+            if self.world_size > 1:
+                if fsdp_version(self.actor.actor_module) == 1:
+                    self.actor.actor_module._handle.reshard(True)
+                elif fsdp_version(self.actor.actor_module) == 2:
+                    self.actor.actor_module.reshard()
         finally:
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-                log_gpu_memory_usage("After offload model during compute_answer_log_prob", logger=logger)
-
+                log_gpu_memory_usage("After offload actor model during counterfactual credit", logger=logger)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
-        loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
-        return_topk_logits = loss_mode == "dgpo"
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
-            data.meta_info["return_topk_logits"] = return_topk_logits
             return self.compute_log_prob(data)
         assert self._is_ref
         # else:
@@ -1254,12 +1216,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             outputs = self.ref_policy.compute_log_prob(
                 data=data,
                 calculate_entropy=False,
-                return_topk_logits=return_topk_logits,
             )
             tensors = {"ref_log_prob": outputs["log_probs"]}
-            if return_topk_logits:
-                tensors["ref_logits"] = outputs["logits"]
-                tensors["ref_logits_indices"] = outputs["logits_indices"]
             output = DataProto.from_dict(tensors=tensors)
         output = output.to("cpu")
 
@@ -1286,11 +1244,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
-        if self.actor.has_step_value_probe and self.actor.config.step_value_probe.save_checkpoint and self.rank == 0:
-            step_value_probe_path = os.path.join(local_path, "step_value_probe.pt")
-            torch.save(self.actor.step_value_probe_state_dict(), step_value_probe_path)
+        if (
+            self.actor.has_counterfactual_credit_head
+            and self.actor.config.counterfactual_credit_head.save_checkpoint
+            and self.rank == 0
+        ):
+            credit_head_path = os.path.join(local_path, "counterfactual_credit_head.pt")
+            torch.save(self.actor.counterfactual_credit_state_dict(), credit_head_path)
             log_with_rank(
-                f"Saved step-value probe to {os.path.abspath(step_value_probe_path)}",
+                f"Saved counterfactual-credit head to {os.path.abspath(credit_head_path)}",
                 rank=self.rank,
                 logger=logger,
             )
@@ -1353,29 +1315,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         if self._is_actor:
-            step_value_probe_state = None
-            local_step_value_probe_path_to_delete = None
-            if self.actor.has_step_value_probe and self.actor.config.step_value_probe.save_checkpoint:
-                step_value_probe_path = os.path.join(local_path, "step_value_probe.pt")
-                if self.rank == 0 and exists(step_value_probe_path):
-                    local_step_value_probe_path = copy_to_local(step_value_probe_path)
-                    step_value_probe_state = torch.load(
-                        local_step_value_probe_path,
+            credit_head_state = None
+            local_credit_head_path_to_delete = None
+            if (
+                self.actor.has_counterfactual_credit_head
+                and self.actor.config.counterfactual_credit_head.save_checkpoint
+            ):
+                credit_head_path = os.path.join(local_path, "counterfactual_credit_head.pt")
+                if self.rank == 0 and exists(credit_head_path):
+                    local_credit_head_path = copy_to_local(credit_head_path)
+                    credit_head_state = torch.load(
+                        local_credit_head_path,
                         map_location="cpu",
                         weights_only=False,
                     )
-                    if del_local_after_load and is_non_local(step_value_probe_path):
-                        local_step_value_probe_path_to_delete = local_step_value_probe_path
-                probe_state_payload = [step_value_probe_state]
-                dist.broadcast_object_list(probe_state_payload, src=0)
-                step_value_probe_state = probe_state_payload[0]
-            self.actor.load_step_value_probe_state_dict(step_value_probe_state)
+                    if del_local_after_load and is_non_local(credit_head_path):
+                        local_credit_head_path_to_delete = local_credit_head_path
+                credit_state_payload = [credit_head_state]
+                dist.broadcast_object_list(credit_state_payload, src=0)
+                credit_head_state = credit_state_payload[0]
+            self.actor.load_counterfactual_credit_state_dict(credit_head_state)
 
             if del_local_after_load:
                 dist.barrier()
-                if self.rank == 0 and local_step_value_probe_path_to_delete is not None:
+                if self.rank == 0 and local_credit_head_path_to_delete is not None:
                     try:
-                        os.remove(local_step_value_probe_path_to_delete)
+                        os.remove(local_credit_head_path_to_delete)
                     except FileNotFoundError:
                         pass
 

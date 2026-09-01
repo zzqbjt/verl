@@ -70,8 +70,10 @@ actor_rollout_ref:
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null
     ppo_micro_batch_size_per_gpu: null
+    ppo_infer_micro_batch_size_per_gpu: null
     use_dynamic_bsz: false
     ppo_max_token_len_per_gpu: 16384
+    ppo_infer_max_token_len_per_gpu: 16384
     clip_ratio: 0.2
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
@@ -87,20 +89,13 @@ actor_rollout_ref:
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
       tau: 0.5
-    step_value_probe:
-      _target_: verl.workers.config.StepValueProbeConfig
+    counterfactual_credit_head:
+      _target_: verl.workers.config.CounterfactualCreditHeadConfig
       enabled: false
-      hidden_dim: 256
+      hidden_dim: 512
       lr: 0.001
       weight_decay: 0.0
-      warmup_epochs: 10
-      update_epochs: 1
-      warmup_updates: 1
       save_checkpoint: true
-    answer_prefix: 'Answer: '
-    answer_log_prob_batch_size: 16
-    answer_log_prob_use_dynamic_bsz: null
-    answer_log_prob_max_token_len_per_gpu: null
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
@@ -693,7 +688,6 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
   lam: 1.0
-  length_adaptive_gae_alpha: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
   step_split:
@@ -701,33 +695,6 @@ algorithm:
     enabled: false
     lookahead_tokens: 10
     separate_preamble: false
-  step_value:
-    _target_: verl.trainer.config.StepValueAdvantageConfig
-    provider: probe
-    lam: 0.9
-    norm_by_group_std: true
-    zero_when_group_uniform: true
-    target_key: acc
-    task_reward_key: score
-    prompt_center_calibration_enabled: false
-    prompt_center_calibration_slope: 1.0
-    prompt_center_calibration_intercept: 0.0
-    prompt_center_audit_enabled: false
-    prompt_center_audit_groups: 16
-    prompt_center_audit_window: 2
-    prompt_center_audit_seed: 0
-    similarity_top_k: 3
-    similarity_tau: 0.002
-    similarity_position_window: 0.2
-    similarity_iterations: 1
-    lookahead_tokens: null
-    separate_preamble: null
-  ratio_value_critic:
-    a_init: 1.0
-    b_init: 0.0
-    lr: 0.01
-    weight_decay: 0.01
-    update_steps: 1
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

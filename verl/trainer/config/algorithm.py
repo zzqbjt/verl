@@ -20,96 +20,12 @@ from verl.base_config import BaseConfig
 
 __all__ = [
     "AlgoConfig",
-    "DapoReferenceKLConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
     "RolloutCorrectionConfig",
+    "SparseCounterfactualCreditConfig",
     "StepSplitConfig",
-    "StepValueAdvantageConfig",
 ]
-
-
-@dataclass
-class DapoReferenceKLConfig(BaseConfig):
-    """Auxiliary privileged-context KL loss for DAPO.
-
-    For every rollout group retained by DAPO, a verified-correct sampled response
-    is inserted into the prompt used by the rollout old policy.  Its compressed
-    teacher distribution is cached before any actor optimizer step.  The old
-    teacher and the current ordinary-context actor score the same incorrect
-    response; their forward KL is mixed with the normal DAPO policy loss.
-    """
-
-    enabled: bool = False
-    loss_coef: float = 0.0
-    teacher_prompt_template: str = (
-        "Solve the following math problem step by step. The last line of your "
-        "response should be of the form Answer: $Answer (without quotes) where "
-        "$Answer is the answer to the problem.\n\n{question}\n\nRemember to put "
-        'your answer on its own line after "Answer:".\n\nHere is a reference solution: '
-        "{reference_solution}"
-    )
-    question_key: str = "question"
-    student_prompt_prefix: str = (
-        "Solve the following math problem step by step. The last line of your "
-        "response should be of the form Answer: $Answer (without quotes) where "
-        "$Answer is the answer to the problem.\n\n"
-    )
-    student_prompt_suffix: str = '\n\nRemember to put your answer on its own line after "Answer:".'
-    max_teacher_prompt_length: int = 2048
-    truncation: str = "error"
-    temperature: float = 1.0
-    approximation: str = "topk"
-    top_k: int = 100
-    token_chunk_size: int = 512
-    teacher_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not isinstance(self.enabled, bool):
-            raise ValueError(f"dapo_reference_kl.enabled must be a bool, got {self.enabled!r}.")
-        if (
-            not isinstance(self.loss_coef, (int, float))
-            or isinstance(self.loss_coef, bool)
-            or not math.isfinite(self.loss_coef)
-            or not 0.0 <= self.loss_coef <= 1.0
-        ):
-            raise ValueError("dapo_reference_kl.loss_coef must be finite and in [0, 1].")
-        if not isinstance(self.teacher_prompt_template, str) or not self.teacher_prompt_template.strip():
-            raise ValueError("dapo_reference_kl.teacher_prompt_template must be a non-empty string.")
-        for placeholder in ("{question}", "{reference_solution}"):
-            if placeholder not in self.teacher_prompt_template:
-                raise ValueError(f"dapo_reference_kl.teacher_prompt_template must contain {placeholder!r}.")
-        if not isinstance(self.question_key, str) or not self.question_key.strip():
-            raise ValueError("dapo_reference_kl.question_key must be a non-empty string.")
-        if not isinstance(self.student_prompt_prefix, str):
-            raise ValueError("dapo_reference_kl.student_prompt_prefix must be a string.")
-        if not isinstance(self.student_prompt_suffix, str):
-            raise ValueError("dapo_reference_kl.student_prompt_suffix must be a string.")
-        if (
-            not isinstance(self.max_teacher_prompt_length, int)
-            or isinstance(self.max_teacher_prompt_length, bool)
-            or self.max_teacher_prompt_length < 1
-        ):
-            raise ValueError("dapo_reference_kl.max_teacher_prompt_length must be an integer >= 1.")
-        if self.truncation not in {"error", "left", "right"}:
-            raise ValueError("dapo_reference_kl.truncation must be one of: error, left, right.")
-        if (
-            not isinstance(self.temperature, (int, float))
-            or isinstance(self.temperature, bool)
-            or not math.isfinite(self.temperature)
-            or self.temperature <= 0
-        ):
-            raise ValueError("dapo_reference_kl.temperature must be finite and > 0.")
-        if self.approximation != "topk":
-            raise ValueError("Old-policy dapo_reference_kl.approximation must be 'topk'.")
-        if not isinstance(self.top_k, int) or isinstance(self.top_k, bool) or self.top_k < 1:
-            raise ValueError("dapo_reference_kl.top_k must be an integer >= 1.")
-        if (
-            not isinstance(self.token_chunk_size, int)
-            or isinstance(self.token_chunk_size, bool)
-            or self.token_chunk_size < 1
-        ):
-            raise ValueError("dapo_reference_kl.token_chunk_size must be an integer >= 1.")
 
 
 @dataclass
@@ -157,9 +73,7 @@ class StepSplitConfig(BaseConfig):
     is enabled.
 
     Args:
-        enabled (bool): Attach ``step_end_mask`` for methods that do not
-            require it. V-Info and step-value estimators enable splitting
-            automatically.
+        enabled (bool): Attach ``step_end_mask`` to rollout batches.
         lookahead_tokens (int): Tokens inspected after a delimiter for a numeric step marker.
         separate_preamble (bool): Whether text before an explicit Step 1 marker is a separate step.
     """
@@ -182,163 +96,99 @@ class StepSplitConfig(BaseConfig):
 
 
 @dataclass
-class StepValueAdvantageConfig(BaseConfig):
-    """Configuration for constructing advantages from provider-supplied step values.
+class SparseCounterfactualCreditConfig(BaseConfig):
+    """Sparse Monte-Carlo supervision for step-level policy credit.
 
-    The estimator consumes ``step_values`` but does not prescribe how they are
-    produced. ``provider`` selects the built-in trainable probe or same-prompt
-    semantic retrieval while the surrounding split and advantage stages stay shared.
-
-    Args:
-        provider (str): Step-value estimator used between shared splitting and shared advantage computation.
-        lam (float): Decay applied to future step-value differences.
-        norm_by_group_std (bool): Whether the provider prepares step-value scales from its target's prompt-group
-            standard deviation. Probe targets use acc space; retrieval targets may use raw-reward space.
-        zero_when_group_uniform (bool): Whether groups uniform in the provider's target space receive zero advantage.
-        target_key (str): Reward-manager output key used as the probe target.
-        task_reward_key (str): Reward-manager output key for the verifier's raw task reward.
-        prompt_center_calibration_enabled (bool): Apply a frozen rank-preserving prompt-center map to Probe logits.
-        prompt_center_calibration_slope (float): Positive slope of the frozen prompt-center map.
-        prompt_center_calibration_intercept (float): Intercept of the frozen prompt-center map.
-        prompt_center_audit_enabled (bool): Learn a causally lagged prompt-center map from uncensored DAPO groups.
-        prompt_center_audit_groups (int): Complete first-generation prompt groups audited per update.
-        prompt_center_audit_window (int): Number of completed audit updates retained by the online fit.
-        prompt_center_audit_seed (int): Seed used only for outcome-independent first-batch ordinal priorities.
-        similarity_top_k (int): Number of semantic neighbors used by the similarity provider.
-        similarity_tau (float): Softmax temperature for similarity weights.
-        similarity_position_window (float): Maximum relative-position distance between retrieved steps.
-        similarity_iterations (int): Number of synchronous value-propagation rounds.
-        lookahead_tokens (Optional[int]): Deprecated compatibility alias for ``step_split.lookahead_tokens``.
-        separate_preamble (Optional[bool]): Deprecated compatibility alias for ``step_split.separate_preamble``.
+    Entropy is used only to choose a small number of step anchors. Each
+    selected anchor receives a signed ``Q - V`` target from fresh suffix
+    rollouts; a detached actor-side head predicts the unobserved steps.
     """
 
-    provider: str = "probe"
-    lam: float = 0.9
-    norm_by_group_std: bool = True
-    zero_when_group_uniform: bool = True
-    target_key: str = "acc"
-    task_reward_key: str = "score"
-    prompt_center_calibration_enabled: bool = False
-    prompt_center_calibration_slope: float = 1.0
-    prompt_center_calibration_intercept: float = 0.0
-    prompt_center_audit_enabled: bool = False
-    prompt_center_audit_groups: int = 16
-    prompt_center_audit_window: int = 2
-    prompt_center_audit_seed: int = 0
-    similarity_top_k: int = 3
-    similarity_tau: float = 0.002
-    similarity_position_window: float = 0.2
-    similarity_iterations: int = 1
-    lookahead_tokens: Optional[int] = None
-    separate_preamble: Optional[bool] = None
+    enabled: bool = False
+    entropy_top_ratio: float = 0.2
+    anchors_per_group: int = 2
+    sampling_temperature: float = 1.0
+    uniform_mix: float = 0.1
+    num_q_samples: int = 1
+    num_v_samples: int = 2
+    correctness_key: str = "acc"
+    huber_delta: float = 1.0
+    use_inverse_propensity: bool = True
+    inverse_propensity_clip: float = 5.0
+    advantage_coef: float = 0.3
+    warmup_ratio: float = 0.1
+    normalize_batch_std: bool = True
+    epsilon: float = 1e-6
+    selection_seed: int = 42
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    repetition_penalty: float = 1.0
+    max_new_tokens: Optional[int] = None
 
     def __post_init__(self):
-        """Validate step-value advantage parameters."""
-        if self.provider not in {"probe", "similarity"}:
-            raise ValueError(f"step_value.provider must be 'probe' or 'similarity', got {self.provider!r}.")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("sparse_counterfactual_credit.enabled must be a bool.")
+        self._validate_open_unit("entropy_top_ratio", self.entropy_top_ratio)
         if (
-            not isinstance(self.lam, (int, float))
-            or isinstance(self.lam, bool)
-            or not math.isfinite(self.lam)
-            or not 0.0 <= self.lam <= 1.0
+            not isinstance(self.anchors_per_group, int)
+            or isinstance(self.anchors_per_group, bool)
+            or self.anchors_per_group < 1
         ):
-            raise ValueError(f"step_value.lam must be finite and in [0, 1], got {self.lam}.")
-        if not isinstance(self.norm_by_group_std, bool):
-            raise ValueError(f"step_value.norm_by_group_std must be a bool, got {self.norm_by_group_std!r}.")
-        if not isinstance(self.zero_when_group_uniform, bool):
-            raise ValueError(
-                f"step_value.zero_when_group_uniform must be a bool, got {self.zero_when_group_uniform!r}."
-            )
-        if not isinstance(self.target_key, str) or not self.target_key.strip():
-            raise ValueError(f"step_value.target_key must be a non-empty string, got {self.target_key!r}.")
-        if not isinstance(self.task_reward_key, str) or not self.task_reward_key.strip():
-            raise ValueError(f"step_value.task_reward_key must be a non-empty string, got {self.task_reward_key!r}.")
-        if not isinstance(self.prompt_center_calibration_enabled, bool):
-            raise ValueError(
-                "step_value.prompt_center_calibration_enabled must be a bool, "
-                f"got {self.prompt_center_calibration_enabled!r}."
-            )
+            raise ValueError("sparse_counterfactual_credit.anchors_per_group must be an integer >= 1.")
+        self._validate_positive("sampling_temperature", self.sampling_temperature)
+        self._validate_closed_unit("uniform_mix", self.uniform_mix)
+        for name in ("num_q_samples", "num_v_samples"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"sparse_counterfactual_credit.{name} must be an integer >= 1.")
+        if not isinstance(self.correctness_key, str) or not self.correctness_key.strip():
+            raise ValueError("sparse_counterfactual_credit.correctness_key must be a non-empty string.")
+        self._validate_positive("huber_delta", self.huber_delta)
+        if not isinstance(self.use_inverse_propensity, bool):
+            raise ValueError("sparse_counterfactual_credit.use_inverse_propensity must be a bool.")
+        self._validate_positive("inverse_propensity_clip", self.inverse_propensity_clip)
+        self._validate_closed_unit("advantage_coef", self.advantage_coef)
+        self._validate_closed_unit("warmup_ratio", self.warmup_ratio)
+        if not isinstance(self.normalize_batch_std, bool):
+            raise ValueError("sparse_counterfactual_credit.normalize_batch_std must be a bool.")
+        self._validate_positive("epsilon", self.epsilon)
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("sparse_counterfactual_credit.selection_seed must be an integer.")
+        self._validate_positive("temperature", self.temperature)
+        self._validate_open_unit("top_p", self.top_p)
+        if not isinstance(self.top_k, int) or isinstance(self.top_k, bool) or self.top_k == 0 or self.top_k < -1:
+            raise ValueError("sparse_counterfactual_credit.top_k must be -1 or an integer >= 1.")
+        self._validate_positive("repetition_penalty", self.repetition_penalty)
+        if self.max_new_tokens is not None and (
+            not isinstance(self.max_new_tokens, int) or isinstance(self.max_new_tokens, bool) or self.max_new_tokens < 1
+        ):
+            raise ValueError("sparse_counterfactual_credit.max_new_tokens must be null or an integer >= 1.")
+
+    @staticmethod
+    def _validate_positive(name: str, value: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and > 0.")
+
+    @staticmethod
+    def _validate_closed_unit(name: str, value: float) -> None:
         if (
-            isinstance(self.prompt_center_calibration_slope, bool)
-            or not isinstance(self.prompt_center_calibration_slope, (int, float))
-            or not math.isfinite(self.prompt_center_calibration_slope)
-            or self.prompt_center_calibration_slope <= 0.0
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
         ):
-            raise ValueError(
-                "step_value.prompt_center_calibration_slope must be finite and positive, "
-                f"got {self.prompt_center_calibration_slope!r}."
-            )
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and in [0, 1].")
+
+    @staticmethod
+    def _validate_open_unit(name: str, value: float) -> None:
         if (
-            isinstance(self.prompt_center_calibration_intercept, bool)
-            or not isinstance(self.prompt_center_calibration_intercept, (int, float))
-            or not math.isfinite(self.prompt_center_calibration_intercept)
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 < value <= 1.0
         ):
-            raise ValueError(
-                "step_value.prompt_center_calibration_intercept must be finite, "
-                f"got {self.prompt_center_calibration_intercept!r}."
-            )
-        if not isinstance(self.prompt_center_audit_enabled, bool):
-            raise ValueError(
-                "step_value.prompt_center_audit_enabled must be a bool, "
-                f"got {self.prompt_center_audit_enabled!r}."
-            )
-        if self.prompt_center_audit_enabled and self.prompt_center_calibration_enabled:
-            raise ValueError(
-                "step_value.prompt_center_audit_enabled and prompt_center_calibration_enabled are mutually exclusive"
-            )
-        for name, value in (
-            ("prompt_center_audit_groups", self.prompt_center_audit_groups),
-            ("prompt_center_audit_window", self.prompt_center_audit_window),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"step_value.{name} must be a positive integer, got {value!r}.")
-        if (
-            isinstance(self.prompt_center_audit_seed, bool)
-            or not isinstance(self.prompt_center_audit_seed, int)
-            or self.prompt_center_audit_seed < 0
-        ):
-            raise ValueError(
-                "step_value.prompt_center_audit_seed must be a non-negative integer, "
-                f"got {self.prompt_center_audit_seed!r}."
-            )
-        if (
-            isinstance(self.similarity_top_k, bool)
-            or not isinstance(self.similarity_top_k, int)
-            or self.similarity_top_k <= 0
-        ):
-            raise ValueError(f"step_value.similarity_top_k must be a positive integer, got {self.similarity_top_k!r}.")
-        if (
-            isinstance(self.similarity_tau, bool)
-            or not isinstance(self.similarity_tau, (int, float))
-            or not math.isfinite(self.similarity_tau)
-            or self.similarity_tau <= 0
-        ):
-            raise ValueError(f"step_value.similarity_tau must be finite and positive, got {self.similarity_tau!r}.")
-        if (
-            not isinstance(self.similarity_position_window, (int, float))
-            or not math.isfinite(self.similarity_position_window)
-            or not 0.0 <= self.similarity_position_window <= 1.0
-        ):
-            raise ValueError(
-                "step_value.similarity_position_window must be finite and in [0, 1], "
-                f"got {self.similarity_position_window!r}."
-            )
-        if (
-            isinstance(self.similarity_iterations, bool)
-            or not isinstance(self.similarity_iterations, int)
-            or self.similarity_iterations <= 0
-        ):
-            raise ValueError(
-                f"step_value.similarity_iterations must be a positive integer, got {self.similarity_iterations!r}."
-            )
-        if self.lookahead_tokens is not None and (
-            not isinstance(self.lookahead_tokens, int)
-            or isinstance(self.lookahead_tokens, bool)
-            or self.lookahead_tokens < 1
-        ):
-            raise ValueError(f"step_value.lookahead_tokens must be an integer >= 1, got {self.lookahead_tokens!r}.")
-        if self.separate_preamble is not None and not isinstance(self.separate_preamble, bool):
-            raise ValueError(f"step_value.separate_preamble must be a bool, got {self.separate_preamble!r}.")
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and in (0, 1].")
 
 
 @dataclass
@@ -858,15 +708,10 @@ class AlgoConfig(BaseConfig):
     Args:
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
-        length_adaptive_gae_alpha (float): Scale in
-            ``lambda_i = 1 - 1 / max(alpha * response_length_i, 1)``.
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
         step_split (StepSplitConfig): Reusable reasoning-step boundary configuration.
-        step_value (StepValueAdvantageConfig): Step-level advantage construction configuration.
-        dapo_reference_kl (DapoReferenceKLConfig): Same-group correct-response KL auxiliary loss.
-        ratio_value_critic (dict[str, Any]): Optimizer and initialization settings for the lightweight
-            prefix-ratio value critic used when GAE is enabled without the standard critic worker.
+        sparse_counterfactual_credit (SparseCounterfactualCreditConfig): Sparse step-credit supervision.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -893,20 +738,11 @@ class AlgoConfig(BaseConfig):
 
     gamma: float = 1.0
     lam: float = 1.0
-    length_adaptive_gae_alpha: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     step_split: StepSplitConfig = field(default_factory=StepSplitConfig)
-    step_value: StepValueAdvantageConfig = field(default_factory=StepValueAdvantageConfig)
-    dapo_reference_kl: DapoReferenceKLConfig = field(default_factory=DapoReferenceKLConfig)
-    ratio_value_critic: dict[str, Any] = field(
-        default_factory=lambda: {
-            "a_init": 1.0,
-            "b_init": 0.0,
-            "lr": 1e-2,
-            "weight_decay": 1e-2,
-            "update_steps": 1,
-        }
+    sparse_counterfactual_credit: SparseCounterfactualCreditConfig = field(
+        default_factory=SparseCounterfactualCreditConfig
     )
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"

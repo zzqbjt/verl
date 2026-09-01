@@ -30,7 +30,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "RouterReplayConfig",
-    "StepValueProbeConfig",
+    "CounterfactualCreditHeadConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
@@ -82,7 +82,7 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
-        tau (float): Temperature divisor for token weights in the my loss.
+        tau (float): Temperature divisor for token weights in weighting-based policy losses such as DGPO.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -94,7 +94,7 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     tau: float = 0.5
     future_kl_start: str = "exclude_current"
-    future_kl_window: int = -1 # -1 indicate no window
+    future_kl_window: int = -1  # -1 indicate no window
     future_kl_average: bool = True
     future_kl_clip_ratio: float = 0.0
     decay_rate: float = 128.0
@@ -106,57 +106,36 @@ class PolicyLossConfig(BaseConfig):
 
 
 @dataclass
-class StepValueProbeConfig(BaseConfig):
-    """Configuration for the lightweight step-end value probe.
-
-    Args:
-        enabled (bool): Whether to compute and train step-end value predictions.
-        hidden_dim (int): Hidden width of the two-layer probe MLP.
-        lr (float): AdamW learning rate for the probe.
-        weight_decay (float): AdamW decoupled weight decay for the probe.
-        warmup_epochs (int): Probe optimization epochs during each warmup update.
-        update_epochs (int): Probe optimization epochs after warmup.
-        warmup_updates (int): Number of policy updates that only train the probe.
-        save_checkpoint (bool): Whether to save the probe and its optimizer state.
-    """
+class CounterfactualCreditHeadConfig(BaseConfig):
+    """Configuration for the detached step-credit regression head."""
 
     enabled: bool = False
-    hidden_dim: int = 256
+    hidden_dim: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
-    warmup_epochs: int = 10
-    update_epochs: int = 1
-    warmup_updates: int = 1
     save_checkpoint: bool = True
 
     def __post_init__(self):
-        """Validate step-value probe hyperparameters."""
         if not isinstance(self.enabled, bool):
-            raise ValueError(f"step_value_probe.enabled must be a bool, got {self.enabled!r}.")
+            raise ValueError("counterfactual_credit_head.enabled must be a bool.")
         if not isinstance(self.hidden_dim, int) or isinstance(self.hidden_dim, bool) or self.hidden_dim < 1:
-            raise ValueError(f"step_value_probe.hidden_dim must be an integer >= 1, got {self.hidden_dim!r}.")
+            raise ValueError("counterfactual_credit_head.hidden_dim must be an integer >= 1.")
         if (
-            not isinstance(self.lr, (int, float))
-            or isinstance(self.lr, bool)
+            isinstance(self.lr, bool)
+            or not isinstance(self.lr, (int, float))
             or not math.isfinite(self.lr)
             or self.lr <= 0
         ):
-            raise ValueError(f"step_value_probe.lr must be finite and > 0, got {self.lr}.")
+            raise ValueError("counterfactual_credit_head.lr must be finite and > 0.")
         if (
-            not isinstance(self.weight_decay, (int, float))
-            or isinstance(self.weight_decay, bool)
+            isinstance(self.weight_decay, bool)
+            or not isinstance(self.weight_decay, (int, float))
             or not math.isfinite(self.weight_decay)
             or self.weight_decay < 0
         ):
-            raise ValueError(f"step_value_probe.weight_decay must be finite and >= 0, got {self.weight_decay}.")
-        if not isinstance(self.warmup_epochs, int) or isinstance(self.warmup_epochs, bool) or self.warmup_epochs < 1:
-            raise ValueError(f"step_value_probe.warmup_epochs must be an integer >= 1, got {self.warmup_epochs!r}.")
-        if not isinstance(self.update_epochs, int) or isinstance(self.update_epochs, bool) or self.update_epochs < 1:
-            raise ValueError(f"step_value_probe.update_epochs must be an integer >= 1, got {self.update_epochs!r}.")
-        if not isinstance(self.warmup_updates, int) or isinstance(self.warmup_updates, bool) or self.warmup_updates < 1:
-            raise ValueError(f"step_value_probe.warmup_updates must be an integer >= 1, got {self.warmup_updates!r}.")
+            raise ValueError("counterfactual_credit_head.weight_decay must be finite and >= 0.")
         if not isinstance(self.save_checkpoint, bool):
-            raise ValueError(f"step_value_probe.save_checkpoint must be a bool, got {self.save_checkpoint!r}.")
+            raise ValueError("counterfactual_credit_head.save_checkpoint must be a bool.")
 
 
 @dataclass
@@ -177,9 +156,9 @@ class ActorConfig(BaseConfig):
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
-        step_value_probe (StepValueProbeConfig): Lightweight step-end value probe configuration.
+        counterfactual_credit_head (CounterfactualCreditHeadConfig): Detached sparse-credit regression head.
         clip_ratio_c (float): Clipping ratio for critic loss.
-        loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
+        loss_agg_mode (str): Loss aggregation mode.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
@@ -220,11 +199,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
-    step_value_probe: StepValueProbeConfig = field(default_factory=StepValueProbeConfig)
-    answer_prefix: str = "Answer: "
-    answer_log_prob_batch_size: int = 16
-    answer_log_prob_use_dynamic_bsz: Optional[bool] = None
-    answer_log_prob_max_token_len_per_gpu: Optional[int] = None
+    counterfactual_credit_head: CounterfactualCreditHeadConfig = field(default_factory=CounterfactualCreditHeadConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
