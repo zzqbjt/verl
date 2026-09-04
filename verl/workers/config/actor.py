@@ -107,12 +107,14 @@ class PolicyLossConfig(BaseConfig):
 
 @dataclass
 class CounterfactualCreditHeadConfig(BaseConfig):
-    """Configuration for the detached step-credit regression head."""
+    """Configuration for the detached boundary-value prediction head."""
 
     enabled: bool = False
     hidden_dim: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
+    difference_loss_weight: float = 0.25
+    optimizer_steps_per_batch: int = 2
     save_checkpoint: bool = True
 
     def __post_init__(self):
@@ -134,6 +136,19 @@ class CounterfactualCreditHeadConfig(BaseConfig):
             or self.weight_decay < 0
         ):
             raise ValueError("counterfactual_credit_head.weight_decay must be finite and >= 0.")
+        if (
+            isinstance(self.difference_loss_weight, bool)
+            or not isinstance(self.difference_loss_weight, (int, float))
+            or not math.isfinite(self.difference_loss_weight)
+            or self.difference_loss_weight < 0
+        ):
+            raise ValueError("counterfactual_credit_head.difference_loss_weight must be finite and >= 0.")
+        if (
+            not isinstance(self.optimizer_steps_per_batch, int)
+            or isinstance(self.optimizer_steps_per_batch, bool)
+            or self.optimizer_steps_per_batch < 1
+        ):
+            raise ValueError("counterfactual_credit_head.optimizer_steps_per_batch must be an integer >= 1.")
         if not isinstance(self.save_checkpoint, bool):
             raise ValueError("counterfactual_credit_head.save_checkpoint must be a bool.")
 
@@ -156,7 +171,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
-        counterfactual_credit_head (CounterfactualCreditHeadConfig): Detached sparse-credit regression head.
+        counterfactual_credit_head (CounterfactualCreditHeadConfig): Detached boundary-value prediction head.
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.

@@ -19,6 +19,7 @@ from typing import Any, Optional
 from verl.base_config import BaseConfig
 
 __all__ = [
+    "AdaptiveTopupConfig",
     "AlgoConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
@@ -48,6 +49,33 @@ class KLControlConfig(BaseConfig):
 
 
 @dataclass
+class AdaptiveTopupConfig(BaseConfig):
+    """Adaptive extra rollouts for homogeneous dynamic-sampling groups.
+
+    Only prompt groups whose initial samples have zero metric variance are
+    extended.  Extra samples are discarded after a fixed-size mixed group is
+    reconstructed for training.
+    """
+
+    enabled: bool = False
+    max_total_n: int = 0
+    chunk_size: int = 4
+    selection_seed: int = 42
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError("filter_groups.adaptive_topup.enabled must be a bool.")
+        if not isinstance(self.max_total_n, int) or isinstance(self.max_total_n, bool) or self.max_total_n < 0:
+            raise ValueError("filter_groups.adaptive_topup.max_total_n must be an integer >= 0.")
+        if not isinstance(self.chunk_size, int) or isinstance(self.chunk_size, bool) or self.chunk_size < 1:
+            raise ValueError("filter_groups.adaptive_topup.chunk_size must be an integer >= 1.")
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("filter_groups.adaptive_topup.selection_seed must be an integer.")
+        if self.enabled and self.max_total_n < 2:
+            raise ValueError("filter_groups.adaptive_topup.max_total_n must be >= 2 when enabled.")
+
+
+@dataclass
 class FilterGroupsConfig(BaseConfig):
     """Configuration for filter groups (used in DAPO and Entropy).
 
@@ -57,11 +85,15 @@ class FilterGroupsConfig(BaseConfig):
         enable (bool): Whether to enable filter groups.
         metric (Optional[str]): Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
         max_num_gen_batches (int): Non-positive values mean no upper limit.
+        fill_shortfall (bool): Fill a short batch with filtered-out prompt groups instead of generating another batch.
+        adaptive_topup (AdaptiveTopupConfig): Extra sampling for initially homogeneous groups.
     """
 
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+    fill_shortfall: bool = False
+    adaptive_topup: AdaptiveTopupConfig = field(default_factory=AdaptiveTopupConfig)
 
 
 @dataclass
@@ -74,25 +106,32 @@ class StepSplitConfig(BaseConfig):
 
     Args:
         enabled (bool): Attach ``step_end_mask`` to rollout batches.
-        lookahead_tokens (int): Tokens inspected after a delimiter for a numeric step marker.
-        separate_preamble (bool): Whether text before an explicit Step 1 marker is a separate step.
+        min_step_tokens (int): Ordinary fragments shorter than this are merged.
+        max_step_tokens (int): Longer fragments are split at a safe text boundary.
     """
 
     enabled: bool = False
-    lookahead_tokens: int = 10
-    separate_preamble: bool = False
+    min_step_tokens: int = 96
+    max_step_tokens: int = 512
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
             raise ValueError(f"step_split.enabled must be a bool, got {self.enabled!r}.")
         if (
-            not isinstance(self.lookahead_tokens, int)
-            or isinstance(self.lookahead_tokens, bool)
-            or self.lookahead_tokens < 1
+            not isinstance(self.min_step_tokens, int)
+            or isinstance(self.min_step_tokens, bool)
+            or self.min_step_tokens < 1
         ):
-            raise ValueError(f"step_split.lookahead_tokens must be an integer >= 1, got {self.lookahead_tokens!r}.")
-        if not isinstance(self.separate_preamble, bool):
-            raise ValueError(f"step_split.separate_preamble must be a bool, got {self.separate_preamble!r}.")
+            raise ValueError(f"step_split.min_step_tokens must be an integer >= 1, got {self.min_step_tokens!r}.")
+        if (
+            not isinstance(self.max_step_tokens, int)
+            or isinstance(self.max_step_tokens, bool)
+            or self.max_step_tokens < self.min_step_tokens
+        ):
+            raise ValueError(
+                "step_split.max_step_tokens must be an integer >= min_step_tokens "
+                f"({self.min_step_tokens}), got {self.max_step_tokens!r}."
+            )
 
 
 @dataclass
@@ -100,8 +139,9 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     """Sparse Monte-Carlo supervision for step-level policy credit.
 
     Entropy is used only to choose a small number of step anchors. Each
-    selected anchor receives a signed ``Q - V`` target from fresh suffix
-    rollouts; a detached actor-side head predicts the unobserved steps.
+    selected anchor receives Q/V value targets from fresh suffix rollouts; a
+    detached actor-side value head predicts unobserved boundaries and adjacent
+    value differences provide step credit.
     """
 
     enabled: bool = False
@@ -111,10 +151,12 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     uniform_mix: float = 0.1
     num_q_samples: int = 1
     num_v_samples: int = 2
+    train_mc_branches: bool = False
+    branch_groups_per_prompt: int = 2
     correctness_key: str = "acc"
-    huber_delta: float = 1.0
-    use_inverse_propensity: bool = True
-    inverse_propensity_clip: float = 5.0
+    mc_value_loss_weight: float = 0.6
+    start_value_loss_weight: float = 0.2
+    terminal_value_loss_weight: float = 0.2
     advantage_coef: float = 0.3
     warmup_ratio: float = 0.1
     normalize_batch_std: bool = True
@@ -142,12 +184,20 @@ class SparseCounterfactualCreditConfig(BaseConfig):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"sparse_counterfactual_credit.{name} must be an integer >= 1.")
+        if not isinstance(self.train_mc_branches, bool):
+            raise ValueError("sparse_counterfactual_credit.train_mc_branches must be a bool.")
+        if (
+            not isinstance(self.branch_groups_per_prompt, int)
+            or isinstance(self.branch_groups_per_prompt, bool)
+            or self.branch_groups_per_prompt < 1
+        ):
+            raise ValueError("sparse_counterfactual_credit.branch_groups_per_prompt must be an integer >= 1.")
         if not isinstance(self.correctness_key, str) or not self.correctness_key.strip():
             raise ValueError("sparse_counterfactual_credit.correctness_key must be a non-empty string.")
-        self._validate_positive("huber_delta", self.huber_delta)
-        if not isinstance(self.use_inverse_propensity, bool):
-            raise ValueError("sparse_counterfactual_credit.use_inverse_propensity must be a bool.")
-        self._validate_positive("inverse_propensity_clip", self.inverse_propensity_clip)
+        for name in ("mc_value_loss_weight", "start_value_loss_weight", "terminal_value_loss_weight"):
+            self._validate_closed_unit(name, getattr(self, name))
+        if self.mc_value_loss_weight + self.start_value_loss_weight + self.terminal_value_loss_weight <= 0:
+            raise ValueError("sparse_counterfactual_credit value-loss weights may not all be zero.")
         self._validate_closed_unit("advantage_coef", self.advantage_coef)
         self._validate_closed_unit("warmup_ratio", self.warmup_ratio)
         if not isinstance(self.normalize_batch_std, bool):

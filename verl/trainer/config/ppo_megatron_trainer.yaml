@@ -130,11 +130,11 @@ algorithm:
     # Whether to attach step_end_mask to rollout batches
     enabled: false
 
-    # Tokens inspected after a delimiter for an explicit numeric step marker
-    lookahead_tokens: 10
+    # Merge ordinary fragments shorter than this many response tokens
+    min_step_tokens: 96
 
-    # Whether text before an explicit Step 1 marker is a separate step
-    separate_preamble: false
+    # Split longer fragments at the nearest safe sentence or line boundary
+    max_step_tokens: 512
 
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence

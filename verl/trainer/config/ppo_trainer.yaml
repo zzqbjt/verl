@@ -86,11 +86,11 @@ algorithm:
     # Whether to attach step_end_mask to rollout batches
     enabled: false
 
-    # Tokens inspected after a delimiter for an explicit numeric step marker
-    lookahead_tokens: 10
+    # Merge ordinary fragments shorter than this many response tokens
+    min_step_tokens: 96
 
-    # Whether text before an explicit Step 1 marker is a separate step
-    separate_preamble: false
+    # Split longer fragments at the nearest safe sentence or line boundary
+    max_step_tokens: 512
 
   # Entropy-sampled Monte-Carlo step credit with a detached actor-side regression head
   sparse_counterfactual_credit:
@@ -104,7 +104,7 @@ algorithm:
     # Fraction of the highest-entropy tokens averaged within each semantic step
     entropy_top_ratio: 0.2
 
-    # Number of step anchors sampled without replacement per uid group
+    # Number of anchors sampled sequentially from distinct responses per uid group
     anchors_per_group: 2
 
     # Temperature of the step-entropy sampling softmax
@@ -119,17 +119,19 @@ algorithm:
     # Fresh prefix-before-step continuations per anchor
     num_v_samples: 2
 
+    # Whether selected Q/V suffix groups also participate in the policy update
+    train_mc_branches: false
+
+    # Number of prefix groups inserted per prompt when MC-branch training is enabled
+    branch_groups_per_prompt: 2
+
     # Raw verifier output used for Q and V targets
     correctness_key: acc
 
-    # Delta of the credit head's Huber regression loss
-    huber_delta: 1.0
-
-    # Whether to weight anchor losses by the inverse entropy-mixture probability
-    use_inverse_propensity: true
-
-    # Maximum inverse-propensity weight
-    inverse_propensity_clip: 5.0
+    # Relative BCE weights for MC-anchor, start-boundary, and terminal-boundary values
+    mc_value_loss_weight: 0.6
+    start_value_loss_weight: 0.2
+    terminal_value_loss_weight: 0.2
 
     # Maximum coefficient of the centered credit residual
     advantage_coef: 0.3
@@ -158,7 +160,7 @@ algorithm:
     # Repetition penalty for fresh Q and V suffixes
     repetition_penalty: 1.0
 
-    # Optional hard cap for fresh suffixes; null uses data.max_response_length minus response-prefix tokens
+    # Optional stricter cap; null reserves reward.reward_kwargs.overlong_buffer_cfg.len below max response length
     max_new_tokens: null
 
   # Whether to enable in-reward KL penalty

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from verl.trainer.ppo.sparse_counterfactual_credit import (
     build_credit_residual,
-    compute_anchor_probabilities,
     compute_monte_carlo_credit,
     compute_step_uncertainty,
     credit_advantage_coefficient,
@@ -72,42 +72,48 @@ def test_top_entropy_uncertainty_uses_ceil_twenty_percent_within_each_step():
     torch.testing.assert_close(uncertainty, expected)
 
 
-def test_group_sampling_distribution_and_without_replacement_are_deterministic():
+def test_group_sampling_is_deterministic_and_uses_distinct_responses():
     step_end_mask, _ = _step_masks()
     uncertainty = torch.zeros(3, 6)
     uncertainty[step_end_mask] = torch.tensor([0.0, 1.0, 2.0, 0.5, 1.5])
-    uids = ["question-a", "question-a", "question-b"]
+    uids = ["question-a", "question-a", "question-a"]
 
-    probabilities = compute_anchor_probabilities(
+    first = sample_anchor_steps(
         uncertainty,
         step_end_mask,
         uids,
         temperature=1.0,
         uniform_mix=0.1,
-    )
-
-    torch.testing.assert_close(probabilities[:2].sum(), torch.tensor(1.0))
-    torch.testing.assert_close(probabilities[2].sum(), torch.tensor(1.0))
-    assert torch.all(probabilities[step_end_mask] > 0)
-    first = sample_anchor_steps(
-        probabilities,
-        step_end_mask,
-        uids,
         anchors_per_group=2,
         seed=7,
         global_step=3,
     )
     second = sample_anchor_steps(
-        probabilities,
+        uncertainty,
         step_end_mask,
         uids,
+        temperature=1.0,
+        uniform_mix=0.1,
         anchors_per_group=2,
         seed=7,
         global_step=3,
     )
     assert torch.equal(first, second)
-    assert int(first[:2].sum()) == 2
-    assert int(first[2].sum()) == 2
+    assert int(first.sum()) == 2
+    assert torch.all(first.sum(dim=-1) <= 1)
+
+
+def test_group_sampling_rejects_more_anchors_than_responses():
+    step_end_mask, _ = _step_masks()
+    uncertainty = step_end_mask.float()
+
+    with pytest.raises(ValueError, match="responses with step endpoints"):
+        sample_anchor_steps(
+            uncertainty,
+            step_end_mask,
+            ["question-a"] * 3,
+            anchors_per_group=4,
+        )
 
 
 def test_monte_carlo_anchor_override_and_policy_token_broadcast():

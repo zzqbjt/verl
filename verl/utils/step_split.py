@@ -11,49 +11,104 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token-aligned reasoning-step splitting utilities."""
+"""Token-aligned, structure-aware reasoning-step splitting utilities."""
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-# A numeric index is intentional: phrases such as "solve step by step" are not
-# explicit step markers.
+# Named markers are accepted at the beginning of a line. Ordinary numbered
+# markers are deliberately weaker: they upgrade an existing paragraph break
+# but do not split every equation/list item introduced by a single newline.
 STEP_MARKER_RE = re.compile(
     r"""
-    \A[ \t\r\n]*                # marker must begin the next visible block
-    (?:\#{1,6}\s*)?             # optional Markdown heading
-    (?:\*{1,2}\s*)?             # optional opening emphasis
+    \A[ \t]*
+    (?:\#{1,6}[ \t]*)?
+    (?:\*{1,2}[ \t]*)?
     (?:step|步骤)
-    \s*(?:\*{1,2}\s*)?          # also accept: Step **1**
-    (?:[\#：:\-]\s*)?
-    (?P<number>\d+)
+    [ \t]*(?:\*{1,2}[ \t]*)?
+    (?:[\#：:\-][ \t]*)?
+    (?P<number>\d+|[一二三四五六七八九十百]+)
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+CASE_MARKER_RE = re.compile(
+    r"""
+    \A[ \t]*
+    (?:\#{1,6}[ \t]*)?
+    (?:\*{1,2}[ \t]*)?
+    (?:case|情况)
+    [ \t]*(?:\*{1,2}[ \t]*)?
+    (?:[\#：:\-][ \t]*)?
+    (?:\d+|[一二三四五六七八九十百]+)
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+FINAL_ANSWER_RE = re.compile(
+    r"""
+    \A[ \t]*
+    (?:\#{1,6}[ \t]*)?
+    (?:\*{1,2}[ \t]*)?
+    (?:final[ \t]+(?:answer|result)|最终答案|答案|结论)
+    (?:\*{1,2})?[ \t]*(?:[：:]|\Z)
     """,
     flags=re.IGNORECASE | re.VERBOSE,
 )
 
 ORDINARY_NUMBER_MARKER_RE = re.compile(
     r"""
-    \A[ \t\r\n]*                # marker must begin the next visible block
-    (?:\#{1,6}[ \t]*)?          # optional Markdown heading
-    (?:\*{1,2}[ \t]*)?          # optional opening emphasis
-    (?:[(（][ \t]*)?             # optional opening parenthesis
+    \A[ \t]*
+    (?:\#{1,6}[ \t]*)?
+    (?:\*{1,2}[ \t]*)?
+    (?:[(（][ \t]*)?
     (?:
-        (?P<arabic>[1-9]\d*)[ \t]*(?:[)）]|[.．](?!\d)|、)
+        [1-9]\d*[ \t]*(?:[)）]|[.．](?!\d)|、)
         |
-        (?P<latin>[A-Z])[.．]
+        [A-Z][.．]
         |
-        (?P<chinese>[一二三四五六七八九十百]+)、
+        [一二三四五六七八九十百]+、
     )
     """,
     flags=re.VERBOSE,
 )
 
+_PARAGRAPH_BREAK_RE = re.compile(r"(?:\r?\n[ \t]*){2,}")
+_LINE_START_RE = re.compile(r"(?m)^")
+_SENTENCE_END_RE = re.compile(r"[.!?;。！？；](?:[\"'”’）)\]}】]*)(?=[ \t\r\n]|$)")
+_SINGLE_NEWLINE_RE = re.compile(r"\r?\n[ \t]*")
+_MATH_BLOCK_START_RE = re.compile(r"\A(?:\$\$|\\\[|\\begin\{)")
+
+_BOUNDARY_PRIORITY = {
+    "line_fallback": 1,
+    "sentence_fallback": 2,
+    "paragraph": 3,
+    "explicit": 4,
+    "final_answer": 5,
+    "forced": 0,
+}
+
 _SINGLE_TOKEN_TEXT_CACHE: dict[int, tuple[Any, dict[int, str]]] = {}
+
+
+@dataclass(frozen=True)
+class StepSpan:
+    """One half-open token span and the reason its right boundary was chosen."""
+
+    start: int
+    end: int
+    end_boundary_type: str
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
 
 
 def _normalize_eos_token_ids(tokenizer: Any) -> set[int]:
@@ -76,16 +131,13 @@ def _decode(tokenizer: Any, input_ids: list[int], *, response_index: int) -> str
     return text
 
 
-def _delimiter_token_ids(
-    tokenizer: Any,
-    token_ids: set[int],
-    *,
-    delimiter: str,
-) -> set[int]:
-    """Find original action tokens whose own decoded text contains a delimiter.
+def _decode_token_pieces(tokenizer: Any, input_ids: list[int]) -> list[str]:
+    """Decode original actions individually so every text boundary maps to them.
 
-    The cache avoids a tokenizer call for every occurrence of a common token
-    in long batches.
+    Structural characters used by this splitter (newlines, ASCII markers and
+    punctuation) have stable single-token decodings in the supported text
+    tokenizers. Keeping the original pieces also avoids the incorrect but
+    tempting decode-then-retokenize round trip.
     """
 
     tokenizer_key = id(tokenizer)
@@ -96,138 +148,287 @@ def _delimiter_token_ids(
     else:
         token_text_cache = cache_entry[1]
 
-    delimiter_ids = set()
-    for token_id in token_ids:
+    pieces = []
+    for token_id in input_ids:
         if token_id not in token_text_cache:
             token_text_cache[token_id] = _decode(tokenizer, [token_id], response_index=-1)
-        if delimiter in token_text_cache[token_id]:
-            delimiter_ids.add(token_id)
-    return delimiter_ids
+        pieces.append(token_text_cache[token_id])
 
-
-def _step_end_indices(
-    tokenizer: Any,
-    input_ids: list[int],
-    delimiter_token_ids: set[int],
-    *,
-    lookahead_tokens: int,
-    separate_preamble: bool,
-    response_index: int,
-) -> list[int]:
-    detected_splits: list[tuple[int, int]] = []
-    for token_index, token_id in enumerate(input_ids):
-        if token_id not in delimiter_token_ids or token_index + 1 >= len(input_ids):
+    # Byte-level tokenizers can split one UTF-8 character across actions. A
+    # single-token decode then contains a temporary replacement character even
+    # though decoding the short run is lossless. Assign the resolved text to
+    # the final token in that run; empty preceding pieces retain every original
+    # token boundary without inventing a retokenized sequence.
+    token_index = 0
+    while token_index < len(pieces):
+        if "\ufffd" not in pieces[token_index]:
+            token_index += 1
             continue
+        resolved_end = None
+        resolved_text = None
+        for token_end in range(token_index + 2, min(len(input_ids), token_index + 8) + 1):
+            candidate_text = _decode(tokenizer, input_ids[token_index:token_end], response_index=-1)
+            if "\ufffd" not in candidate_text:
+                resolved_end = token_end
+                resolved_text = candidate_text
+                break
+        if resolved_end is None:
+            token_index += 1
+            continue
+        pieces[token_index:resolved_end] = [""] * (resolved_end - token_index - 1) + [resolved_text]
+        token_index = resolved_end
+    return pieces
 
-        lookahead_end = min(len(input_ids), token_index + 1 + lookahead_tokens)
-        following_text = _decode(
-            tokenizer,
-            input_ids[token_index + 1 : lookahead_end],
-            response_index=response_index,
-        )
-        explicit_match = STEP_MARKER_RE.match(following_text)
-        ordinary_match = ORDINARY_NUMBER_MARKER_RE.match(following_text)
-        marker_candidates = []
-        if explicit_match is not None:
-            marker_candidates.append((explicit_match.start(), int(explicit_match.group("number"))))
-        if ordinary_match is not None:
-            ordinary_groups = ordinary_match.groupdict()
-            if ordinary_groups["arabic"] is not None:
-                ordinary_number = int(ordinary_groups["arabic"])
-            elif ordinary_groups["latin"] is not None:
-                ordinary_number = ord(ordinary_groups["latin"]) - ord("A") + 1
-            else:
-                ordinary_number = 1 if ordinary_groups["chinese"] == "一" else 2
-            marker_candidates.append((ordinary_match.start(), ordinary_number))
 
-        if marker_candidates:
-            _, marker_number = min(marker_candidates, key=lambda candidate: candidate[0])
-            # Split after the double-newline token, so punctuation and the
-            # delimiter stay in the preceding step.
-            detected_splits.append((token_index + 1, marker_number))
+def _protected_ranges(text: str) -> list[tuple[int, int]]:
+    """Return code and LaTeX ranges whose interiors must not be split."""
 
-    # More than one whitespace delimiter can see the same marker inside the
-    # lookahead window.  Keep the delimiter closest to that marker instead of
-    # creating an artificial whitespace-only step between the candidates.
-    collapsed_splits: list[tuple[int, int]] = []
-    for position, marker_number in detected_splits:
-        if collapsed_splits:
-            previous_position = collapsed_splits[-1][0]
-            between_text = _decode(
-                tokenizer,
-                input_ids[previous_position:position],
-                response_index=response_index,
-            )
-            if not between_text.strip():
-                collapsed_splits[-1] = (position, marker_number)
+    patterns = (
+        re.compile(r"(?P<fence>`{3,}|~{3,})[^\n]*(?:\n|\Z).*?(?:(?P=fence)|\Z)", re.DOTALL),
+        re.compile(r"\$\$.*?(?:\$\$|\Z)", re.DOTALL),
+        re.compile(r"\\\[.*?(?:\\\]|\Z)", re.DOTALL),
+        re.compile(
+            r"\\begin\{(?P<env>aligned\*?|align\*?|equation\*?|gathered|gather\*?|cases|"
+            r"[bBpvV]?matrix)\}.*?\\end\{(?P=env)\}",
+            re.DOTALL,
+        ),
+    )
+    ranges = sorted((match.start(), match.end()) for pattern in patterns for match in pattern.finditer(text))
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _inside_protected_range(position: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start < position < end for start, end in ranges)
+
+
+def _snap_to_token_boundary(character_position: int, token_character_ends: list[int]) -> int:
+    """Map a text position to the nearest boundary between original tokens."""
+
+    right = bisect.bisect_left(token_character_ends, character_position)
+    if right <= 0:
+        return 0
+    if right >= len(token_character_ends):
+        return len(token_character_ends) - 1
+    left_distance = character_position - token_character_ends[right - 1]
+    right_distance = token_character_ends[right] - character_position
+    return right - 1 if left_distance < right_distance else right
+
+
+def _block_marker_type(text: str, *, allow_ordinary: bool) -> str | None:
+    if FINAL_ANSWER_RE.match(text) is not None:
+        return "final_answer"
+    if STEP_MARKER_RE.match(text) is not None or CASE_MARKER_RE.match(text) is not None:
+        return "explicit"
+    if allow_ordinary and ORDINARY_NUMBER_MARKER_RE.match(text) is not None:
+        return "explicit"
+    return None
+
+
+def _is_marker_only_heading(line: str) -> bool:
+    """Whether a line is a heading that should stay with its following body."""
+
+    stripped = line.strip()
+    if _block_marker_type(stripped, allow_ordinary=True) is None:
+        return False
+    return stripped.startswith("#") or (stripped.startswith("**") and stripped.endswith("**"))
+
+
+def _add_candidate(candidates: dict[int, str], position: int, kind: str, *, num_tokens: int) -> None:
+    if position <= 0 or position >= num_tokens:
+        return
+    previous = candidates.get(position)
+    if previous is None or _BOUNDARY_PRIORITY[kind] > _BOUNDARY_PRIORITY[previous]:
+        candidates[position] = kind
+
+
+def _candidate_boundaries(
+    text: str,
+    token_character_ends: list[int],
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Collect structural boundaries and weak fallbacks at token positions."""
+
+    num_tokens = len(token_character_ends) - 1
+    protected = _protected_ranges(text)
+    structural: dict[int, str] = {}
+    fallback: dict[int, str] = {}
+
+    for match in _PARAGRAPH_BREAK_RE.finditer(text):
+        character_position = match.end()
+        if _inside_protected_range(character_position, protected):
+            continue
+        previous_line_start = text.rfind("\n", 0, match.start()) + 1
+        if _is_marker_only_heading(text[previous_line_start : match.start()]):
+            continue
+        right_text = text[character_position : character_position + 256]
+        # A displayed equation normally belongs to its preceding explanation;
+        # the paragraph break after the equation remains available.
+        if _MATH_BLOCK_START_RE.match(right_text.lstrip(" \t")) is not None:
+            continue
+        kind = _block_marker_type(right_text, allow_ordinary=True) or "paragraph"
+        token_position = _snap_to_token_boundary(character_position, token_character_ends)
+        _add_candidate(structural, token_position, kind, num_tokens=num_tokens)
+
+    # Named steps/cases/final answers remain explicit with only a single line
+    # break. Ordinary numbered lists require a paragraph break to avoid turning
+    # every formula list into reasoning steps.
+    for match in _LINE_START_RE.finditer(text):
+        character_position = match.start()
+        if character_position == 0 or _inside_protected_range(character_position, protected):
+            continue
+        kind = _block_marker_type(text[character_position : character_position + 256], allow_ordinary=False)
+        if kind is None:
+            continue
+        token_position = _snap_to_token_boundary(character_position, token_character_ends)
+        _add_candidate(structural, token_position, kind, num_tokens=num_tokens)
+
+    # A completion has only one semantic transition into its final answer.
+    # Degenerate generations sometimes repeat the same final-answer line until
+    # truncation; treating every repetition as an exempt short explicit step
+    # would let one response contribute hundreds of meaningless candidates.
+    final_answer_positions = sorted(position for position, kind in structural.items() if kind == "final_answer")
+    for position in final_answer_positions[1:]:
+        structural[position] = "paragraph"
+
+    for match in _SENTENCE_END_RE.finditer(text):
+        character_position = match.end()
+        if _inside_protected_range(character_position, protected):
+            continue
+        token_position = _snap_to_token_boundary(character_position, token_character_ends)
+        _add_candidate(fallback, token_position, "sentence_fallback", num_tokens=num_tokens)
+
+    for match in _SINGLE_NEWLINE_RE.finditer(text):
+        character_position = match.end()
+        if _inside_protected_range(character_position, protected):
+            continue
+        token_position = _snap_to_token_boundary(character_position, token_character_ends)
+        _add_candidate(fallback, token_position, "line_fallback", num_tokens=num_tokens)
+
+    return structural, fallback
+
+
+def _merge_short_steps(candidates: dict[int, str], *, num_tokens: int, min_step_tokens: int) -> dict[int, str]:
+    """Merge ordinary short fragments while preserving explicit short steps."""
+
+    selected = dict(candidates)
+    while selected:
+        positions = [0, *sorted(selected), num_tokens]
+        removed = False
+        for span_index, (start, end) in enumerate(zip(positions, positions[1:], strict=False)):
+            if end - start >= min_step_tokens:
                 continue
-        collapsed_splits.append((position, marker_number))
+            start_kind = selected.get(start)
+            if start_kind in {"explicit", "final_answer"}:
+                continue
+            if span_index == 0:
+                # Merge a short introductory fragment into the first real step.
+                selected.pop(end, None)
+            else:
+                # An ordinary short paragraph is a continuation of its left step.
+                selected.pop(start, None)
+            removed = True
+            break
+        if not removed:
+            break
+    return selected
 
-    # A response may begin with blank lines before its first visible marker.
-    # Do not materialize those leading blanks as a standalone reasoning step.
-    if collapsed_splits:
-        leading_text = _decode(
-            tokenizer,
-            input_ids[: collapsed_splits[0][0]],
-            response_index=response_index,
+
+def _split_long_steps(
+    candidates: dict[int, str],
+    fallback_candidates: dict[int, str],
+    *,
+    num_tokens: int,
+    min_step_tokens: int,
+    max_step_tokens: int,
+) -> dict[int, str]:
+    """Bound long spans at the latest safe sentence/newline before the limit."""
+
+    selected = dict(candidates)
+    original_positions = [0, *sorted(selected), num_tokens]
+    safe_positions = sorted(set(fallback_candidates) | set(candidates))
+
+    for original_start, original_end in zip(original_positions, original_positions[1:], strict=False):
+        start = original_start
+        while original_end - start > max_step_tokens:
+            upper = min(start + max_step_tokens, original_end - min_step_tokens)
+            lower = start + min_step_tokens
+            safe_index = bisect.bisect_right(safe_positions, upper) - 1
+            if safe_index >= 0 and safe_positions[safe_index] >= lower:
+                split_position = safe_positions[safe_index]
+                kind = candidates.get(split_position, fallback_candidates.get(split_position, "sentence_fallback"))
+            else:
+                split_position = upper
+                kind = "forced"
+            _add_candidate(selected, split_position, kind, num_tokens=num_tokens)
+            start = split_position
+
+    return selected
+
+
+def split_token_ids(
+    tokenizer: Any,
+    input_ids: Sequence[int],
+    *,
+    min_step_tokens: int = 96,
+    max_step_tokens: int = 512,
+) -> list[StepSpan]:
+    """Split one nonempty original token sequence into half-open step spans.
+
+    Paragraphs and explicit step markers provide normal boundaries. Short
+    ordinary fragments are merged, while long spans fall back to sentence or
+    line endings and finally to a hard token boundary.
+    """
+
+    if not isinstance(min_step_tokens, int) or isinstance(min_step_tokens, bool) or min_step_tokens < 1:
+        raise ValueError(f"min_step_tokens must be an integer >= 1, got {min_step_tokens!r}")
+    if not isinstance(max_step_tokens, int) or isinstance(max_step_tokens, bool) or max_step_tokens < min_step_tokens:
+        raise ValueError(
+            f"max_step_tokens must be an integer >= min_step_tokens ({min_step_tokens}), got {max_step_tokens!r}"
         )
-        if not leading_text.strip():
-            collapsed_splits = collapsed_splits[1:]
 
-    split_positions = [position for position, _ in collapsed_splits]
-    if not separate_preamble and collapsed_splits and collapsed_splits[0][1] == 1:
-        # Merge introductory text into Step 1 instead of creating Step 0.
-        split_positions = split_positions[1:]
+    ids = [int(token_id) for token_id in input_ids]
+    if not ids:
+        raise ValueError("input_ids must contain at least one token")
 
-    split_positions = sorted(set(split_positions))
-    span_starts = [0, *split_positions]
-    span_ends = [*split_positions, len(input_ids)]
-    step_end_indices = []
-    for token_start, token_end in zip(span_starts, span_ends, strict=True):
-        if token_start >= token_end:
-            raise RuntimeError("Step splitter created an empty token span")
-        step_text = _decode(
-            tokenizer,
-            input_ids[token_start:token_end],
-            response_index=response_index,
-        )
-        if not step_text.strip():
-            if len(span_starts) == 1:
-                # A non-EOS response consisting only of whitespace is still a
-                # valid sampled action sequence. Treat it as one step.
-                return [len(input_ids) - 1]
-            raise RuntimeError(f"Response {response_index}: step splitter created an empty text step")
-        step_end_indices.append(token_end - 1)
-    return step_end_indices
+    pieces = _decode_token_pieces(tokenizer, ids)
+    token_character_ends = [0]
+    for piece in pieces:
+        token_character_ends.append(token_character_ends[-1] + len(piece))
+    text = "".join(pieces)
+
+    structural, fallback = _candidate_boundaries(text, token_character_ends)
+    selected = _merge_short_steps(structural, num_tokens=len(ids), min_step_tokens=min_step_tokens)
+    selected = _split_long_steps(
+        selected,
+        fallback,
+        num_tokens=len(ids),
+        min_step_tokens=min_step_tokens,
+        max_step_tokens=max_step_tokens,
+    )
+
+    positions = [0, *sorted(selected), len(ids)]
+    spans = [
+        StepSpan(start=start, end=end, end_boundary_type=selected.get(end, "response_end"))
+        for start, end in zip(positions, positions[1:], strict=False)
+    ]
+    if any(span.length <= 0 for span in spans):
+        raise RuntimeError("Step splitter created an empty token span")
+    return spans
 
 
 def build_step_end_mask(
     tokenizer: Any,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
-    lookahead_tokens: int = 10,
-    separate_preamble: bool = False,
+    min_step_tokens: int = 96,
+    max_step_tokens: int = 512,
 ) -> torch.Tensor:
-    """Return a boolean mask selecting the last token of every reasoning step.
-
-    Active response tokens are selected by ``response_mask``. Trailing EOS
-    tokens are removed first. Boundaries are then detected directly on the
-    original generated token IDs. This matters because sampled BPE token
-    sequences are not necessarily
-    the canonical tokenization produced by encoding their decoded text.
-
-    A delimiter is accepted only when one original token's decoded text
-    contains a literal double newline and the following block begins with
-    either a numeric ``Step``/``步骤`` marker or an ordinary numbered marker.
-    Leading whitespace and Markdown heading/emphasis syntax are allowed, but
-    non-whitespace blocks such as a Markdown horizontal rule are not skipped.
-    Thus, when ``---`` separates two steps, only the delimiter after that rule
-    and immediately before the next marker can become a boundary. The marker
-    must be fully recognizable within ``lookahead_tokens``; markers appearing
-    later in prose are not searched for. The delimiter belongs to the preceding
-    step. The last non-EOS response token always ends the final step. If a valid
-    completion immediately emits EOS, that EOS action is its sole step endpoint.
-    """
+    """Return a boolean mask selecting the final original token of every step."""
 
     if not isinstance(responses, torch.Tensor) or not isinstance(response_mask, torch.Tensor):
         raise TypeError("responses and response_mask must be torch.Tensor instances")
@@ -238,20 +439,11 @@ def build_step_end_mask(
             f"responses and response_mask must have the same shape, got "
             f"{tuple(responses.shape)} and {tuple(response_mask.shape)}"
         )
-    if lookahead_tokens <= 0:
-        raise ValueError(f"lookahead_tokens must be positive, got {lookahead_tokens}")
 
     eos_token_ids = _normalize_eos_token_ids(tokenizer)
     responses_cpu = responses.detach().cpu()
     active_mask = response_mask.detach().to(device="cpu", dtype=torch.bool)
-    step_end_mask = torch.zeros_like(responses, dtype=torch.bool)
-    unique_active_token_ids = torch.unique(responses_cpu[active_mask]).tolist()
-    active_token_ids = {int(token_id) for token_id in unique_active_token_ids if int(token_id) not in eos_token_ids}
-    delimiter_token_ids = _delimiter_token_ids(
-        tokenizer,
-        active_token_ids,
-        delimiter="\n\n",
-    )
+    step_end_mask_cpu = torch.zeros_like(responses_cpu, dtype=torch.bool)
 
     for response_index in range(responses.shape[0]):
         active_positions = torch.nonzero(active_mask[response_index], as_tuple=False).flatten().tolist()
@@ -264,32 +456,24 @@ def build_step_end_mask(
             input_ids.pop()
             active_positions.pop()
         if not input_ids:
-            # Immediate EOS is a valid empty completion.  It has no text token
-            # to serve as a step tail, so use the active terminal action itself
-            # as the sole endpoint instead of dropping the response.
-            step_end_mask[response_index, first_active_position] = True
+            # Immediate EOS is a valid empty completion and remains one action.
+            step_end_mask_cpu[response_index, first_active_position] = True
             continue
 
-        for step_end_index in _step_end_indices(
+        spans = split_token_ids(
             tokenizer,
             input_ids,
-            delimiter_token_ids,
-            lookahead_tokens=lookahead_tokens,
-            separate_preamble=separate_preamble,
-            response_index=response_index,
-        ):
-            step_end_mask[response_index, active_positions[step_end_index]] = True
+            min_step_tokens=min_step_tokens,
+            max_step_tokens=max_step_tokens,
+        )
+        for span in spans:
+            step_end_mask_cpu[response_index, active_positions[span.end - 1]] = True
 
-    return step_end_mask
+    return step_end_mask_cpu.to(device=responses.device)
 
 
 def build_step_start_mask(step_end_mask: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-    """Derive one first-token marker for every shared step endpoint.
-
-    This function does not detect or alter boundaries. It converts the exact
-    partition represented by ``step_end_mask`` into the corresponding starts,
-    so providers that need a full step span reuse the same split result.
-    """
+    """Derive one first-token marker for every shared step endpoint."""
 
     if not isinstance(step_end_mask, torch.Tensor) or not isinstance(response_mask, torch.Tensor):
         raise TypeError("step_end_mask and response_mask must be torch.Tensor instances")
@@ -332,8 +516,12 @@ def build_step_start_mask(step_end_mask: torch.Tensor, response_mask: torch.Tens
 
 
 __all__ = [
+    "CASE_MARKER_RE",
+    "FINAL_ANSWER_RE",
     "ORDINARY_NUMBER_MARKER_RE",
     "STEP_MARKER_RE",
+    "StepSpan",
     "build_step_end_mask",
     "build_step_start_mask",
+    "split_token_ids",
 ]

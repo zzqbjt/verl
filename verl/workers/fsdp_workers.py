@@ -1163,7 +1163,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="purple", role="actor_counterfactual_credit")
     def update_counterfactual_credit(self, data: DataProto):
-        """Fit the replicated detached credit head and return dense step predictions."""
+        """Fit the replicated detached value head and return dense step-credit predictions."""
 
         assert self._is_actor
         if not self.actor.has_counterfactual_credit_head:

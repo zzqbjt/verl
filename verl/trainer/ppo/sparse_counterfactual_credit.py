@@ -74,15 +74,24 @@ def compute_step_uncertainty(
     return uncertainty
 
 
-def compute_anchor_probabilities(
+def sample_anchor_steps(
     step_uncertainty: torch.Tensor,
     step_end_mask: torch.Tensor,
     uids: Sequence[object],
     *,
     temperature: float = 1.0,
     uniform_mix: float = 0.1,
+    anchors_per_group: int = 2,
+    seed: int = 42,
+    global_step: int = 0,
 ) -> torch.Tensor:
-    """Return the method's entropy/uniform mixture over all steps in each uid group."""
+    """Sequentially sample endpoints from distinct responses in each uid group.
+
+    After every draw, all endpoints from the selected response are removed.
+    Entropy and uniform-mixture weights are recomputed over the remaining
+    endpoints before every draw, so a response can contribute at most one
+    anchor to a group.
+    """
 
     if step_uncertainty.ndim != 2 or step_end_mask.shape != step_uncertainty.shape:
         raise ValueError("step_uncertainty and step_end_mask must be identically-shaped rank-2 tensors")
@@ -92,39 +101,6 @@ def compute_anchor_probabilities(
         raise ValueError("temperature must be finite and > 0")
     if not 0.0 <= uniform_mix <= 1.0:
         raise ValueError("uniform_mix must be in [0, 1]")
-
-    probabilities = torch.zeros_like(step_uncertainty, dtype=torch.float32)
-    groups: dict[object, list[int]] = {}
-    for row, uid in enumerate(uids):
-        groups.setdefault(uid, []).append(row)
-    for rows in groups.values():
-        group_mask = step_end_mask[rows].bool()
-        scores = step_uncertainty[rows][group_mask].float()
-        if scores.numel() == 0:
-            raise ValueError("uid group contains no step endpoints")
-        entropy_probability = torch.softmax(scores / temperature, dim=0)
-        mixture = (1.0 - uniform_mix) * entropy_probability + uniform_mix / scores.numel()
-        group_probability = probabilities[rows]
-        group_probability[group_mask] = mixture
-        probabilities[rows] = group_probability
-    return probabilities
-
-
-def sample_anchor_steps(
-    probabilities: torch.Tensor,
-    step_end_mask: torch.Tensor,
-    uids: Sequence[object],
-    *,
-    anchors_per_group: int = 2,
-    seed: int = 42,
-    global_step: int = 0,
-) -> torch.Tensor:
-    """Sample endpoints without replacement, independently within each uid group."""
-
-    if probabilities.ndim != 2 or step_end_mask.shape != probabilities.shape:
-        raise ValueError("probabilities and step_end_mask must be identically-shaped rank-2 tensors")
-    if len(uids) != probabilities.shape[0]:
-        raise ValueError("uids length must equal the response batch size")
     if not isinstance(anchors_per_group, int) or isinstance(anchors_per_group, bool) or anchors_per_group < 1:
         raise ValueError("anchors_per_group must be an integer >= 1")
     generator = torch.Generator(device="cpu")
@@ -134,17 +110,25 @@ def sample_anchor_steps(
     for row, uid in enumerate(uids):
         groups.setdefault(uid, []).append(row)
     for rows in groups.values():
-        coordinates = torch.nonzero(step_end_mask[rows].detach().cpu().bool(), as_tuple=False)
-        if coordinates.shape[0] < anchors_per_group:
+        available = step_end_mask[rows].detach().cpu().bool().clone()
+        eligible_responses = int(available.any(dim=-1).sum().item())
+        if eligible_responses < anchors_per_group:
             raise ValueError(
-                f"uid group has {coordinates.shape[0]} steps, fewer than anchors_per_group={anchors_per_group}"
+                f"uid group has {eligible_responses} responses with step endpoints, "
+                f"fewer than anchors_per_group={anchors_per_group}"
             )
-        weights = probabilities[rows].detach().cpu()[coordinates[:, 0], coordinates[:, 1]].float()
-        if torch.any(~torch.isfinite(weights)) or torch.any(weights <= 0):
-            raise ValueError("all endpoint sampling probabilities must be finite and positive")
-        selected = torch.multinomial(weights, anchors_per_group, replacement=False, generator=generator)
-        for coordinate in coordinates[selected]:
-            anchor_mask[rows[int(coordinate[0])], int(coordinate[1])] = True
+        group_uncertainty = step_uncertainty[rows].detach().cpu().float()
+        for _ in range(anchors_per_group):
+            coordinates = torch.nonzero(available, as_tuple=False)
+            scores = group_uncertainty[coordinates[:, 0], coordinates[:, 1]]
+            entropy_probability = torch.softmax(scores / temperature, dim=0)
+            weights = (1.0 - uniform_mix) * entropy_probability + uniform_mix / scores.numel()
+            if torch.any(~torch.isfinite(weights)) or torch.any(weights <= 0):
+                raise ValueError("all available endpoint sampling probabilities must be finite and positive")
+            selected = int(torch.multinomial(weights, 1, replacement=False, generator=generator).item())
+            local_row, endpoint = coordinates[selected].tolist()
+            anchor_mask[rows[local_row], endpoint] = True
+            available[local_row] = False
     return anchor_mask
 
 
@@ -163,7 +147,7 @@ def merge_anchor_credit(
     anchor_mask: torch.Tensor,
     anchor_credit: torch.Tensor,
 ) -> torch.Tensor:
-    """Use Monte-Carlo labels at anchors and post-update predictions elsewhere."""
+    """Use Monte-Carlo labels at anchors and pre-update predictions elsewhere."""
 
     if predicted_credit.shape != anchor_mask.shape or predicted_credit.ndim != 2:
         raise ValueError("predicted_credit and anchor_mask must be identically-shaped rank-2 tensors")
@@ -241,6 +225,8 @@ def credit_advantage_coefficient(
         return float(maximum)
     if total_training_steps < 1:
         raise ValueError("total_training_steps must be >= 1 when warmup_ratio > 0")
+    if global_step <= 1:
+        return 0.0
     warmup_steps = max(1, math.ceil(total_training_steps * warmup_ratio))
     progress = min(max((global_step - 1) / warmup_steps, 0.0), 1.0)
     return float(maximum * progress)
@@ -248,7 +234,6 @@ def credit_advantage_coefficient(
 
 __all__ = [
     "build_credit_residual",
-    "compute_anchor_probabilities",
     "compute_monte_carlo_credit",
     "compute_step_uncertainty",
     "credit_advantage_coefficient",

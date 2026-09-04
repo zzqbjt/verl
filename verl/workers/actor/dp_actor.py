@@ -18,6 +18,7 @@ Single Process Actor
 """
 
 import logging
+import math
 import os
 from contextlib import contextmanager, nullcontext
 
@@ -50,22 +51,28 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class CounterfactualCreditHead(nn.Module):
-    """Regress signed step credit from ``[h_pre; h_post - h_pre]``."""
+    """Predict a bounded state value from a boundary hidden state."""
 
     def __init__(self, hidden_size: int, projection_size: int) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.projection_size = int(projection_size)
-        self.input_layer = nn.Linear(2 * self.hidden_size, self.projection_size, dtype=torch.float32)
+        self.input_layer = nn.Linear(self.hidden_size, self.projection_size, dtype=torch.float32)
         self.activation = nn.SiLU()
         self.output_layer = nn.Linear(self.projection_size, 1, dtype=torch.float32)
+        self._reset_output_parameters()
+
+    def _reset_output_parameters(self) -> None:
+        nn.init.normal_(self.output_layer.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.output_layer.bias)
 
     def reset_parameters(self) -> None:
         self.input_layer.reset_parameters()
-        self.output_layer.reset_parameters()
+        self._reset_output_parameters()
 
     def forward(self, representation: torch.Tensor) -> torch.Tensor:
-        return self.output_layer(self.activation(self.input_layer(representation)))
+        logits = self.output_layer(self.activation(self.input_layer(representation)))
+        return torch.sigmoid(logits)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -316,9 +323,9 @@ class DataParallelPPOActor(BasePPOActor):
         if not self.has_counterfactual_credit_head:
             return None
         return {
-            "format_version": 1,
+            "format_version": 2,
             "architecture": {
-                "type": "h_pre_delta_two_layer_mlp",
+                "type": "boundary_value_two_layer_mlp_sigmoid",
                 "hidden_size": self.counterfactual_credit_head.hidden_size,
                 "projection_size": self.counterfactual_credit_head.projection_size,
             },
@@ -344,11 +351,25 @@ class DataParallelPPOActor(BasePPOActor):
             self._counterfactual_credit_needs_broadcast = True
             return
         expected = {
-            "type": "h_pre_delta_two_layer_mlp",
+            "type": "boundary_value_two_layer_mlp_sigmoid",
             "hidden_size": self.counterfactual_credit_head.hidden_size,
             "projection_size": self.counterfactual_credit_head.projection_size,
         }
-        if int(state_dict.get("format_version", 0)) != 1 or state_dict.get("architecture") != expected:
+        format_version = int(state_dict.get("format_version", 0))
+        architecture = state_dict.get("architecture")
+        is_legacy_direct_credit = (
+            format_version == 1
+            and isinstance(architecture, dict)
+            and architecture.get("type") == "h_pre_delta_two_layer_mlp"
+        )
+        if is_legacy_direct_credit:
+            logger.warning(
+                "Resetting the legacy direct-credit probe while retaining the resumed actor checkpoint; "
+                "its 2H transition input is incompatible with the new H-dimensional value probe."
+            )
+            self.load_counterfactual_credit_state_dict(None)
+            return
+        if format_version != 2 or architecture != expected:
             raise RuntimeError("Counterfactual-credit checkpoint architecture does not match the configured head.")
         self.counterfactual_credit_head.load_state_dict(state_dict["model"], strict=True)
         self.counterfactual_credit_optimizer.load_state_dict(state_dict["optimizer"])
@@ -466,9 +487,30 @@ class DataParallelPPOActor(BasePPOActor):
                     prompt_tail = prompt_positions.masked_fill(~prompt_attention, -1).max(dim=-1).values
                     if torch.any(prompt_tail < 0):
                         raise ValueError("Credit representation requires a nonempty prompt in every response.")
+                    prefix_lengths = micro_batch.get("credit_prefix_lengths")
+                    if prefix_lengths is None:
+                        prefix_lengths = torch.zeros(batch_size, dtype=torch.long, device=attention_mask.device)
+                    else:
+                        prefix_lengths = prefix_lengths.to(device=attention_mask.device, dtype=torch.long)
+                    if prefix_lengths.shape != (batch_size,) or torch.any(prefix_lengths < 0):
+                        raise ValueError("credit_prefix_lengths must be one nonnegative integer per response.")
+                    if torch.any(prefix_lengths > response_length):
+                        raise ValueError("credit_prefix_lengths may not exceed the padded response width.")
+                    boundary_positions = prompt_tail.clone()
+                    has_fixed_prefix = prefix_lengths > 0
+                    boundary_positions[has_fixed_prefix] = prompt_length + prefix_lengths[has_fixed_prefix] - 1
+                    boundary_is_active = attention_mask.gather(1, boundary_positions.unsqueeze(-1)).squeeze(-1).bool()
+                    if torch.any(~boundary_is_active):
+                        raise ValueError("Every credit prefix boundary must select an active context token.")
+                    response_positions = torch.arange(response_length, device=attention_mask.device).expand(
+                        batch_size, -1
+                    )
+                    first_step_end = response_positions.masked_fill(~step_end_mask, response_length).min(dim=-1).values
+                    if torch.any(first_step_end < prefix_lengths):
+                        raise ValueError("Credit step endpoints must occur after the fixed response prefix.")
                     full_step_end_mask[
                         torch.arange(batch_size, device=attention_mask.device),
-                        prompt_tail,
+                        boundary_positions,
                     ] = True
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -789,59 +831,94 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @staticmethod
-    def build_counterfactual_credit_representations(
+    def build_counterfactual_value_transitions(
         boundary_hidden: torch.Tensor,
         step_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pair each step end with the preceding prompt/step boundary."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Align each step with its before/after boundary and endpoint flags."""
 
         if boundary_hidden.ndim != 2 or step_counts.ndim != 1:
             raise ValueError("boundary_hidden must be rank-2 and step_counts must be rank-1")
         expected_boundaries = int(step_counts.sum().item()) + int(step_counts.numel())
         if boundary_hidden.shape[0] != expected_boundaries:
             raise ValueError(f"Expected {expected_boundaries} prompt/step boundaries, got {boundary_hidden.shape[0]}.")
-        representations = []
+        before_boundaries = []
+        after_boundaries = []
+        first_step_masks = []
+        last_step_masks = []
+        before_indices = []
+        after_indices = []
         offset = 0
         for count_tensor in step_counts:
             count = int(count_tensor.item())
             if count < 1:
                 raise ValueError("Every response must contain at least one semantic step.")
             boundaries = boundary_hidden[offset : offset + count + 1].detach().float()
-            before = boundaries[:-1]
-            after = boundaries[1:]
-            representations.append(torch.cat((before, after - before), dim=-1))
+            before_boundaries.append(boundaries[:-1])
+            after_boundaries.append(boundaries[1:])
+            first = torch.zeros(count, dtype=torch.bool, device=boundary_hidden.device)
+            last = torch.zeros(count, dtype=torch.bool, device=boundary_hidden.device)
+            first[0] = True
+            last[-1] = True
+            first_step_masks.append(first)
+            last_step_masks.append(last)
+            response_indices = torch.arange(count, device=boundary_hidden.device)
+            before_indices.append(response_indices + offset)
+            after_indices.append(response_indices + offset + 1)
             offset += count + 1
-        return torch.cat(representations, dim=0)
+        return (
+            torch.cat(before_boundaries, dim=0),
+            torch.cat(after_boundaries, dim=0),
+            torch.cat(first_step_masks, dim=0),
+            torch.cat(last_step_masks, dim=0),
+            torch.cat(before_indices, dim=0),
+            torch.cat(after_indices, dim=0),
+        )
 
-    def _sync_counterfactual_credit_gradients(self, local_weight_sum: torch.Tensor) -> torch.Tensor:
-        weight_sum = local_weight_sum.detach().float().clone()
+    def _sync_counterfactual_credit_gradients(self) -> None:
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(weight_sum, op=torch.distributed.ReduceOp.SUM)
             for parameter in self.counterfactual_credit_head.parameters():
                 if parameter.grad is None:
                     parameter.grad = torch.zeros_like(parameter)
                 torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
-        if weight_sum.item() > 0:
-            for parameter in self.counterfactual_credit_head.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.div_(weight_sum)
-        return weight_sum
 
     def compute_counterfactual_credit(self, data: DataProto) -> dict[str, torch.Tensor]:
-        """Fit the detached credit head on sparse anchors and predict every step."""
+        """Predict boundary values, replace known values, then fit the detached probe."""
 
         if not self.has_counterfactual_credit_head:
             raise ValueError("Counterfactual credit requires actor.counterfactual_credit_head.enabled=True.")
-        required_keys = ("step_end_mask", "credit_anchor_mask", "credit_anchor_targets", "credit_anchor_weights")
+        required_keys = (
+            "step_end_mask",
+            "credit_anchor_mask",
+            "credit_anchor_targets",
+            "credit_anchor_q_targets",
+            "credit_anchor_v_targets",
+            "credit_start_value_mask",
+            "credit_start_value_train_mask",
+            "credit_start_value_targets",
+            "credit_terminal_value_mask",
+            "credit_terminal_value_targets",
+        )
         missing_keys = [key for key in required_keys if key not in data.batch]
         if missing_keys:
             raise ValueError("Counterfactual credit actor batch is missing: " + ", ".join(missing_keys))
-        if "global_steps" not in data.meta_info or "huber_delta" not in data.meta_info:
-            raise ValueError("Counterfactual credit requires global_steps and huber_delta in meta_info.")
+        required_meta_info = (
+            "global_steps",
+            "credit_value_loss_weights",
+        )
+        missing_meta_info = [key for key in required_meta_info if key not in data.meta_info]
+        if missing_meta_info:
+            raise ValueError("Counterfactual credit meta_info is missing: " + ", ".join(missing_meta_info))
         global_step = int(data.meta_info["global_steps"])
-        huber_delta = float(data.meta_info["huber_delta"])
-        if huber_delta <= 0:
-            raise ValueError("huber_delta must be > 0")
+        value_loss_weights = tuple(float(weight) for weight in data.meta_info["credit_value_loss_weights"])
+        predict_all_steps = bool(data.meta_info.get("predict_all_credit_steps", True))
+        invalid_value_loss_weights = len(value_loss_weights) != 3 or any(
+            not math.isfinite(weight) or weight < 0 for weight in value_loss_weights
+        )
+        if invalid_value_loss_weights:
+            raise ValueError("credit_value_loss_weights must contain three finite nonnegative values")
+        if sum(value_loss_weights) <= 0:
+            raise ValueError("credit_value_loss_weights must contain at least one positive value")
 
         self.actor_module.eval()
         select_keys = [
@@ -851,6 +928,8 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             *required_keys,
         ]
+        if "credit_prefix_lengths" in data.batch:
+            select_keys.append("credit_prefix_lengths")
         data = data.select(batch_keys=select_keys)
         use_dynamic_bsz = bool(data.meta_info["use_dynamic_bsz"])
         if use_dynamic_bsz:
@@ -863,11 +942,14 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             micro_batches = data.split(int(data.meta_info["micro_batch_size"]))
 
-        representations_by_micro_batch = []
-        endpoint_masks = []
-        anchor_representations = []
-        anchor_targets = []
-        anchor_weights = []
+        value_batches = []
+        mc_value_hidden = []
+        mc_value_targets = []
+        start_value_hidden = []
+        start_value_targets = []
+        terminal_value_hidden = []
+        terminal_value_targets = []
+        anchor_credit_targets = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, "pad_token_id": data.meta_info.get("pad_token_id", 0)}
@@ -881,89 +963,230 @@ class DataParallelPPOActor(BasePPOActor):
                     temperature=float(data.meta_info["temperature"]),
                     return_credit_boundary_hidden=True,
                 )
-            representations = self.build_counterfactual_credit_representations(
-                forward_outputs["credit_boundary_hidden"],
-                step_end_mask.sum(dim=-1, dtype=torch.long),
+            step_counts = step_end_mask.sum(dim=-1, dtype=torch.long)
+            boundary_hidden = forward_outputs["credit_boundary_hidden"].detach().float()
+            before_hidden, after_hidden, first_step_mask, last_step_mask, before_indices, after_indices = (
+                self.build_counterfactual_value_transitions(boundary_hidden, step_counts)
             )
             packed_anchor_mask = anchor_mask[step_end_mask]
-            dense_targets = model_inputs["credit_anchor_targets"].float()
-            dense_weights = model_inputs["credit_anchor_weights"].float()
-            selected_targets = dense_targets[anchor_mask]
-            selected_weights = dense_weights[anchor_mask]
-            if torch.any(~torch.isfinite(selected_targets)) or torch.any(selected_targets.abs() > 1.0):
+            selected_credit_targets = model_inputs["credit_anchor_targets"].float()[anchor_mask]
+            selected_q_targets = model_inputs["credit_anchor_q_targets"].float()[anchor_mask]
+            selected_v_targets = model_inputs["credit_anchor_v_targets"].float()[anchor_mask]
+            if torch.any(~torch.isfinite(selected_credit_targets)) or torch.any(selected_credit_targets.abs() > 1.0):
                 raise ValueError("Anchor credit targets must be finite and in [-1, 1].")
-            if torch.any(~torch.isfinite(selected_weights)) or torch.any(selected_weights <= 0):
-                raise ValueError("Anchor credit weights must be finite and positive.")
-            representations_by_micro_batch.append(representations)
-            endpoint_masks.append(step_end_mask)
-            anchor_representations.append(representations[packed_anchor_mask])
-            anchor_targets.append(selected_targets)
-            anchor_weights.append(selected_weights)
-
-        all_anchor_representations = torch.cat(anchor_representations, dim=0)
-        all_anchor_targets = torch.cat(anchor_targets, dim=0)
-        all_anchor_weights = torch.cat(anchor_weights, dim=0)
-        device = representations_by_micro_batch[0].device
-        self._ensure_counterfactual_credit_device(device)
-        self.counterfactual_credit_head.train()
-        self.counterfactual_credit_optimizer.zero_grad(set_to_none=True)
-        local_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
-        should_update = self.counterfactual_credit_last_global_step != global_step
-        anchor_predictions = self.counterfactual_credit_head(all_anchor_representations).squeeze(-1)
-        directional_targets = all_anchor_targets != 0
-        direction_counts = torch.stack(
-            (
-                ((anchor_predictions.detach() * all_anchor_targets > 0) & directional_targets).sum().float(),
-                directional_targets.sum().float(),
-            )
-        )
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(direction_counts, op=torch.distributed.ReduceOp.SUM)
-        direction_agreement = torch.where(
-            direction_counts[1] > 0,
-            direction_counts[0] / direction_counts[1],
-            direction_counts.new_tensor(float("nan")),
-        )
-        if should_update and all_anchor_targets.numel() > 0:
-            losses = torch.nn.functional.huber_loss(
-                anchor_predictions,
-                all_anchor_targets,
-                reduction="none",
-                delta=huber_delta,
-            )
-            local_loss_sum = (losses * all_anchor_weights).sum()
-            local_loss_sum.backward()
-        global_weight_sum = self._sync_counterfactual_credit_gradients(
-            all_anchor_weights.sum() if should_update else all_anchor_weights.new_zeros(())
-        )
-        global_loss_sum = local_loss_sum.detach().clone()
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(global_loss_sum, op=torch.distributed.ReduceOp.SUM)
-        if should_update and global_weight_sum.item() > 0:
-            self.counterfactual_credit_optimizer.step()
-            self.counterfactual_credit_updates += 1
-            self.counterfactual_credit_last_global_step = global_step
-        self.counterfactual_credit_head.eval()
-
-        dense_predictions = []
-        with torch.no_grad():
-            for representations, endpoint_mask in zip(
-                representations_by_micro_batch,
-                endpoint_masks,
-                strict=True,
+            for name, targets in (
+                ("anchor Q", selected_q_targets),
+                ("anchor V", selected_v_targets),
+                ("start", model_inputs["credit_start_value_targets"].float()),
+                ("terminal", model_inputs["credit_terminal_value_targets"].float()),
             ):
-                packed_predictions = self.counterfactual_credit_head(representations).squeeze(-1)
+                if torch.any(~torch.isfinite(targets)) or torch.any((targets < 0) | (targets > 1)):
+                    raise ValueError(f"{name} value targets must be finite and in [0, 1].")
+
+            start_mask = model_inputs["credit_start_value_mask"].bool()
+            start_train_mask = model_inputs["credit_start_value_train_mask"].bool()
+            terminal_mask = model_inputs["credit_terminal_value_mask"].bool()
+            batch_size = step_end_mask.shape[0]
+            if any(mask.shape != (batch_size,) for mask in (start_mask, start_train_mask, terminal_mask)):
+                raise ValueError("Start and terminal value masks must contain one entry per response.")
+            if torch.any(start_train_mask & ~start_mask):
+                raise ValueError("credit_start_value_train_mask must be a subset of credit_start_value_mask.")
+            first_step_indices = torch.nonzero(first_step_mask, as_tuple=False).flatten()
+            last_step_indices = torch.nonzero(last_step_mask, as_tuple=False).flatten()
+            if first_step_indices.numel() != batch_size or last_step_indices.numel() != batch_size:
+                raise RuntimeError("Each response must contribute exactly one first and terminal semantic step.")
+
+            # Anchor Q/V labels train both sides of an interior transition.
+            # First-step V and terminal-step Q are excluded here because their
+            # exact labels are already supplied by the start/terminal sources.
+            train_anchor_v = packed_anchor_mask & ~first_step_mask
+            train_anchor_q = packed_anchor_mask & ~last_step_mask
+            mc_value_hidden.extend((before_hidden[train_anchor_v], after_hidden[train_anchor_q]))
+            mc_value_targets.extend(
+                (
+                    selected_v_targets[~first_step_mask[packed_anchor_mask]],
+                    selected_q_targets[~last_step_mask[packed_anchor_mask]],
+                )
+            )
+            start_value_hidden.append(before_hidden[first_step_indices[start_train_mask]])
+            start_value_targets.append(model_inputs["credit_start_value_targets"].float()[start_train_mask])
+            terminal_value_hidden.append(after_hidden[last_step_indices[terminal_mask]])
+            terminal_value_targets.append(model_inputs["credit_terminal_value_targets"].float()[terminal_mask])
+            anchor_credit_targets.append(selected_credit_targets)
+            value_batches.append(
+                {
+                    "boundary_hidden": boundary_hidden,
+                    "step_counts": step_counts,
+                    "step_end_mask": step_end_mask,
+                    "packed_anchor_mask": packed_anchor_mask,
+                    "before_hidden": before_hidden,
+                    "after_hidden": after_hidden,
+                    "first_step_indices": first_step_indices,
+                    "last_step_indices": last_step_indices,
+                    "before_indices": before_indices,
+                    "after_indices": after_indices,
+                    "start_mask": start_mask,
+                    "start_targets": model_inputs["credit_start_value_targets"].float(),
+                    "terminal_mask": terminal_mask,
+                    "terminal_targets": model_inputs["credit_terminal_value_targets"].float(),
+                    "anchor_q_targets": selected_q_targets,
+                    "anchor_v_targets": selected_v_targets,
+                }
+            )
+
+        all_anchor_targets = torch.cat(anchor_credit_targets, dim=0)
+        device = value_batches[0]["boundary_hidden"].device
+        self._ensure_counterfactual_credit_device(device)
+
+        # Predictions used by the policy are computed before this batch's probe
+        # update. Known start, anchor-Q/V, and terminal values then replace the
+        # corresponding predictions before adjacent values are differenced.
+        dense_predictions = []
+        raw_anchor_predictions = []
+        self.counterfactual_credit_head.eval()
+        with torch.no_grad():
+            for value_batch in value_batches:
+                packed_anchor_mask = value_batch["packed_anchor_mask"]
+                raw_anchor_predictions.append(
+                    self.counterfactual_credit_head(value_batch["after_hidden"][packed_anchor_mask]).squeeze(-1)
+                    - self.counterfactual_credit_head(value_batch["before_hidden"][packed_anchor_mask]).squeeze(-1)
+                )
+                endpoint_mask = value_batch["step_end_mask"]
                 dense = torch.zeros(endpoint_mask.shape, dtype=torch.float32, device=endpoint_mask.device)
-                dense[endpoint_mask] = packed_predictions.float()
+                if predict_all_steps:
+                    boundary_values = self.counterfactual_credit_head(value_batch["boundary_hidden"])
+                    boundary_values = boundary_values.squeeze(-1).float()
+                    before_indices = value_batch["before_indices"]
+                    after_indices = value_batch["after_indices"]
+                    boundary_values[before_indices[packed_anchor_mask]] = value_batch["anchor_v_targets"]
+                    boundary_values[after_indices[packed_anchor_mask]] = value_batch["anchor_q_targets"]
+                    start_rows = value_batch["start_mask"]
+                    terminal_rows = value_batch["terminal_mask"]
+                    start_steps = value_batch["first_step_indices"][start_rows]
+                    terminal_steps = value_batch["last_step_indices"][terminal_rows]
+                    boundary_values[before_indices[start_steps]] = value_batch["start_targets"][start_rows]
+                    boundary_values[after_indices[terminal_steps]] = value_batch["terminal_targets"][terminal_rows]
+                    dense[endpoint_mask] = boundary_values[after_indices] - boundary_values[before_indices]
                 dense_predictions.append(dense)
+
+        all_raw_anchor_predictions = torch.cat(raw_anchor_predictions, dim=0)
+
+        self.counterfactual_credit_head.train()
+        should_update = self.counterfactual_credit_last_global_step != global_step
+        # Weight each sign decision by the amount of credit at stake. These are
+        # raw value-probe differences, before exact boundary values are inserted.
+        target_magnitudes = all_anchor_targets.abs()
+        correct_directions = all_raw_anchor_predictions * all_anchor_targets > 0
+        direction_statistics = torch.stack(
+            (
+                (target_magnitudes * correct_directions).sum(),
+                target_magnitudes.sum(),
+            )
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(direction_statistics, op=torch.distributed.ReduceOp.SUM)
+        direction_agreement = torch.where(
+            direction_statistics[1] > 0,
+            direction_statistics[0] / direction_statistics[1],
+            direction_statistics.new_tensor(float("nan")),
+        )
+        source_hidden = (
+            torch.cat(mc_value_hidden, dim=0),
+            torch.cat(start_value_hidden, dim=0),
+            torch.cat(terminal_value_hidden, dim=0),
+        )
+        source_targets = (
+            torch.cat(mc_value_targets, dim=0),
+            torch.cat(start_value_targets, dim=0),
+            torch.cat(terminal_value_targets, dim=0),
+        )
+        global_source_counts = torch.tensor(
+            [targets.numel() for targets in source_targets],
+            dtype=torch.float32,
+            device=device,
+        )
+        global_difference_count = torch.tensor(float(all_anchor_targets.numel()), dtype=torch.float32, device=device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(global_source_counts, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(global_difference_count, op=torch.distributed.ReduceOp.SUM)
+        configured_weights = torch.tensor(value_loss_weights, dtype=torch.float32, device=device)
+        active_weights = configured_weights * (global_source_counts > 0)
+        active_weights = active_weights / active_weights.sum().clamp_min(torch.finfo(torch.float32).eps)
+
+        head_config = self.config.get("counterfactual_credit_head")
+        difference_loss_weight = float(head_config.get("difference_loss_weight", 0.25))
+        optimizer_steps_per_batch = int(head_config.get("optimizer_steps_per_batch", 2))
+
+        def compute_probe_losses():
+            source_loss_sums = []
+            source_absolute_error_sums = []
+            for hidden, targets in zip(source_hidden, source_targets, strict=True):
+                if targets.numel() > 0:
+                    value_predictions = self.counterfactual_credit_head(hidden).squeeze(-1)
+                    source_loss_sums.append(
+                        torch.nn.functional.binary_cross_entropy(value_predictions, targets, reduction="sum")
+                    )
+                    source_absolute_error_sums.append((value_predictions.detach() - targets).abs().sum())
+                else:
+                    source_loss_sums.append(torch.zeros((), dtype=torch.float32, device=device))
+                    source_absolute_error_sums.append(torch.zeros((), dtype=torch.float32, device=device))
+
+            difference_predictions = []
+            for value_batch in value_batches:
+                packed_anchor_mask = value_batch["packed_anchor_mask"]
+                difference_predictions.append(
+                    self.counterfactual_credit_head(value_batch["after_hidden"][packed_anchor_mask]).squeeze(-1)
+                    - self.counterfactual_credit_head(value_batch["before_hidden"][packed_anchor_mask]).squeeze(-1)
+                )
+            all_difference_predictions = torch.cat(difference_predictions, dim=0)
+            difference_loss_sum = torch.nn.functional.smooth_l1_loss(
+                all_difference_predictions,
+                all_anchor_targets,
+                reduction="sum",
+            )
+            return torch.stack(source_loss_sums), torch.stack(source_absolute_error_sums), difference_loss_sum
+
+        source_loss_sums, source_absolute_error_sums, difference_loss_sum = compute_probe_losses()
+        metric_source_loss_sums = source_loss_sums.detach().clone()
+        metric_source_absolute_error_sums = source_absolute_error_sums.clone()
+        metric_difference_loss_sum = difference_loss_sum.detach().clone()
+        if should_update and (global_source_counts.sum() + global_difference_count).item() > 0:
+            for optimizer_step in range(optimizer_steps_per_batch):
+                if optimizer_step > 0:
+                    source_loss_sums, _, difference_loss_sum = compute_probe_losses()
+                self.counterfactual_credit_optimizer.zero_grad(set_to_none=True)
+                value_bce = (active_weights * source_loss_sums / global_source_counts.clamp_min(1.0)).sum()
+                difference_smooth_l1 = difference_loss_sum / global_difference_count.clamp_min(1.0)
+                objective = sum(parameter.sum() * 0.0 for parameter in self.counterfactual_credit_head.parameters())
+                objective = objective + value_bce + difference_loss_weight * difference_smooth_l1
+                objective.backward()
+                self._sync_counterfactual_credit_gradients()
+                self.counterfactual_credit_optimizer.step()
+                self.counterfactual_credit_updates += 1
+            self.counterfactual_credit_last_global_step = global_step
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(metric_source_loss_sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(metric_source_absolute_error_sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(metric_difference_loss_sum, op=torch.distributed.ReduceOp.SUM)
+        self.counterfactual_credit_head.eval()
         predictions = torch.cat(dense_predictions, dim=0)
         if use_dynamic_bsz:
             predictions = restore_dynamic_batch(predictions, batch_idx_list)
         batch_size = predictions.shape[0]
-        mean_loss = global_loss_sum / global_weight_sum.clamp_min(1.0)
+        mean_value_bce = (
+            active_weights * metric_source_loss_sums / global_source_counts.clamp_min(1.0)
+        ).sum()
+        mean_absolute_error = (
+            active_weights * metric_source_absolute_error_sums / global_source_counts.clamp_min(1.0)
+        ).sum()
+        mean_difference_smooth_l1 = metric_difference_loss_sum / global_difference_count.clamp_min(1.0)
+        mean_total_loss = mean_value_bce + difference_loss_weight * mean_difference_smooth_l1
         return {
             "credit_predictions": predictions,
-            "credit_head_loss": mean_loss.expand(batch_size).clone(),
+            "credit_head_value_bce": mean_value_bce.expand(batch_size).clone(),
+            "credit_head_difference_smooth_l1": mean_difference_smooth_l1.expand(batch_size).clone(),
+            "credit_head_total_loss": mean_total_loss.expand(batch_size).clone(),
+            "credit_head_value_mae": mean_absolute_error.expand(batch_size).clone(),
             "credit_head_direction_agreement": direction_agreement.expand(batch_size).clone(),
         }
 

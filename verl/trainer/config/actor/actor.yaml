@@ -84,16 +84,16 @@ policy_loss:
   # Temperature divisor for token weights in the "my" loss
   tau: 0.5
 
-# Detached sparse-counterfactual step-credit head configuration
+# Detached sparse-counterfactual boundary-value head configuration
 counterfactual_credit_head:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.CounterfactualCreditHeadConfig
 
-  # Whether to build and train the sparse-credit head
+  # Whether to build and train the boundary-value head
   enabled: false
 
-  # Hidden width of the 2H -> hidden_dim -> 1 MLP
+  # Hidden width of the H -> hidden_dim -> sigmoid-value MLP
   hidden_dim: 512
 
   # AdamW learning rate, independent of the policy optimizer
@@ -101,6 +101,12 @@ counterfactual_credit_head:
 
   # AdamW decoupled weight decay
   weight_decay: 0.0
+
+  # Weight of anchor (Q - V) SmoothL1 auxiliary loss
+  difference_loss_weight: 0.25
+
+  # Number of detached probe optimizer steps per PPO batch
+  optimizer_steps_per_batch: 2
 
   # Whether to save head and optimizer state in actor checkpoints
   save_checkpoint: true

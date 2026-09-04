@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from verl.utils.step_split import build_step_end_mask, build_step_start_mask
+from verl.utils.step_split import build_step_end_mask, build_step_start_mask, split_token_ids
 
 
 class PieceTokenizer:
@@ -25,31 +25,17 @@ class PieceTokenizer:
         self.pieces = dict(pieces)
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
-        self._piece_ids = sorted(self.pieces, key=lambda token_id: len(self.pieces[token_id]), reverse=True)
 
     def decode(self, input_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
         assert not skip_special_tokens
         assert not clean_up_tokenization_spaces
         return "".join(self.pieces[token_id] for token_id in input_ids)
 
-    def __call__(self, text, *, add_special_tokens, return_attention_mask, return_offsets_mapping):
-        assert not add_special_tokens
-        assert not return_attention_mask
-        assert return_offsets_mapping
-        input_ids = []
-        offsets = []
-        char_start = 0
-        while char_start < len(text):
-            for token_id in self._piece_ids:
-                piece = self.pieces[token_id]
-                if text.startswith(piece, char_start):
-                    input_ids.append(token_id)
-                    offsets.append((char_start, char_start + len(piece)))
-                    char_start += len(piece)
-                    break
-            else:
-                raise AssertionError(f"No configured token piece starts at character {char_start}: {text!r}")
-        return {"input_ids": input_ids, "offset_mapping": offsets}
+
+def _endpoint_indices(tokenizer, token_ids, **kwargs):
+    responses = torch.tensor([token_ids])
+    mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses), **kwargs)
+    return mask.nonzero(as_tuple=False).tolist()
 
 
 def test_step_starts_are_derived_from_the_shared_endpoint_partition():
@@ -68,329 +54,223 @@ def test_step_starts_are_derived_from_the_shared_endpoint_partition():
     torch.testing.assert_close(starts, expected)
 
 
-@pytest.fixture
-def tokenizer():
-    return PieceTokenizer(
+def test_plain_paragraphs_are_steps_without_numeric_markers():
+    tokenizer = PieceTokenizer({0: "First", 1: "\n", 2: "\n", 3: "Second"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3], min_step_tokens=1)
+
+    assert endpoints == [[0, 2], [0, 3]]
+
+
+def test_double_newline_inside_one_token_is_also_a_paragraph_boundary():
+    tokenizer = PieceTokenizer({0: "First.\n\n", 1: "Second."})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1], min_step_tokens=1)
+
+    assert endpoints == [[0, 0], [0, 1]]
+
+
+def test_named_step_marker_after_a_single_newline_is_explicit():
+    tokenizer = PieceTokenizer({0: "First.", 1: "\n", 2: "### Step 2: next"})
+
+    spans = split_token_ids(tokenizer, [0, 1, 2], min_step_tokens=1)
+
+    assert [(span.start, span.end, span.end_boundary_type) for span in spans] == [
+        (0, 2, "explicit"),
+        (2, 3, "response_end"),
+    ]
+
+
+def test_case_marker_after_a_single_newline_is_explicit():
+    tokenizer = PieceTokenizer({0: "First.", 1: "\n", 2: "Case 2: next"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2], min_step_tokens=1)
+
+    assert endpoints == [[0, 1], [0, 2]]
+
+
+def test_ordinary_numbered_list_needs_a_paragraph_break():
+    tokenizer = PieceTokenizer({0: "First.", 1: "\n", 2: "2. formula", 3: "\n\n", 4: "3. reasoning"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3, 4], min_step_tokens=1)
+
+    assert endpoints == [[0, 3], [0, 4]]
+
+
+def test_short_ordinary_paragraph_is_merged_to_the_left():
+    tokenizer = PieceTokenizer({0: "A ", 1: "\n\n", 2: "tiny", 3: "\n\n", 4: "B "})
+    token_ids = [0, 0, 0, 0, 1, 2, 3, 4, 4, 4, 4]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=4, max_step_tokens=20)
+
+    assert [(span.start, span.end) for span in spans] == [(0, 7), (7, 11)]
+
+
+def test_short_intro_is_merged_into_the_first_explicit_step():
+    tokenizer = PieceTokenizer({0: "Intro", 1: "\n", 2: "Step 1: body", 3: " body"})
+
+    spans = split_token_ids(tokenizer, [0, 1, 2, 3, 3], min_step_tokens=3, max_step_tokens=20)
+
+    assert [(span.start, span.end) for span in spans] == [(0, 5)]
+
+
+def test_short_explicit_step_is_preserved():
+    tokenizer = PieceTokenizer({0: "body ", 1: "\n", 2: "Step 2: short", 3: "\n\n", 4: "next "})
+    token_ids = [0, 0, 0, 0, 1, 2, 3, 4, 4, 4, 4]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=4, max_step_tokens=20)
+
+    assert [(span.start, span.end) for span in spans] == [(0, 5), (5, 7), (7, 11)]
+
+
+@pytest.mark.parametrize("heading", ["### Step 2: Calculate x", "**Step 2: Calculate x**"])
+def test_marker_only_heading_stays_with_its_following_body(heading):
+    tokenizer = PieceTokenizer({0: "First", 1: "\n", 2: heading, 3: "\n\n", 4: "body"})
+
+    spans = split_token_ids(tokenizer, [0, 1, 2, 3, 4], min_step_tokens=1, max_step_tokens=20)
+
+    assert [(span.start, span.end) for span in spans] == [(0, 2), (2, 5)]
+
+
+def test_short_final_answer_is_preserved():
+    tokenizer = PieceTokenizer({0: "reason ", 1: "\n", 2: "Final Answer: 42"})
+    token_ids = [0, 0, 0, 0, 1, 2]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=4, max_step_tokens=20)
+
+    assert [(span.start, span.end) for span in spans] == [(0, 5), (5, 6)]
+
+
+def test_repeated_final_answers_do_not_create_many_short_steps():
+    tokenizer = PieceTokenizer({0: "reason ", 1: "\n\n", 2: "Final Answer: 42"})
+    token_ids = [0, 0, 0, 0, 1, 2, 1, 2, 1, 2]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=4, max_step_tokens=20)
+
+    assert [(span.start, span.end, span.end_boundary_type) for span in spans] == [
+        (0, 5, "final_answer"),
+        (5, 10, "response_end"),
+    ]
+
+
+def test_paragraph_before_display_math_does_not_detach_the_formula():
+    tokenizer = PieceTokenizer(
         {
-            0: "Intro",
-            1: "!\n\n",
-            2: "### ",
-            3: "Step ",
-            4: "1",
-            5: ": do one",
-            6: ".\n\n",
-            7: "步骤",
-            8: "：",
-            9: "2",
-            10: "：do two",
+            0: "Explanation.",
+            1: "\n\n",
+            2: "\\[\na = b\n\\]",
+            3: "\n\n",
+            4: "Next argument.",
         }
     )
 
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3, 4], min_step_tokens=1)
 
-def test_numeric_markers_merge_step_one_preamble_and_strip_trailing_eos(tokenizer):
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 98, 99]])
-    response_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, response_mask)
-
-    expected = torch.zeros_like(responses, dtype=torch.bool)
-    expected[0, [6, 10]] = True
-    torch.testing.assert_close(step_end_mask, expected)
+    assert endpoints == [[0, 3], [0, 4]]
 
 
-def test_separate_preamble_keeps_split_before_step_one(tokenizer):
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    response_mask = torch.ones_like(responses)
+def test_blank_lines_inside_display_math_are_not_split():
+    tokenizer = PieceTokenizer({0: "Before ", 1: "$$a", 2: "\n\n", 3: "b$$", 4: " after"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3, 4], min_step_tokens=1)
+
+    assert endpoints == [[0, 4]]
+
+
+def test_blank_lines_inside_code_fence_are_not_split():
+    tokenizer = PieceTokenizer({0: "Before\n```python\n", 1: "x = 1\n\n", 2: "y = 2\n```", 3: " after"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3], min_step_tokens=1)
+
+    assert endpoints == [[0, 3]]
+
+
+def test_long_step_uses_sentence_boundary_before_hard_limit():
+    tokenizer = PieceTokenizer({0: "word ", 1: "end. "})
+    token_ids = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=2, max_step_tokens=5)
+
+    assert [(span.start, span.end, span.end_boundary_type) for span in spans] == [
+        (0, 4, "sentence_fallback"),
+        (4, 8, "forced"),
+        (8, 10, "response_end"),
+    ]
+
+
+def test_long_step_prefers_line_boundary_to_forced_split():
+    tokenizer = PieceTokenizer({0: "word ", 1: "\n"})
+    token_ids = [0, 0, 0, 1, 0, 0, 0]
+
+    spans = split_token_ids(tokenizer, token_ids, min_step_tokens=2, max_step_tokens=4)
+
+    assert [(span.start, span.end, span.end_boundary_type) for span in spans] == [
+        (0, 4, "line_fallback"),
+        (4, 7, "response_end"),
+    ]
+
+
+def test_long_step_without_safe_text_boundary_is_forced():
+    tokenizer = PieceTokenizer({0: "word "})
+
+    spans = split_token_ids(tokenizer, [0] * 10, min_step_tokens=2, max_step_tokens=4)
+
+    assert [(span.start, span.end, span.end_boundary_type) for span in spans] == [
+        (0, 4, "forced"),
+        (4, 8, "forced"),
+        (8, 10, "response_end"),
+    ]
+
+
+def test_splitter_never_retokenizes_generated_ids():
+    class NoEncodeTokenizer(PieceTokenizer):
+        def __call__(self, text, **kwargs):
+            raise AssertionError("step splitting must not re-tokenize generated text")
+
+    tokenizer = NoEncodeTokenizer({0: "First", 1: "\n", 2: "\n", 3: "Second"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3], min_step_tokens=1)
+
+    assert endpoints == [[0, 2], [0, 3]]
+
+
+def test_splitter_resolves_characters_split_across_byte_tokens():
+    class BytePieceTokenizer(PieceTokenizer):
+        def decode(self, input_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
+            assert not skip_special_tokens
+            assert not clean_up_tokenization_spaces
+            if input_ids == [1]:
+                return " �"
+            if input_ids == [2]:
+                return "�"
+            if input_ids == [1, 2]:
+                return " 步"
+            return super().decode(
+                input_ids,
+                skip_special_tokens=skip_special_tokens,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+            )
+
+    tokenizer = BytePieceTokenizer({0: "First\n", 1: "unused", 2: "unused", 3: "骤 2: next"})
+
+    endpoints = _endpoint_indices(tokenizer, [0, 1, 2, 3], min_step_tokens=1)
+
+    assert endpoints == [[0, 0], [0, 3]]
+
+
+def test_maps_steps_to_original_masked_positions_and_removes_trailing_eos():
+    tokenizer = PieceTokenizer({0: "Start.", 1: "\n", 2: "\n", 3: "Next"})
+    responses = torch.tensor([[99, 0, 1, 99, 2, 3, 98, 98, 99]])
+    response_mask = torch.tensor([[0, 1, 1, 0, 1, 1, 1, 1, 0]])
 
     step_end_mask = build_step_end_mask(
         tokenizer,
         responses,
         response_mask,
-        separate_preamble=True,
+        min_step_tokens=1,
     )
 
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1], [0, 6], [0, 10]]
-
-
-def test_requires_double_newline_to_be_covered_by_one_token_and_numeric_marker():
-    tokenizer = PieceTokenizer(
-        {
-            0: "First",
-            1: "\n",
-            2: "\n ",
-            3: "Step ",
-            4: "2",
-            5: " body",
-            6: ".\n\n",
-            7: "Next, continue",
-            8: " final",
-            9: "First\n\n ",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8]])
-    text = tokenizer.decode(
-        responses[0].tolist(),
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-    assert (
-        tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_offsets_mapping=True,
-        )["input_ids"]
-        != responses[0].tolist()
-    )
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 8]]
-
-
-def test_splitter_does_not_retokenize_generated_ids():
-    class NoEncodeTokenizer(PieceTokenizer):
-        def __call__(self, text, **kwargs):
-            raise AssertionError("step splitting must not re-tokenize generated text")
-
-    tokenizer = NoEncodeTokenizer(
-        {
-            0: "First.\n\n",
-            1: "Step ",
-            2: "2",
-            3: " body",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 3]]
-
-
-@pytest.mark.parametrize(
-    "delimiter_piece",
-    [":\n\n", ",\n\n", ".\n\n", " arbitrary token prefix!?\n\n"],
-)
-def test_any_token_containing_double_newline_can_be_a_delimiter(delimiter_piece):
-    tokenizer = PieceTokenizer(
-        {
-            0: "First",
-            1: delimiter_piece,
-            2: "**Step ",
-            3: "2",
-            4: "** body",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3, 4]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1], [0, 4]]
-
-
-@pytest.mark.parametrize(
-    "marker_piece",
-    [
-        "**Step 3**: body",
-        "### **Step 3**: body",
-        "3. ordinary step",
-        "3) ordinary step",
-        "(3) ordinary step",
-        "3、普通步骤",
-        "### **3. ordinary step**",
-        "B. alphabetic step",
-        "二、中文步骤",
-    ],
-)
-def test_supported_step_marker_forms_are_found_at_block_start(marker_piece):
-    tokenizer = PieceTokenizer({0: "First.\n\n", 1: marker_piece})
-    responses = torch.tensor([[0, 1]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 1]]
-
-
-@pytest.mark.parametrize(
-    "later_marker",
-    [
-        "prefix before **Step 3**: body",
-        "prefix before **3. ordinary step**",
-    ],
-)
-def test_marker_later_in_prose_is_not_an_explicit_step_boundary(later_marker):
-    tokenizer = PieceTokenizer({0: "First.\n\n", 1: later_marker})
-    responses = torch.tensor([[0, 1]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1]]
-
-
-@pytest.mark.parametrize("marker", ["### **Step 2: next**", "### **2. next**"])
-def test_only_delimiter_after_markdown_horizontal_rule_precedes_marker(marker):
-    tokenizer = PieceTokenizer(
-        {
-            0: "First.\n\n",
-            1: "---",
-            2: "\n\n",
-            3: marker,
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 2], [0, 3]]
-
-
-@pytest.mark.parametrize(
-    ("first_marker", "second_marker"),
-    [
-        ("**1. first**", "2) second"),
-        ("A. first", "B. second"),
-        ("一、第一步", "二、第二步"),
-    ],
-)
-def test_ordinary_first_marker_merges_preamble(first_marker, second_marker):
-    tokenizer = PieceTokenizer(
-        {
-            0: "Intro.\n\n",
-            1: first_marker,
-            2: ".\n\n",
-            3: second_marker,
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 2], [0, 3]]
-
-
-def test_adjacent_whitespace_delimiters_collapse_to_the_one_closest_to_marker():
-    tokenizer = PieceTokenizer(
-        {
-            0: "Body",
-            1: ".\n\n",
-            2: " \n\n",
-            3: "**Step ",
-            4: "2",
-            5: "** next",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 2], [0, 5]]
-
-
-def test_adjacent_delimiters_before_step_one_still_merge_preamble():
-    tokenizer = PieceTokenizer(
-        {
-            0: "Intro",
-            1: ".\n\n",
-            2: " \n\n",
-            3: "**Step ",
-            4: "1",
-            5: "** first",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3, 4, 5]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 5]]
-
-
-def test_non_eos_whitespace_only_response_is_one_step():
-    tokenizer = PieceTokenizer({0: "\n\n", 1: " \n"})
-    responses = torch.tensor([[0, 1]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1]]
-
-
-def test_explicit_marker_must_be_fully_recognizable_inside_token_lookahead():
-    tokenizer = PieceTokenizer(
-        {
-            0: "First.\n\n",
-            1: "### ",
-            2: "Step ",
-            3: "2",
-            4: " body",
-        }
-    )
-    responses = torch.tensor([[0, 1, 2, 3, 4]])
-    response_mask = torch.ones_like(responses)
-
-    short_mask = build_step_end_mask(tokenizer, responses, response_mask, lookahead_tokens=2)
-    long_mask = build_step_end_mask(tokenizer, responses, response_mask, lookahead_tokens=3)
-
-    assert short_mask.nonzero(as_tuple=False).tolist() == [[0, 4]]
-    assert long_mask.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 4]]
-
-
-def test_maps_steps_back_to_original_masked_positions_and_removes_all_trailing_eos():
-    tokenizer = PieceTokenizer({0: "Start.\n\n", 1: "Step ", 2: "2", 3: " body"})
-    responses = torch.tensor([[99, 0, 1, 99, 2, 3, 98, 98, 99]])
-    response_mask = torch.tensor([[0, 1, 1, 0, 1, 1, 1, 1, 0]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, response_mask)
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1], [0, 5]]
-
-
-def test_noncanonical_generated_tokenization_keeps_original_step_positions():
-    tokenizer = PieceTokenizer(
-        {
-            0: "Preamble.\n\n",
-            1: "Step ",
-            2: "1",
-            3: ": Ass",
-            4: "ist",
-            5: " first.\n\n",
-            6: "Step ",
-            7: "2",
-            8: ": done",
-            9: ": Assist",
-        }
-    )
-    original_ids = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-    text = tokenizer.decode(
-        original_ids,
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
-    retokenized_ids = tokenizer(
-        text,
-        add_special_tokens=False,
-        return_attention_mask=False,
-        return_offsets_mapping=True,
-    )["input_ids"]
-    assert retokenized_ids != original_ids
-
-    responses = torch.tensor([original_ids])
-    step_end_mask = build_step_end_mask(tokenizer, responses, torch.ones_like(responses))
-
-    # The Step-1 preamble is merged.  The Step-2 delimiter and final endpoint
-    # remain aligned to the original sampled actions despite the BPE merge.
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 5], [0, 8]]
-
-
-@pytest.mark.parametrize("lookahead_tokens", [0, -1])
-def test_lookahead_must_be_positive(tokenizer, lookahead_tokens):
-    responses = torch.tensor([[0]])
-    with pytest.raises(ValueError, match="lookahead_tokens must be positive"):
-        build_step_end_mask(
-            tokenizer,
-            responses,
-            torch.ones_like(responses),
-            lookahead_tokens=lookahead_tokens,
-        )
+    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 4], [0, 5]]
 
 
 def test_immediate_eos_is_the_only_step_endpoint():
@@ -403,14 +283,23 @@ def test_immediate_eos_is_the_only_step_endpoint():
     assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 1]]
 
 
-def test_repeated_active_eos_uses_the_first_termination_action():
+@pytest.mark.parametrize(
+    ("min_step_tokens", "max_step_tokens", "message"),
+    [
+        (0, 4, "min_step_tokens"),
+        (4, 3, "max_step_tokens"),
+        (True, 4, "min_step_tokens"),
+    ],
+)
+def test_rejects_invalid_step_lengths(min_step_tokens, max_step_tokens, message):
     tokenizer = PieceTokenizer({0: "unused"})
-    responses = torch.tensor([[98, 98, 99]])
-    response_mask = torch.tensor([[1, 1, 0]])
-
-    step_end_mask = build_step_end_mask(tokenizer, responses, response_mask)
-
-    assert step_end_mask.nonzero(as_tuple=False).tolist() == [[0, 0]]
+    with pytest.raises(ValueError, match=message):
+        split_token_ids(
+            tokenizer,
+            [0],
+            min_step_tokens=min_step_tokens,
+            max_step_tokens=max_step_tokens,
+        )
 
 
 def test_rejects_response_without_any_active_token():

@@ -29,7 +29,12 @@ def test_sparse_credit_defaults_match_method_configuration():
     assert config.anchors_per_group == 2
     assert config.num_q_samples == 1
     assert config.num_v_samples == 2
+    assert not config.train_mc_branches
+    assert config.branch_groups_per_prompt == 2
     assert config.correctness_key == "acc"
+    assert config.mc_value_loss_weight == 0.6
+    assert config.start_value_loss_weight == 0.2
+    assert config.terminal_value_loss_weight == 0.2
     assert config.advantage_coef == 0.3
     assert config.warmup_ratio == 0.1
     assert config.max_new_tokens is None
@@ -44,8 +49,18 @@ def test_sparse_credit_defaults_match_method_configuration():
         ({"uniform_mix": 1.1}, "uniform_mix"),
         ({"num_q_samples": 0}, "num_q_samples"),
         ({"num_v_samples": 0}, "num_v_samples"),
+        ({"train_mc_branches": 1}, "train_mc_branches"),
+        ({"branch_groups_per_prompt": 0}, "branch_groups_per_prompt"),
         ({"correctness_key": ""}, "correctness_key"),
-        ({"inverse_propensity_clip": 0.0}, "inverse_propensity_clip"),
+        ({"mc_value_loss_weight": -0.1}, "mc_value_loss_weight"),
+        (
+            {
+                "mc_value_loss_weight": 0.0,
+                "start_value_loss_weight": 0.0,
+                "terminal_value_loss_weight": 0.0,
+            },
+            "may not all be zero",
+        ),
         ({"advantage_coef": 1.1}, "advantage_coef"),
         ({"top_k": 0}, "top_k"),
         ({"max_new_tokens": 0}, "max_new_tokens"),
@@ -61,9 +76,15 @@ def test_credit_head_defaults_and_validation():
     assert not config.enabled
     assert config.hidden_dim == 512
     assert config.lr == 1e-3
+    assert config.difference_loss_weight == 0.25
+    assert config.optimizer_steps_per_batch == 2
     assert config.save_checkpoint
     with pytest.raises(ValueError, match="hidden_dim"):
         CounterfactualCreditHeadConfig(hidden_dim=0)
+    with pytest.raises(ValueError, match="difference_loss_weight"):
+        CounterfactualCreditHeadConfig(difference_loss_weight=-0.1)
+    with pytest.raises(ValueError, match="optimizer_steps_per_batch"):
+        CounterfactualCreditHeadConfig(optimizer_steps_per_batch=0)
 
 
 def test_ppo_yaml_materializes_both_typed_configs():

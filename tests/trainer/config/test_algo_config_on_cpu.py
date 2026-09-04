@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from verl.trainer.config import AlgoConfig, KLControlConfig, StepSplitConfig
+from verl.trainer.config import AdaptiveTopupConfig, AlgoConfig, KLControlConfig, StepSplitConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -100,8 +100,8 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertTrue(config.norm_adv_by_std_in_grpo)  # default value
         self.assertIsInstance(config.step_split, StepSplitConfig)
         self.assertFalse(config.step_split.enabled)
-        self.assertEqual(config.step_split.lookahead_tokens, 10)
-        self.assertFalse(config.step_split.separate_preamble)
+        self.assertEqual(config.step_split.min_step_tokens, 96)
+        self.assertEqual(config.step_split.max_step_tokens, 512)
         self.assertFalse(config.use_kl_in_reward)  # default value
         self.assertEqual(config.kl_penalty, "kl")  # default value
         self.assertFalse(config.use_pf_ppo)  # default value
@@ -143,19 +143,35 @@ class TestAlgoConfig(unittest.TestCase):
 
     def test_step_split_config_validation(self):
         """Step splitting is independently configurable without a probe."""
-        config = StepSplitConfig(enabled=True, lookahead_tokens=4, separate_preamble=True)
+        config = StepSplitConfig(enabled=True, min_step_tokens=32, max_step_tokens=256)
         self.assertTrue(config.enabled)
-        self.assertEqual(config.lookahead_tokens, 4)
-        self.assertTrue(config.separate_preamble)
+        self.assertEqual(config.min_step_tokens, 32)
+        self.assertEqual(config.max_step_tokens, 256)
 
         invalid_cases = [
             ({"enabled": 1}, "step_split.enabled"),
-            ({"lookahead_tokens": 0}, "step_split.lookahead_tokens"),
-            ({"separate_preamble": 1}, "step_split.separate_preamble"),
+            ({"min_step_tokens": 0}, "step_split.min_step_tokens"),
+            ({"max_step_tokens": 63}, "step_split.max_step_tokens"),
         ]
         for kwargs, expected_message in invalid_cases:
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_message):
                 StepSplitConfig(**kwargs)
+
+    def test_adaptive_topup_config_validation(self):
+        config = AdaptiveTopupConfig(enabled=True, max_total_n=16, chunk_size=4)
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.max_total_n, 16)
+        self.assertEqual(config.chunk_size, 4)
+
+        invalid_cases = [
+            ({"enabled": 1}, "adaptive_topup.enabled"),
+            ({"enabled": True, "max_total_n": 1}, "adaptive_topup.max_total_n"),
+            ({"chunk_size": 0}, "adaptive_topup.chunk_size"),
+            ({"selection_seed": 1.5}, "adaptive_topup.selection_seed"),
+        ]
+        for kwargs, expected_message in invalid_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, expected_message):
+                AdaptiveTopupConfig(**kwargs)
 
 
 class TestAlgoCompute(unittest.TestCase):

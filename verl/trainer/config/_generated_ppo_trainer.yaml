@@ -87,6 +87,8 @@ actor_rollout_ref:
       hidden_dim: 512
       lr: 0.001
       weight_decay: 0.0
+      difference_loss_weight: 0.25
+      optimizer_steps_per_batch: 2
       save_checkpoint: true
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
@@ -658,8 +660,8 @@ algorithm:
   step_split:
     _target_: verl.trainer.config.StepSplitConfig
     enabled: false
-    lookahead_tokens: 10
-    separate_preamble: false
+    min_step_tokens: 96
+    max_step_tokens: 512
   sparse_counterfactual_credit:
     _target_: verl.trainer.config.SparseCounterfactualCreditConfig
     enabled: false
@@ -669,10 +671,12 @@ algorithm:
     uniform_mix: 0.1
     num_q_samples: 1
     num_v_samples: 2
+    train_mc_branches: false
+    branch_groups_per_prompt: 2
     correctness_key: acc
-    huber_delta: 1.0
-    use_inverse_propensity: true
-    inverse_propensity_clip: 5.0
+    mc_value_loss_weight: 0.6
+    start_value_loss_weight: 0.2
+    terminal_value_loss_weight: 0.2
     advantage_coef: 0.3
     warmup_ratio: 0.1
     normalize_batch_std: true

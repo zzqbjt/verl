@@ -316,11 +316,11 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
 
-    def _step_split_options(self) -> tuple[int, bool]:
+    def _step_split_options(self) -> tuple[int, int]:
         """Resolve the shared reasoning-step boundary settings."""
 
         split_config = self.config.algorithm.get("step_split", {})
-        return int(split_config.get("lookahead_tokens", 10)), bool(split_config.get("separate_preamble", False))
+        return int(split_config.get("min_step_tokens", 96)), int(split_config.get("max_step_tokens", 512))
 
     def _prepare_step_inputs(self, batch: DataProto) -> None:
         """Attach tokenizer-aligned step boundaries when requested."""
@@ -331,13 +331,13 @@ class RayPPOTrainer:
             batch.batch["response_mask"] = compute_response_mask(batch)
         if "step_end_mask" in batch.batch:
             return
-        lookahead_tokens, separate_preamble = self._step_split_options()
+        min_step_tokens, max_step_tokens = self._step_split_options()
         batch.batch["step_end_mask"] = build_step_end_mask(
             tokenizer=self.tokenizer,
             responses=batch.batch["responses"],
             response_mask=batch.batch["response_mask"],
-            lookahead_tokens=lookahead_tokens,
-            separate_preamble=separate_preamble,
+            min_step_tokens=min_step_tokens,
+            max_step_tokens=max_step_tokens,
         )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -708,6 +708,12 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _register_additional_worker_roles(self) -> None:
+        """Hook for recipes that colocate extra worker roles in an existing resource pool."""
+
+    def _initialize_additional_worker_groups(self, all_wg: dict) -> None:
+        """Hook for recipes to initialize worker groups registered by the hook above."""
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -773,6 +779,8 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
+        self._register_additional_worker_roles()
+
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -806,6 +814,10 @@ class RayPPOTrainer:
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
+
+        # Initialize recipe-specific workers before the actor.  Extra models can
+        # therefore offload themselves before vLLM sizes its KV cache.
+        self._initialize_additional_worker_groups(all_wg)
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
