@@ -87,7 +87,6 @@ actor_rollout_ref:
       hidden_dim: 512
       lr: 0.001
       weight_decay: 0.0
-      difference_loss_weight: 0.25
       optimizer_steps_per_batch: 2
       save_checkpoint: true
     clip_ratio_c: 3.0
@@ -665,12 +664,12 @@ algorithm:
   sparse_counterfactual_credit:
     _target_: verl.trainer.config.SparseCounterfactualCreditConfig
     enabled: false
+    use_probe: true
     entropy_top_ratio: 0.2
     anchors_per_group: 2
     sampling_temperature: 1.0
     uniform_mix: 0.1
-    num_q_samples: 1
-    num_v_samples: 2
+    num_samples: 4
     train_mc_branches: false
     branch_groups_per_prompt: 2
     correctness_key: acc

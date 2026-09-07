@@ -98,8 +98,7 @@ def test_counterfactual_rollout_reuses_boundary_values_and_samples_only_required
     supervisor.config = SparseCounterfactualCreditConfig(
         enabled=True,
         anchors_per_group=4,
-        num_q_samples=1,
-        num_v_samples=2,
+        num_samples=2,
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
     seen_prompts = []
@@ -107,14 +106,14 @@ def test_counterfactual_rollout_reuses_boundary_values_and_samples_only_required
 
     def generate(prompt_ids, response_prefix_lengths):
         # Initial anchors skip V rollouts; terminal anchors skip Q rollouts.
-        assert response_prefix_lengths == [2, 2, 2]
+        assert response_prefix_lengths == [2, 2, 2, 2]
         seen_prompts.extend(prompt_ids)
         return [SimpleNamespace(token_ids=[90 + index]) for index in range(len(prompt_ids))]
 
     def score(batch, source_indices, response_ids):
         del batch, source_indices
         seen_full_responses.extend(response_ids)
-        return torch.tensor([0.5, 0.25, 0.25])
+        return torch.tensor([0.5, 0.5, 0.25, 0.25])
 
     supervisor._generate = generate
     supervisor._score = score
@@ -130,11 +129,13 @@ def test_counterfactual_rollout_reuses_boundary_values_and_samples_only_required
 
     assert seen_prompts == [
         [1, 2, 10, 11],
+        [1, 2, 10, 11],
         [1, 2, 20, 21],
         [1, 2, 20, 21],
     ]
     assert seen_full_responses[0] == [10, 11, 90]
-    assert seen_full_responses[1] == [20, 21, 91]
+    assert seen_full_responses[1] == [10, 11, 91]
+    assert seen_full_responses[2] == [20, 21, 92]
     anchor_targets = batch.batch["credit_anchor_targets"][batch.batch["credit_anchor_mask"]]
     # First-step V uses the full group's correctness.
     # Terminal-step Q uses its own final correctness without a Q rollout.
@@ -164,14 +165,13 @@ def test_middle_steps_keep_both_q_and_v_suffix_rollouts():
     supervisor.config = SparseCounterfactualCreditConfig(
         enabled=True,
         anchors_per_group=6,
-        num_q_samples=1,
-        num_v_samples=2,
+        num_samples=2,
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
     seen_prefix_lengths = []
 
     def generate(prompt_ids, response_prefix_lengths):
-        assert len(prompt_ids) == 12
+        assert len(prompt_ids) == 16
         seen_prefix_lengths.extend(response_prefix_lengths)
         return [SimpleNamespace(token_ids=[90]) for _ in prompt_ids]
 
@@ -189,8 +189,8 @@ def test_middle_steps_keep_both_q_and_v_suffix_rollouts():
     ):
         result = supervisor.collect_targets(batch, global_step=1)
 
-    # Per response: first Q; middle Q + two V; final two V.
-    assert seen_prefix_lengths == [2, 4, 2, 2, 4, 4] * 2
+    # Per response: two first Q; two middle Q + two V; two final V.
+    assert seen_prefix_lengths == [2, 2, 4, 4, 2, 2, 4, 4] * 2
     assert result.training_branches is None
 
 
@@ -199,8 +199,7 @@ def test_single_step_responses_need_no_counterfactual_suffix_rollouts():
     supervisor.config = SparseCounterfactualCreditConfig(
         enabled=True,
         anchors_per_group=2,
-        num_q_samples=1,
-        num_v_samples=2,
+        num_samples=2,
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
 
@@ -267,8 +266,7 @@ def test_mc_branch_training_selects_diverse_high_variance_anchors_and_masks_pref
     supervisor.config = SparseCounterfactualCreditConfig(
         enabled=True,
         anchors_per_group=2,
-        num_q_samples=2,
-        num_v_samples=2,
+        num_samples=2,
         train_mc_branches=True,
         branch_groups_per_prompt=2,
         selection_seed=7,

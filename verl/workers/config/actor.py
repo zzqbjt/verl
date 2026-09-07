@@ -113,7 +113,6 @@ class CounterfactualCreditHeadConfig(BaseConfig):
     hidden_dim: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
-    difference_loss_weight: float = 0.25
     optimizer_steps_per_batch: int = 2
     save_checkpoint: bool = True
 
@@ -136,13 +135,6 @@ class CounterfactualCreditHeadConfig(BaseConfig):
             or self.weight_decay < 0
         ):
             raise ValueError("counterfactual_credit_head.weight_decay must be finite and >= 0.")
-        if (
-            isinstance(self.difference_loss_weight, bool)
-            or not isinstance(self.difference_loss_weight, (int, float))
-            or not math.isfinite(self.difference_loss_weight)
-            or self.difference_loss_weight < 0
-        ):
-            raise ValueError("counterfactual_credit_head.difference_loss_weight must be finite and >= 0.")
         if (
             not isinstance(self.optimizer_steps_per_batch, int)
             or isinstance(self.optimizer_steps_per_batch, bool)
@@ -190,6 +182,8 @@ class ActorConfig(BaseConfig):
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
         router_replay (RouterReplayConfig): Configuration for router replay in MoE models.
+        rollout_n (int): Training responses per prompt. Defaults to the base rollout count;
+            DAPO includes inserted MC branches when branch training is enabled.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {

@@ -22,6 +22,7 @@ from tensordict import TensorDict
 
 from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
 from verl import DataProto
+from verl.trainer.ppo.sparse_counterfactual_credit import build_credit_residual, merge_anchor_credit
 
 
 class _ExhaustedDataLoader:
@@ -32,6 +33,170 @@ class _ExhaustedDataLoader:
 
     def __iter__(self):
         return iter(())
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("use_probe", [True, False])
+def test_sparse_mc_disables_head_before_worker_initialization(enabled, use_probe):
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {"sparse_counterfactual_credit": {"enabled": enabled, "use_probe": use_probe}},
+            "actor_rollout_ref": {
+                "actor": {"counterfactual_credit_head": {"enabled": True}},
+                "rollout": {"n": 8},
+            },
+        }
+    )
+
+    def check_head_config():
+        assert trainer.config.actor_rollout_ref.actor.counterfactual_credit_head.enabled is (not enabled or use_probe)
+
+    with patch("recipe.dapo.dapo_ray_trainer.RayPPOTrainer.init_workers", side_effect=check_head_config) as initialize:
+        trainer.init_workers()
+    initialize.assert_called_once_with()
+
+
+@pytest.mark.parametrize("credit_enabled", [True, False])
+@pytest.mark.parametrize("train_mc_branches", [True, False])
+@pytest.mark.parametrize("use_probe", [True, False])
+@pytest.mark.parametrize("credit_coef", [0.0, 0.3])
+@pytest.mark.parametrize(("base_n", "branch_groups", "samples"), [(8, 2, 4), (6, 2, 3), (12, 3, 4)])
+def test_actor_minibatch_response_count_includes_only_training_branches(
+    credit_enabled, train_mc_branches, use_probe, credit_coef, base_n, branch_groups, samples
+):
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {
+                "sparse_counterfactual_credit": {
+                    "enabled": credit_enabled,
+                    "train_mc_branches": train_mc_branches,
+                    "use_probe": use_probe,
+                    "advantage_coef": credit_coef,
+                    "branch_groups_per_prompt": branch_groups,
+                    "num_samples": samples,
+                }
+            },
+            "actor_rollout_ref": {
+                "actor": {
+                    "ppo_mini_batch_size": 8,
+                    "rollout_n": base_n,
+                    "counterfactual_credit_head": {"enabled": True},
+                },
+                "rollout": {"n": base_n},
+            },
+        }
+    )
+    OmegaConf.set_struct(trainer.config, True)
+    expected_n = base_n + (branch_groups * samples if credit_enabled and train_mc_branches else 0)
+
+    def check_worker_config():
+        assert trainer.config.actor_rollout_ref.rollout.n == base_n
+        assert trainer.config.actor_rollout_ref.actor.ppo_mini_batch_size == 8
+        assert trainer.config.actor_rollout_ref.actor.rollout_n == expected_n
+
+    with patch("recipe.dapo.dapo_ray_trainer.RayPPOTrainer.init_workers", side_effect=check_worker_config):
+        trainer.init_workers()
+        trainer.init_workers()  # Reinitialization must not multiply or add the branch count again.
+    # A resolved config may already hold the previous training count.
+    trainer.config.algorithm.sparse_counterfactual_credit.train_mc_branches = False
+    with patch("recipe.dapo.dapo_ray_trainer.RayPPOTrainer.init_workers"):
+        trainer.init_workers()
+    assert trainer.config.actor_rollout_ref.actor.rollout_n == base_n
+    assert trainer.config.actor_rollout_ref.rollout.n == base_n
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_sparse_mc_skips_probe_and_centers_over_all_policy_tokens(normalize, sign):
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create({"algorithm": {"sparse_counterfactual_credit": {"use_probe": False}}})
+    trainer.actor_rollout_wg = MagicMock()
+    anchor_mask = torch.tensor(
+        [[0, 1, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.bool
+    )
+    targets = torch.zeros(4, 6)
+    targets[anchor_mask] = sign * torch.tensor([0.75, -0.5])
+    response_mask = torch.tensor(
+        [[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0], [0, 0, 1, 1, 1, 0]], dtype=torch.bool
+    )
+    batch = DataProto.from_dict(
+        tensors={
+            "credit_anchor_targets": targets,
+            "credit_anchor_mask": anchor_mask,
+            # Verify that stale dense values are never used in Sparse-MC mode.
+            "credit_predictions": torch.ones_like(targets),
+            "response_mask": response_mask,
+            "step_end_mask": torch.tensor(
+                [[0, 1, 0, 0, 1, 0], [0, 1, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0], [0, 0, 0, 1, 1, 0]], dtype=torch.bool
+            ),
+            "is_mc_branch": torch.tensor([False, False, False, True]),
+        }
+    )
+    metrics, timing_raw = {}, {}
+    result = trainer._predict_counterfactual_credit(batch, 0.3, metrics, timing_raw)
+
+    assert result is batch
+    trainer.actor_rollout_wg.update_counterfactual_credit.assert_not_called()
+    assert not metrics and not timing_raw
+    torch.testing.assert_close(result.batch["credit_predictions"], torch.zeros_like(targets))
+    endpoints = merge_anchor_credit(result.batch["credit_predictions"], anchor_mask, targets[anchor_mask])
+    torch.testing.assert_close(endpoints, targets)
+    residual, _ = build_credit_residual(
+        endpoints, batch.batch["step_end_mask"], response_mask, normalize_batch_std=normalize, epsilon=1e-6
+    )
+    expected = sign * torch.tensor(
+        [[0.5, 0.5, -0.25, -0.25, -0.25, -0.25], [0.25, 0.25, -0.25, -0.25, 0, 0], [0] * 6, [0] * 6]
+    )
+    if normalize:
+        expected = expected / (expected[response_mask].square().mean().sqrt() + 1e-6)
+    torch.testing.assert_close(residual, expected)
+    torch.testing.assert_close(residual.sum(dim=-1), torch.zeros(4), atol=1e-6, rtol=0)
+    # Non-anchor base rows, MC branches, prefixes, and padding all retain zero residual.
+    assert not residual[2:].any()
+    assert not residual[~response_mask].any()
+
+
+@pytest.mark.parametrize("credit_coef", [0.0, 0.3])
+@pytest.mark.parametrize("probe_config", [{}, {"use_probe": True}])
+def test_full_method_keeps_probe_update_and_metrics(credit_coef, probe_config):
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create(
+        {"algorithm": {"sparse_counterfactual_credit": dict(
+            probe_config, mc_value_loss_weight=1.0, start_value_loss_weight=0.0, terminal_value_loss_weight=0.0
+        )}}
+    )
+    trainer.global_steps = 3
+    trainer.actor_rollout_wg = MagicMock()
+    predictions = torch.tensor([[0.2, -0.1]])
+    values = {
+        "credit_predictions": predictions,
+        "credit_head_value_bce": torch.tensor([0.6]),
+        "credit_head_value_mae": torch.tensor([0.1]),
+        "credit_head_direction_agreement": torch.tensor([0.7]),
+        "credit_head_direction_majority_baseline": torch.tensor([0.6]),
+        "credit_head_direction_excess": torch.tensor([0.1]),
+    }
+    for source in ("mc", "start", "terminal"):
+        for metric in ("bce", "mae"):
+            values[f"credit_head_value_{metric}_{source}"] = torch.tensor([0.2 if source == "mc" else float("nan")])
+    trainer.actor_rollout_wg.update_counterfactual_credit.return_value = DataProto.from_dict(tensors=values)
+    batch = DataProto.from_dict(tensors={"credit_anchor_targets": torch.zeros_like(predictions)})
+    metrics, timing_raw = {}, {}
+
+    result = trainer._predict_counterfactual_credit(batch, credit_coef, metrics, timing_raw)
+
+    trainer.actor_rollout_wg.update_counterfactual_credit.assert_called_once_with(batch)
+    assert batch.meta_info["predict_all_credit_steps"] is (credit_coef != 0.0)
+    assert batch.meta_info["credit_value_loss_weights"] == (1.0, 0.0, 0.0)
+    assert batch.meta_info["global_steps"] == 3
+    torch.testing.assert_close(result.batch["credit_predictions"], predictions)
+    assert metrics["credit/head_direction_agreement"] == pytest.approx(0.7)
+    assert metrics["credit/head_value_bce/mc"] == pytest.approx(0.2)
+    assert "credit/head_value_bce/start" not in metrics
+    assert "credit/head_value_mae/terminal" not in metrics
+    assert "counterfactual_credit_head" in timing_raw
 
 
 def test_response_lengths_use_full_base_responses_and_generated_mc_continuations():

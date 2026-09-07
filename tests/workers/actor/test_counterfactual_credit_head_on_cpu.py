@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -43,7 +44,12 @@ class _TinyCausalLM(torch.nn.Module):
         return SimpleNamespace(logits=self.lm_head(hidden))
 
 
-def _make_actor(use_remove_padding: bool, *, use_dynamic_bsz: bool = False) -> DataParallelPPOActor:
+def _make_actor(
+    use_remove_padding: bool,
+    *,
+    use_dynamic_bsz: bool = False,
+    optimizer_steps_per_batch: int = 2,
+) -> DataParallelPPOActor:
     config = FSDPActorConfig(
         strategy="fsdp",
         rollout_n=1,
@@ -57,6 +63,7 @@ def _make_actor(use_remove_padding: bool, *, use_dynamic_bsz: bool = False) -> D
             hidden_dim=5,
             lr=1e-2,
             weight_decay=0.0,
+            optimizer_steps_per_batch=optimizer_steps_per_batch,
         ),
     )
     model = _TinyCausalLM()
@@ -130,15 +137,32 @@ def test_credit_head_uses_prompt_and_previous_step_boundaries_and_updates(use_re
     expected_credit = torch.tensor([[0.5, 0.0, 0.25], [0.0, -0.5, 0.0]])
     torch.testing.assert_close(outputs["credit_predictions"], expected_credit)
     assert torch.isfinite(outputs["credit_head_value_bce"]).all()
-    assert torch.isfinite(outputs["credit_head_difference_smooth_l1"]).all()
+    for source_name in ("mc", "start", "terminal"):
+        assert torch.isfinite(outputs[f"credit_head_value_bce_{source_name}"]).all()
+        assert torch.isfinite(outputs[f"credit_head_value_mae_{source_name}"]).all()
     torch.testing.assert_close(
-        outputs["credit_head_total_loss"],
-        outputs["credit_head_value_bce"] + 0.25 * outputs["credit_head_difference_smooth_l1"],
+        outputs["credit_head_value_bce"],
+        0.6 * outputs["credit_head_value_bce_mc"]
+        + 0.2 * outputs["credit_head_value_bce_start"]
+        + 0.2 * outputs["credit_head_value_bce_terminal"],
     )
+    torch.testing.assert_close(
+        outputs["credit_head_value_mae"],
+        0.6 * outputs["credit_head_value_mae_mc"]
+        + 0.2 * outputs["credit_head_value_mae_start"]
+        + 0.2 * outputs["credit_head_value_mae_terminal"],
+    )
+    assert "credit_head_difference_smooth_l1" not in outputs
+    assert "credit_head_total_loss" not in outputs
     assert torch.all((outputs["credit_head_value_mae"] >= 0) & (outputs["credit_head_value_mae"] <= 1))
     assert torch.all(
         (outputs["credit_head_direction_agreement"] >= 0) & (outputs["credit_head_direction_agreement"] <= 1)
     )
+    assert torch.all(
+        (outputs["credit_head_direction_majority_baseline"] >= 0.5)
+        & (outputs["credit_head_direction_majority_baseline"] <= 1)
+    )
+    assert torch.all((outputs["credit_head_direction_excess"] >= -1) & (outputs["credit_head_direction_excess"] <= 0.5))
     assert "credit_head_confident_direction_agreement" not in outputs
     assert "credit_head_confident_direction_coverage" not in outputs
     assert "credit_head_updates" not in outputs
@@ -151,6 +175,93 @@ def test_credit_head_uses_prompt_and_previous_step_boundaries_and_updates(use_re
         for name, parameter in actor.counterfactual_credit_head.named_parameters()
     )
     assert actor.counterfactual_credit_updates == 2
+
+
+@pytest.mark.parametrize("optimizer_steps", [1, 2])
+@pytest.mark.parametrize("predict_all_steps", [False, True])
+@pytest.mark.parametrize("source_weights", [(0.6, 0.2, 0.2), (0.6, 0.0, 0.2), (0.6, 0.2, 0.0), (1.0, 0.0, 0.0)])
+def test_probe_skips_disabled_sources_and_matches_bce_only(optimizer_steps, predict_all_steps, source_weights):
+    actor = _make_actor(False, optimizer_steps_per_batch=optimizer_steps)
+    reference_head, reference_optimizer = deepcopy(
+        (actor.counterfactual_credit_head, actor.counterfactual_credit_optimizer)
+    )
+    # These are the MC-Q, prompt, and terminal boundaries in _make_data.
+    source_hidden = (
+        torch.full((1, 4), 0.3),
+        torch.full((1, 4), 0.2),
+        torch.tensor([[0.5] * 4, [0.8] * 4]),
+    )
+    source_targets = (torch.tensor([0.75]), torch.tensor([0.25]), torch.tensor([1.0, 0.0]))
+    for step in range(optimizer_steps):
+        bce = sum(
+            weight / sum(source_weights)
+            * torch.nn.functional.binary_cross_entropy(reference_head(hidden).squeeze(-1), targets)
+            for weight, hidden, targets in zip(source_weights, source_hidden, source_targets, strict=True)
+            if weight > 0
+        )
+        if step == 0:
+            expected_pre_update_bce = bce.detach().clone()
+        reference_optimizer.zero_grad(set_to_none=True)
+        bce.backward()
+        reference_optimizer.step()
+
+    data = _make_data()
+    data.meta_info["predict_all_credit_steps"] = predict_all_steps
+    data.meta_info["credit_value_loss_weights"] = source_weights
+    forward_grad_modes = []
+    diagnostic_inputs = []
+
+    def check_forward(_module, args):
+        forward_grad_modes.append(torch.is_grad_enabled())
+        if not torch.is_grad_enabled():
+            diagnostic_inputs.append(args[0].detach().clone())
+            return
+        # Disabled boundaries may be predicted for diagnostics, but not trained.
+        forbidden_values = []
+        if source_weights[1] == 0:
+            forbidden_values.extend((0.2, 0.6))
+        if source_weights[2] == 0:
+            forbidden_values.extend((0.5, 0.8))
+        for value in forbidden_values:
+            assert not torch.isclose(args[0][:, 0], torch.tensor(value)).any()
+
+    hook = actor.counterfactual_credit_head.register_forward_pre_hook(check_forward)
+    try:
+        with (
+            patch("verl.workers.actor.dp_actor.get_device_id", return_value=torch.device("cpu")),
+            patch("verl.workers.actor.dp_actor.logprobs_from_logits", side_effect=_cpu_logprobs),
+            patch(
+                "torch.nn.functional.smooth_l1_loss",
+                side_effect=AssertionError("Probe training must only compute value BCE."),
+            ),
+        ):
+            outputs = actor.compute_counterfactual_credit(data)
+    finally:
+        hook.remove()
+
+    # Only enabled BCE sources build graphs; direction/policy prediction remains no-grad.
+    assert sum(forward_grad_modes) == sum(weight > 0 for weight in source_weights) * optimizer_steps
+    predicted_tokens = torch.cat(diagnostic_inputs)[:, 0]
+    for boundary in (0.2, 0.6, 0.8):
+        assert torch.isclose(predicted_tokens, torch.tensor(boundary)).any()
+    assert actor.counterfactual_credit_updates == optimizer_steps
+    torch.testing.assert_close(outputs["credit_head_value_bce"], expected_pre_update_bce.expand(2))
+    assert "credit_head_total_loss" not in outputs
+    assert "credit_head_difference_smooth_l1" not in outputs
+    for weight, source_name in zip(source_weights, ("mc", "start", "terminal"), strict=True):
+        for metric in ("bce", "mae"):
+            source_metric = outputs[f"credit_head_value_{metric}_{source_name}"]
+            assert source_metric.isfinite().all() if weight > 0 else source_metric.isnan().all()
+    assert outputs["credit_head_direction_agreement"].isfinite().all()
+    assert outputs["credit_head_direction_excess"].isfinite().all()
+    expected_credit = torch.tensor([[0.5, 0.0, 0.25], [0.0, -0.5, 0.0]])
+    if not predict_all_steps:
+        expected_credit.zero_()
+    torch.testing.assert_close(outputs["credit_predictions"], expected_credit)
+    for actual, expected in zip(
+        actor.counterfactual_credit_head.parameters(), reference_head.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_value_boundaries_are_aligned_with_each_transition_and_detached():
@@ -169,6 +280,39 @@ def test_value_boundaries_are_aligned_with_each_transition_and_detached():
     assert torch.equal(after_indices, torch.tensor([1, 2, 4]))
     assert not before.requires_grad
     assert not after.requires_grad
+
+
+def test_mc_only_without_interior_labels_only_predicts_for_direction_and_skips_optimizer():
+    actor = _make_actor(False)
+    # The second response has one step, with both boundary values known.
+    data = _make_data()[1:]
+    data.meta_info["credit_value_loss_weights"] = (1.0, 0.0, 0.0)
+
+    def diagnostic_forward(hidden):
+        assert not torch.is_grad_enabled()
+        torch.testing.assert_close(hidden, torch.tensor([[0.6] * 4, [0.8] * 4]))
+        return hidden.new_full((hidden.shape[0], 1), 0.5)
+
+    with (
+        patch("verl.workers.actor.dp_actor.get_device_id", return_value=torch.device("cpu")),
+        patch("verl.workers.actor.dp_actor.logprobs_from_logits", side_effect=_cpu_logprobs),
+        patch.object(
+            actor.counterfactual_credit_head,
+            "forward",
+            side_effect=diagnostic_forward,
+        ) as head_forward,
+        patch.object(actor.counterfactual_credit_optimizer, "step") as optimizer_step,
+    ):
+        outputs = actor.compute_counterfactual_credit(data)
+
+    optimizer_step.assert_not_called()
+    head_forward.assert_called_once()
+    assert actor.counterfactual_credit_updates == 0
+    torch.testing.assert_close(outputs["credit_predictions"], torch.tensor([[0.0, -0.5, 0.0]]))
+    torch.testing.assert_close(outputs["credit_head_direction_agreement"], torch.zeros(1))
+    for source_name in ("mc", "start", "terminal"):
+        assert outputs[f"credit_head_value_bce_{source_name}"].isnan().all()
+        assert outputs[f"credit_head_value_mae_{source_name}"].isnan().all()
 
 
 def test_credit_capture_uses_fixed_response_prefix_as_branch_start_boundary():
@@ -191,13 +335,15 @@ def test_credit_capture_uses_fixed_response_prefix_as_branch_start_boundary():
     torch.testing.assert_close(boundary_hidden, expected_token_values)
 
 
-def test_dynamic_credit_micro_batches_restore_original_response_order():
+@pytest.mark.parametrize("source_weights", [(0.6, 0.2, 0.2), (1.0, 0.0, 0.0)])
+def test_dynamic_credit_micro_batches_restore_original_response_order(source_weights):
     actor = _make_actor(True, use_dynamic_bsz=True)
     with torch.no_grad():
         actor.counterfactual_credit_head.output_layer.bias.fill_(0.25)
     data = _make_data()
     data.meta_info["use_dynamic_bsz"] = True
     data.meta_info["max_token_len"] = 5
+    data.meta_info["credit_value_loss_weights"] = source_weights
     with (
         patch("verl.workers.actor.dp_actor.get_device_id", return_value=torch.device("cpu")),
         patch("verl.workers.actor.dp_actor.logprobs_from_logits", side_effect=_cpu_logprobs),
@@ -225,9 +371,46 @@ def test_credit_head_direction_agreement_is_weighted_by_target_magnitude():
         outputs = actor.compute_counterfactual_credit(data)
 
     torch.testing.assert_close(outputs["credit_head_direction_agreement"], torch.full((2,), 0.8))
+    torch.testing.assert_close(outputs["credit_head_direction_majority_baseline"], torch.full((2,), 0.8))
+    torch.testing.assert_close(outputs["credit_head_direction_excess"], torch.zeros(2))
 
 
-def test_credit_predictions_are_computed_before_current_batch_head_update():
+@pytest.mark.parametrize("source_weights", [(0.6, 0.2, 0.2), (1.0, 0.0, 0.0)])
+@pytest.mark.parametrize("predict_all_steps", [False, True])
+@pytest.mark.parametrize("predicted_value", [0.1, 0.5])
+def test_direction_uses_raw_predictions_without_boundary_or_mc_substitution(
+    source_weights, predict_all_steps, predicted_value
+):
+    actor = _make_actor(False)
+    with torch.no_grad():
+        for parameter in actor.counterfactual_credit_head.parameters():
+            parameter.zero_()
+        actor.counterfactual_credit_head.output_layer.bias.fill_(torch.logit(torch.tensor(predicted_value)))
+    data = _make_data()[:1]
+    data.meta_info["credit_value_loss_weights"] = source_weights
+    data.meta_info["predict_all_credit_steps"] = predict_all_steps
+    data.batch["step_end_mask"].fill_(True)
+    data.batch["credit_anchor_mask"].fill_(True)
+    data.batch["credit_anchor_q_targets"] = torch.tensor([[0.75, 0.25, 1.0]])
+    data.batch["credit_anchor_v_targets"] = torch.tensor([[0.25, 0.75, 0.25]])
+    data.batch["credit_anchor_targets"] = torch.tensor([[0.5, -0.5, 0.75]])
+    with (
+        patch("verl.workers.actor.dp_actor.get_device_id", return_value=torch.device("cpu")),
+        patch("verl.workers.actor.dp_actor.logprobs_from_logits", side_effect=_cpu_logprobs),
+    ):
+        outputs = actor.compute_counterfactual_credit(data)
+
+    # All predicted values are identical, so every raw difference is zero.
+    # Neither boundary nor interior MC labels may improve this diagnostic.
+    torch.testing.assert_close(outputs["credit_head_direction_agreement"], torch.zeros(1))
+    torch.testing.assert_close(outputs["credit_head_direction_majority_baseline"], torch.tensor([5 / 7]))
+    torch.testing.assert_close(outputs["credit_head_direction_excess"], torch.tensor([-5 / 7]))
+    expected_credit = data.batch["credit_anchor_targets"] if predict_all_steps else torch.zeros((1, 3))
+    torch.testing.assert_close(outputs["credit_predictions"], expected_credit)
+
+
+@pytest.mark.parametrize("source_weights", [(0.6, 0.2, 0.2), (1.0, 0.0, 0.0)])
+def test_credit_predictions_are_computed_before_current_batch_head_update(source_weights):
     actor = _make_actor(False)
     with torch.no_grad():
         for parameter in actor.counterfactual_credit_head.parameters():
@@ -239,6 +422,7 @@ def test_credit_predictions_are_computed_before_current_batch_head_update():
             actor.counterfactual_credit_head.output_layer.bias.fill_(0.75)
 
     data = _make_data()
+    data.meta_info["credit_value_loss_weights"] = source_weights
     data.batch["credit_terminal_value_mask"][0] = False
     with (
         patch("verl.workers.actor.dp_actor.get_device_id", return_value=torch.device("cpu")),
@@ -270,8 +454,8 @@ def test_zero_lambda_step_predicts_only_mc_anchors_for_probe_update():
     torch.testing.assert_close(outputs["credit_predictions"], torch.zeros_like(data.batch["step_end_mask"].float()))
     assert actor.counterfactual_credit_updates == 2
     assert torch.isfinite(outputs["credit_head_value_bce"]).all()
-    assert torch.isfinite(outputs["credit_head_difference_smooth_l1"]).all()
-    assert torch.isfinite(outputs["credit_head_total_loss"]).all()
+    assert "credit_head_difference_smooth_l1" not in outputs
+    assert "credit_head_total_loss" not in outputs
     assert torch.isfinite(outputs["credit_head_value_mae"]).all()
 
 

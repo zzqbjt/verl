@@ -919,6 +919,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("credit_value_loss_weights must contain three finite nonnegative values")
         if sum(value_loss_weights) <= 0:
             raise ValueError("credit_value_loss_weights must contain at least one positive value")
+        source_enabled = tuple(weight > 0 for weight in value_loss_weights)
 
         self.actor_module.eval()
         select_keys = [
@@ -949,7 +950,6 @@ class DataParallelPPOActor(BasePPOActor):
         start_value_targets = []
         terminal_value_hidden = []
         terminal_value_targets = []
-        anchor_credit_targets = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, "pad_token_id": data.meta_info.get("pad_token_id", 0)}
@@ -999,88 +999,121 @@ class DataParallelPPOActor(BasePPOActor):
             # Anchor Q/V labels train both sides of an interior transition.
             # First-step V and terminal-step Q are excluded here because their
             # exact labels are already supplied by the start/terminal sources.
-            train_anchor_v = packed_anchor_mask & ~first_step_mask
-            train_anchor_q = packed_anchor_mask & ~last_step_mask
+            train_anchor_v = packed_anchor_mask & ~first_step_mask & source_enabled[0]
+            train_anchor_q = packed_anchor_mask & ~last_step_mask & source_enabled[0]
             mc_value_hidden.extend((before_hidden[train_anchor_v], after_hidden[train_anchor_q]))
             mc_value_targets.extend(
                 (
-                    selected_v_targets[~first_step_mask[packed_anchor_mask]],
-                    selected_q_targets[~last_step_mask[packed_anchor_mask]],
+                    selected_v_targets[train_anchor_v[packed_anchor_mask]],
+                    selected_q_targets[train_anchor_q[packed_anchor_mask]],
                 )
             )
-            start_value_hidden.append(before_hidden[first_step_indices[start_train_mask]])
-            start_value_targets.append(model_inputs["credit_start_value_targets"].float()[start_train_mask])
-            terminal_value_hidden.append(after_hidden[last_step_indices[terminal_mask]])
-            terminal_value_targets.append(model_inputs["credit_terminal_value_targets"].float()[terminal_mask])
-            anchor_credit_targets.append(selected_credit_targets)
+            start_supervision_mask = start_train_mask & source_enabled[1]
+            terminal_supervision_mask = terminal_mask & source_enabled[2]
+            start_value_hidden.append(before_hidden[first_step_indices[start_supervision_mask]])
+            start_value_targets.append(model_inputs["credit_start_value_targets"].float()[start_supervision_mask])
+            terminal_value_hidden.append(after_hidden[last_step_indices[terminal_supervision_mask]])
+            terminal_value_targets.append(model_inputs["credit_terminal_value_targets"].float()[terminal_supervision_mask])
+
+            # Policy credit uses known boundaries directly. The legacy direction
+            # diagnostic still predicts both sides of every anchor under no_grad,
+            # even when a boundary's BCE source is disabled.
+            fixed_boundary_mask = torch.zeros(boundary_hidden.shape[0], dtype=torch.bool, device=boundary_hidden.device)
+            fixed_boundary_values = boundary_hidden.new_zeros(boundary_hidden.shape[0])
+            indices = before_indices[first_step_indices[start_mask]]
+            fixed_boundary_mask[indices] = True
+            fixed_boundary_values[indices] = model_inputs["credit_start_value_targets"].float()[start_mask]
+            indices = after_indices[last_step_indices[terminal_mask]]
+            fixed_boundary_mask[indices] = True
+            fixed_boundary_values[indices] = model_inputs["credit_terminal_value_targets"].float()[terminal_mask]
+            anchor_boundary_mask = torch.zeros_like(fixed_boundary_mask)
+            anchor_boundary_mask[before_indices[packed_anchor_mask]] = True
+            anchor_boundary_mask[after_indices[packed_anchor_mask]] = True
             value_batches.append(
                 {
                     "boundary_hidden": boundary_hidden,
-                    "step_counts": step_counts,
                     "step_end_mask": step_end_mask,
                     "packed_anchor_mask": packed_anchor_mask,
-                    "before_hidden": before_hidden,
-                    "after_hidden": after_hidden,
                     "first_step_indices": first_step_indices,
                     "last_step_indices": last_step_indices,
                     "before_indices": before_indices,
                     "after_indices": after_indices,
+                    "fixed_boundary_mask": fixed_boundary_mask,
+                    "fixed_boundary_values": fixed_boundary_values,
+                    "anchor_boundary_mask": anchor_boundary_mask,
                     "start_mask": start_mask,
                     "start_targets": model_inputs["credit_start_value_targets"].float(),
                     "terminal_mask": terminal_mask,
                     "terminal_targets": model_inputs["credit_terminal_value_targets"].float(),
                     "anchor_q_targets": selected_q_targets,
                     "anchor_v_targets": selected_v_targets,
+                    "anchor_credit_targets": selected_credit_targets,
                 }
             )
 
-        all_anchor_targets = torch.cat(anchor_credit_targets, dim=0)
         device = value_batches[0]["boundary_hidden"].device
         self._ensure_counterfactual_credit_device(device)
+
+        def predict_boundary_values(value_batch, boundary_mask=None):
+            prediction_mask = ~value_batch["fixed_boundary_mask"] | value_batch["anchor_boundary_mask"]
+            if boundary_mask is not None:
+                prediction_mask = prediction_mask & boundary_mask
+            values = value_batch["fixed_boundary_values"].clone()
+            if prediction_mask.any():
+                values[prediction_mask] = self.counterfactual_credit_head(
+                    value_batch["boundary_hidden"][prediction_mask]
+                ).squeeze(-1).float()
+            return values
 
         # Predictions used by the policy are computed before this batch's probe
         # update. Known start, anchor-Q/V, and terminal values then replace the
         # corresponding predictions before adjacent values are differenced.
         dense_predictions = []
-        raw_anchor_predictions = []
+        anchor_predictions = []
+        direction_credit_targets = []
         self.counterfactual_credit_head.eval()
         with torch.no_grad():
             for value_batch in value_batches:
                 packed_anchor_mask = value_batch["packed_anchor_mask"]
-                raw_anchor_predictions.append(
-                    self.counterfactual_credit_head(value_batch["after_hidden"][packed_anchor_mask]).squeeze(-1)
-                    - self.counterfactual_credit_head(value_batch["before_hidden"][packed_anchor_mask]).squeeze(-1)
+                before_indices = value_batch["before_indices"]
+                after_indices = value_batch["after_indices"]
+                boundary_values = predict_boundary_values(
+                    value_batch, None if predict_all_steps else value_batch["anchor_boundary_mask"]
                 )
+                start_rows = value_batch["start_mask"]
+                terminal_rows = value_batch["terminal_mask"]
+                start_steps = value_batch["first_step_indices"][start_rows]
+                terminal_steps = value_batch["last_step_indices"][terminal_rows]
+                anchor_predictions.append(
+                    boundary_values[after_indices[packed_anchor_mask]]
+                    - boundary_values[before_indices[packed_anchor_mask]]
+                )
+                direction_credit_targets.append(value_batch["anchor_credit_targets"])
                 endpoint_mask = value_batch["step_end_mask"]
                 dense = torch.zeros(endpoint_mask.shape, dtype=torch.float32, device=endpoint_mask.device)
                 if predict_all_steps:
-                    boundary_values = self.counterfactual_credit_head(value_batch["boundary_hidden"])
-                    boundary_values = boundary_values.squeeze(-1).float()
-                    before_indices = value_batch["before_indices"]
-                    after_indices = value_batch["after_indices"]
                     boundary_values[before_indices[packed_anchor_mask]] = value_batch["anchor_v_targets"]
                     boundary_values[after_indices[packed_anchor_mask]] = value_batch["anchor_q_targets"]
-                    start_rows = value_batch["start_mask"]
-                    terminal_rows = value_batch["terminal_mask"]
-                    start_steps = value_batch["first_step_indices"][start_rows]
-                    terminal_steps = value_batch["last_step_indices"][terminal_rows]
                     boundary_values[before_indices[start_steps]] = value_batch["start_targets"][start_rows]
                     boundary_values[after_indices[terminal_steps]] = value_batch["terminal_targets"][terminal_rows]
                     dense[endpoint_mask] = boundary_values[after_indices] - boundary_values[before_indices]
                 dense_predictions.append(dense)
 
-        all_raw_anchor_predictions = torch.cat(raw_anchor_predictions, dim=0)
+        all_anchor_predictions = torch.cat(anchor_predictions, dim=0)
+        all_direction_targets = torch.cat(direction_credit_targets, dim=0)
 
         self.counterfactual_credit_head.train()
         should_update = self.counterfactual_credit_last_global_step != global_step
-        # Weight each sign decision by the amount of credit at stake. These are
-        # raw value-probe differences, before exact boundary values are inserted.
-        target_magnitudes = all_anchor_targets.abs()
-        correct_directions = all_raw_anchor_predictions * all_anchor_targets > 0
+        # Legacy direction metric: both sides use pre-update probe predictions,
+        # including start/terminal states. No known or MC values are substituted
+        # before this diagnostic; disabled BCE sources remain no-grad here.
+        target_magnitudes = all_direction_targets.abs()
+        correct_directions = all_anchor_predictions * all_direction_targets > 0
         direction_statistics = torch.stack(
             (
                 (target_magnitudes * correct_directions).sum(),
                 target_magnitudes.sum(),
+                all_direction_targets.sum(),
             )
         )
         if torch.distributed.is_initialized():
@@ -1090,6 +1123,12 @@ class DataParallelPPOActor(BasePPOActor):
             direction_statistics[0] / direction_statistics[1],
             direction_statistics.new_tensor(float("nan")),
         )
+        direction_majority_baseline = torch.where(
+            direction_statistics[1] > 0,
+            0.5 + direction_statistics[2].abs() / (2.0 * direction_statistics[1]),
+            direction_statistics.new_tensor(float("nan")),
+        )
+        direction_excess = direction_agreement - direction_majority_baseline
         source_hidden = (
             torch.cat(mc_value_hidden, dim=0),
             torch.cat(start_value_hidden, dim=0),
@@ -1105,16 +1144,13 @@ class DataParallelPPOActor(BasePPOActor):
             dtype=torch.float32,
             device=device,
         )
-        global_difference_count = torch.tensor(float(all_anchor_targets.numel()), dtype=torch.float32, device=device)
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(global_source_counts, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(global_difference_count, op=torch.distributed.ReduceOp.SUM)
         configured_weights = torch.tensor(value_loss_weights, dtype=torch.float32, device=device)
         active_weights = configured_weights * (global_source_counts > 0)
         active_weights = active_weights / active_weights.sum().clamp_min(torch.finfo(torch.float32).eps)
 
         head_config = self.config.get("counterfactual_credit_head")
-        difference_loss_weight = float(head_config.get("difference_loss_weight", 0.25))
         optimizer_steps_per_batch = int(head_config.get("optimizer_steps_per_batch", 2))
 
         def compute_probe_losses():
@@ -1131,34 +1167,20 @@ class DataParallelPPOActor(BasePPOActor):
                     source_loss_sums.append(torch.zeros((), dtype=torch.float32, device=device))
                     source_absolute_error_sums.append(torch.zeros((), dtype=torch.float32, device=device))
 
-            difference_predictions = []
-            for value_batch in value_batches:
-                packed_anchor_mask = value_batch["packed_anchor_mask"]
-                difference_predictions.append(
-                    self.counterfactual_credit_head(value_batch["after_hidden"][packed_anchor_mask]).squeeze(-1)
-                    - self.counterfactual_credit_head(value_batch["before_hidden"][packed_anchor_mask]).squeeze(-1)
-                )
-            all_difference_predictions = torch.cat(difference_predictions, dim=0)
-            difference_loss_sum = torch.nn.functional.smooth_l1_loss(
-                all_difference_predictions,
-                all_anchor_targets,
-                reduction="sum",
-            )
-            return torch.stack(source_loss_sums), torch.stack(source_absolute_error_sums), difference_loss_sum
+            return torch.stack(source_loss_sums), torch.stack(source_absolute_error_sums)
 
-        source_loss_sums, source_absolute_error_sums, difference_loss_sum = compute_probe_losses()
+        source_loss_sums, source_absolute_error_sums = compute_probe_losses()
         metric_source_loss_sums = source_loss_sums.detach().clone()
         metric_source_absolute_error_sums = source_absolute_error_sums.clone()
-        metric_difference_loss_sum = difference_loss_sum.detach().clone()
-        if should_update and (global_source_counts.sum() + global_difference_count).item() > 0:
+        has_training_targets = global_source_counts.sum().item() > 0
+        if should_update and has_training_targets:
             for optimizer_step in range(optimizer_steps_per_batch):
                 if optimizer_step > 0:
-                    source_loss_sums, _, difference_loss_sum = compute_probe_losses()
+                    source_loss_sums, _ = compute_probe_losses()
                 self.counterfactual_credit_optimizer.zero_grad(set_to_none=True)
                 value_bce = (active_weights * source_loss_sums / global_source_counts.clamp_min(1.0)).sum()
-                difference_smooth_l1 = difference_loss_sum / global_difference_count.clamp_min(1.0)
                 objective = sum(parameter.sum() * 0.0 for parameter in self.counterfactual_credit_head.parameters())
-                objective = objective + value_bce + difference_loss_weight * difference_smooth_l1
+                objective = objective + value_bce
                 objective.backward()
                 self._sync_counterfactual_credit_gradients()
                 self.counterfactual_credit_optimizer.step()
@@ -1167,7 +1189,6 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(metric_source_loss_sums, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(metric_source_absolute_error_sums, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(metric_difference_loss_sum, op=torch.distributed.ReduceOp.SUM)
         self.counterfactual_credit_head.eval()
         predictions = torch.cat(dense_predictions, dim=0)
         if use_dynamic_bsz:
@@ -1179,15 +1200,32 @@ class DataParallelPPOActor(BasePPOActor):
         mean_absolute_error = (
             active_weights * metric_source_absolute_error_sums / global_source_counts.clamp_min(1.0)
         ).sum()
-        mean_difference_smooth_l1 = metric_difference_loss_sum / global_difference_count.clamp_min(1.0)
-        mean_total_loss = mean_value_bce + difference_loss_weight * mean_difference_smooth_l1
+        # Keep the RPC schema stable; the trainer omits disabled/missing sources
+        # instead of reporting their unmeasured BCE/MAE as zero.
+        missing_source_value = metric_source_loss_sums.new_tensor(float("nan"))
+        per_source_value_bce = torch.where(
+            global_source_counts > 0,
+            metric_source_loss_sums / global_source_counts.clamp_min(1.0),
+            missing_source_value,
+        )
+        per_source_value_mae = torch.where(
+            global_source_counts > 0,
+            metric_source_absolute_error_sums / global_source_counts.clamp_min(1.0),
+            missing_source_value,
+        )
         return {
             "credit_predictions": predictions,
             "credit_head_value_bce": mean_value_bce.expand(batch_size).clone(),
-            "credit_head_difference_smooth_l1": mean_difference_smooth_l1.expand(batch_size).clone(),
-            "credit_head_total_loss": mean_total_loss.expand(batch_size).clone(),
+            "credit_head_value_bce_mc": per_source_value_bce[0].expand(batch_size).clone(),
+            "credit_head_value_bce_start": per_source_value_bce[1].expand(batch_size).clone(),
+            "credit_head_value_bce_terminal": per_source_value_bce[2].expand(batch_size).clone(),
             "credit_head_value_mae": mean_absolute_error.expand(batch_size).clone(),
+            "credit_head_value_mae_mc": per_source_value_mae[0].expand(batch_size).clone(),
+            "credit_head_value_mae_start": per_source_value_mae[1].expand(batch_size).clone(),
+            "credit_head_value_mae_terminal": per_source_value_mae[2].expand(batch_size).clone(),
             "credit_head_direction_agreement": direction_agreement.expand(batch_size).clone(),
+            "credit_head_direction_majority_baseline": direction_majority_baseline.expand(batch_size).clone(),
+            "credit_head_direction_excess": direction_excess.expand(batch_size).clone(),
         }
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

@@ -141,16 +141,17 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     Entropy is used only to choose a small number of step anchors. Each
     selected anchor receives Q/V value targets from fresh suffix rollouts; a
     detached actor-side value head predicts unobserved boundaries and adjacent
-    value differences provide step credit.
+    value differences provide step credit. With use_probe=False, unobserved
+    step credits are zero before the same token centering and batch scaling.
     """
 
     enabled: bool = False
+    use_probe: bool = True
     entropy_top_ratio: float = 0.2
     anchors_per_group: int = 2
     sampling_temperature: float = 1.0
     uniform_mix: float = 0.1
-    num_q_samples: int = 1
-    num_v_samples: int = 2
+    num_samples: int = 4
     train_mc_branches: bool = False
     branch_groups_per_prompt: int = 2
     correctness_key: str = "acc"
@@ -171,6 +172,8 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
             raise ValueError("sparse_counterfactual_credit.enabled must be a bool.")
+        if not isinstance(self.use_probe, bool):
+            raise ValueError("sparse_counterfactual_credit.use_probe must be a bool.")
         self._validate_open_unit("entropy_top_ratio", self.entropy_top_ratio)
         if (
             not isinstance(self.anchors_per_group, int)
@@ -180,10 +183,8 @@ class SparseCounterfactualCreditConfig(BaseConfig):
             raise ValueError("sparse_counterfactual_credit.anchors_per_group must be an integer >= 1.")
         self._validate_positive("sampling_temperature", self.sampling_temperature)
         self._validate_closed_unit("uniform_mix", self.uniform_mix)
-        for name in ("num_q_samples", "num_v_samples"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"sparse_counterfactual_credit.{name} must be an integer >= 1.")
+        if not isinstance(self.num_samples, int) or isinstance(self.num_samples, bool) or self.num_samples < 1:
+            raise ValueError("sparse_counterfactual_credit.num_samples must be an integer >= 1.")
         if not isinstance(self.train_mc_branches, bool):
             raise ValueError("sparse_counterfactual_credit.train_mc_branches must be a bool.")
         if (

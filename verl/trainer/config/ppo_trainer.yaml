@@ -101,6 +101,10 @@ algorithm:
     # Whether to add sparse counterfactual step credit to the base GRPO advantage
     enabled: false
 
+    # False: skip the probe; use MC anchor credit and zero elsewhere before centering/scaling.
+    # MC rollouts and optional branch training are unchanged.
+    use_probe: true
+
     # Fraction of the highest-entropy tokens averaged within each semantic step
     entropy_top_ratio: 0.2
 
@@ -113,11 +117,9 @@ algorithm:
     # Mixture weight assigned to the uniform step distribution
     uniform_mix: 0.1
 
-    # Fresh retained-step continuations per anchor; the original suffix is one additional free Q sample
-    num_q_samples: 1
-
-    # Fresh prefix-before-step continuations per anchor
-    num_v_samples: 2
+    # Fresh continuations for each sampled Q or V prefix; original suffix rewards are not added.
+    # First-step V and terminal-step Q still use known labels without extra sampling.
+    num_samples: 4
 
     # Whether selected Q/V suffix groups also participate in the policy update
     train_mc_branches: false
@@ -129,6 +131,9 @@ algorithm:
     correctness_key: acc
 
     # Relative BCE weights for MC-anchor, start-boundary, and terminal-boundary values
+    # A zero weight skips that source's supervised forward and BCE/MAE metrics.
+    # Known start/terminal values still replace policy credit predictions.
+    # Direction diagnostics use raw no-grad predictions, including disabled boundary sources.
     mc_value_loss_weight: 0.6
     start_value_loss_weight: 0.2
     terminal_value_loss_weight: 0.2
