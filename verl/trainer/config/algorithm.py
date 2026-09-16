@@ -142,7 +142,7 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     selected anchor receives Q/V value targets from fresh suffix rollouts; a
     detached actor-side value head predicts unobserved boundaries and adjacent
     value differences provide step credit. With use_probe=False, unobserved
-    step credits are zero before the same token centering and batch scaling.
+    step credits are zero before the same per-response centering and batch RMS scaling.
     """
 
     enabled: bool = False
@@ -160,7 +160,6 @@ class SparseCounterfactualCreditConfig(BaseConfig):
     terminal_value_loss_weight: float = 0.2
     advantage_coef: float = 0.3
     warmup_ratio: float = 0.1
-    normalize_batch_std: bool = True
     epsilon: float = 1e-6
     selection_seed: int = 42
     temperature: float = 1.0
@@ -201,8 +200,6 @@ class SparseCounterfactualCreditConfig(BaseConfig):
             raise ValueError("sparse_counterfactual_credit value-loss weights may not all be zero.")
         self._validate_closed_unit("advantage_coef", self.advantage_coef)
         self._validate_closed_unit("warmup_ratio", self.warmup_ratio)
-        if not isinstance(self.normalize_batch_std, bool):
-            raise ValueError("sparse_counterfactual_credit.normalize_batch_std must be a bool.")
         self._validate_positive("epsilon", self.epsilon)
         if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
             raise ValueError("sparse_counterfactual_credit.selection_seed must be an integer.")

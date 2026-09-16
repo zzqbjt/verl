@@ -186,23 +186,29 @@ def build_credit_residual(
     endpoint_credit: torch.Tensor,
     step_end_mask: torch.Tensor,
     response_mask: torch.Tensor,
+    uids: Sequence[object],
     *,
-    normalize_batch_std: bool = True,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Token-weight center per response, then apply token-weighted batch scaling."""
+    """Center each response, then scale by one token-weighted full-batch RMS.
+
+    All active policy tokens in base responses and MC branch suffixes share
+    the scale. Prefixes and padding are excluded. UIDs only validate row count;
+    outcome-group normalization is separate from this process-credit scaling.
+    credit/residual_scale records the RMS before adding epsilon.
+    """
 
     if epsilon <= 0:
         raise ValueError("epsilon must be > 0")
     active = response_mask.bool()
     residual = expand_step_credit_to_tokens(endpoint_credit, step_end_mask, response_mask)
+    if len(uids) != residual.shape[0]:
+        raise ValueError("uids length must equal the response batch size")
     counts = active.sum(dim=-1).clamp_min(1)
     means = (residual * active).sum(dim=-1) / counts
     residual = (residual - means.unsqueeze(-1)) * active
-    scale = residual.new_tensor(1.0)
-    if normalize_batch_std:
-        scale = torch.sqrt(residual.square().sum() / active.sum().clamp_min(1))
-        residual = residual / (scale + epsilon)
+    scale = torch.sqrt(residual.square().sum() / active.sum().clamp_min(1))
+    residual = residual / (scale + epsilon)
     metrics = {
         "credit/residual_abs_mean": float(residual[active].abs().mean().item()),
         "credit/residual_scale": float(scale.item()),

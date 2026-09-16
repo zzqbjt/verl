@@ -80,19 +80,22 @@ def test_credit_head_defaults_and_validation():
     assert not config.enabled
     assert config.hidden_dim == 512
     assert config.lr == 1e-3
-    assert config.optimizer_steps_per_batch == 2
+    assert not hasattr(config, "optimizer_steps_per_batch")
+    assert not hasattr(config, "predict_after_update")
     assert config.save_checkpoint
     with pytest.raises(ValueError, match="hidden_dim"):
         CounterfactualCreditHeadConfig(hidden_dim=0)
-    with pytest.raises(ValueError, match="optimizer_steps_per_batch"):
-        CounterfactualCreditHeadConfig(optimizer_steps_per_batch=0)
 
 
 @pytest.mark.parametrize("use_probe", [True, False])
-def test_ppo_yaml_materializes_both_typed_configs(use_probe):
-    with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+@pytest.mark.parametrize(
+    ("config_dir", "config_name"),
+    [("verl/trainer/config", "ppo_trainer"), ("recipe/dapo/config", "dapo_trainer")],
+)
+def test_ppo_and_dapo_yaml_materialize_both_typed_configs(use_probe, config_dir, config_name):
+    with initialize_config_dir(config_dir=os.path.abspath(config_dir)):
         config = compose(
-            config_name="ppo_trainer",
+            config_name=config_name,
             overrides=[
                 "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
                 f"algorithm.sparse_counterfactual_credit.use_probe={use_probe}",
@@ -107,3 +110,15 @@ def test_ppo_yaml_materializes_both_typed_configs(use_probe):
     assert "num_q_samples" not in config.algorithm.sparse_counterfactual_credit
     assert "num_v_samples" not in config.algorithm.sparse_counterfactual_credit
     assert isinstance(actor.counterfactual_credit_head, CounterfactualCreditHeadConfig)
+
+
+@pytest.mark.parametrize("key", ["normalize_group_std", "normalize_batch_std"])
+def test_removed_credit_normalization_options_are_rejected(key):
+    with pytest.raises(TypeError, match=key):
+        SparseCounterfactualCreditConfig(**{key: True})
+
+
+@pytest.mark.parametrize("key", ["predict_after_update", "optimizer_steps_per_batch"])
+def test_removed_probe_order_and_update_options_are_rejected(key):
+    with pytest.raises(TypeError, match=key):
+        CounterfactualCreditHeadConfig(**{key: 1})

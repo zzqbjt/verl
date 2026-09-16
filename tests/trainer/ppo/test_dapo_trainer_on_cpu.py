@@ -107,9 +107,8 @@ def test_actor_minibatch_response_count_includes_only_training_branches(
     assert trainer.config.actor_rollout_ref.rollout.n == base_n
 
 
-@pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("sign", [-1, 1])
-def test_sparse_mc_skips_probe_and_centers_over_all_policy_tokens(normalize, sign):
+def test_sparse_mc_skips_probe_and_centers_over_all_policy_tokens(sign):
     trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
     trainer.config = OmegaConf.create({"algorithm": {"sparse_counterfactual_credit": {"use_probe": False}}})
     trainer.actor_rollout_wg = MagicMock()
@@ -132,7 +131,8 @@ def test_sparse_mc_skips_probe_and_centers_over_all_policy_tokens(normalize, sig
                 [[0, 1, 0, 0, 1, 0], [0, 1, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0], [0, 0, 0, 1, 1, 0]], dtype=torch.bool
             ),
             "is_mc_branch": torch.tensor([False, False, False, True]),
-        }
+        },
+        non_tensors={"uid": np.asarray(["base", "base", "base", "base:mc-branch:1:0:q"], dtype=object)},
     )
     metrics, timing_raw = {}, {}
     result = trainer._predict_counterfactual_credit(batch, 0.3, metrics, timing_raw)
@@ -144,13 +144,17 @@ def test_sparse_mc_skips_probe_and_centers_over_all_policy_tokens(normalize, sig
     endpoints = merge_anchor_credit(result.batch["credit_predictions"], anchor_mask, targets[anchor_mask])
     torch.testing.assert_close(endpoints, targets)
     residual, _ = build_credit_residual(
-        endpoints, batch.batch["step_end_mask"], response_mask, normalize_batch_std=normalize, epsilon=1e-6
+        endpoints,
+        batch.batch["step_end_mask"],
+        response_mask,
+        uids=batch.non_tensor_batch["uid"],
+        epsilon=1e-6,
     )
     expected = sign * torch.tensor(
         [[0.5, 0.5, -0.25, -0.25, -0.25, -0.25], [0.25, 0.25, -0.25, -0.25, 0, 0], [0] * 6, [0] * 6]
     )
-    if normalize:
-        expected = expected / (expected[response_mask].square().mean().sqrt() + 1e-6)
+    # Base and generated branch tokens share the full-batch RMS.
+    expected /= expected[response_mask].square().mean().sqrt() + 1e-6
     torch.testing.assert_close(residual, expected)
     torch.testing.assert_close(residual.sum(dim=-1), torch.zeros(4), atol=1e-6, rtol=0)
     # Non-anchor base rows, MC branches, prefixes, and padding all retain zero residual.
@@ -196,6 +200,12 @@ def test_full_method_keeps_probe_update_and_metrics(credit_coef, probe_config):
     assert metrics["credit/head_value_bce/mc"] == pytest.approx(0.2)
     assert "credit/head_value_bce/start" not in metrics
     assert "credit/head_value_mae/terminal" not in metrics
+    assert set(metrics) == {
+        "credit/head_value_bce", "credit/head_value_mae",
+        "credit/head_value_bce/mc", "credit/head_value_mae/mc",
+        "credit/head_direction_agreement", "credit/head_direction_majority_baseline",
+        "credit/head_direction_excess",
+    }
     assert "counterfactual_credit_head" in timing_raw
 
 
@@ -476,3 +486,49 @@ def test_dapo_validates_when_dataloader_is_exhausted_before_last_step(tmp_path):
     assert "timing/testing" not in logged_data
     assert logger.log.call_args.kwargs["step"] == 1
     progress_bar.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("consumed", [10, 68])
+def test_legacy_checkpoint_resumes_remaining_data_and_second_epoch(tmp_path, consumed):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    original = StatefulDataLoader(list(range(68)), batch_size=1, num_workers=0)
+    iterator = iter(original)
+    for _ in range(consumed):
+        next(iterator)
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create({"trainer": {"total_epochs": 2}})
+    trainer.global_steps = consumed
+    trainer.train_dataloader = StatefulDataLoader(list(range(68)), batch_size=1, num_workers=0)
+    trainer.train_dataloader.load_state_dict(original.state_dict())
+    trainer._load_trainer_extra_state(str(tmp_path))
+    batches = [(epoch, int(batch.item())) for epoch, batch in trainer._iter_training_batches()]
+    assert batches == [(0, i) for i in range(consumed, 68)] + [(1, i) for i in range(68)]
+    assert trainer._data_epoch == 2
+
+
+@pytest.mark.parametrize("at_epoch_end", [False, True])
+def test_data_epoch_checkpoint_is_independent_of_dynamic_sampling_update_count(tmp_path, at_epoch_end):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+
+    trainer = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    trainer.config = OmegaConf.create({"trainer": {"total_epochs": 3}})
+    trainer._data_epoch = 1
+    trainer.gen_steps = 99
+    trainer.global_steps = 7  # Many data batches can correspond to few updates.
+    trainer.train_dataloader = StatefulDataLoader(list(range(4)), batch_size=1, num_workers=0)
+    iterator = iter(trainer.train_dataloader)
+    consumed = 4 if at_epoch_end else 2
+    for _ in range(consumed):
+        next(iterator)
+    loader_state = trainer.train_dataloader.state_dict()
+    trainer._save_trainer_extra_state(str(tmp_path))
+    restored = RayDAPOTrainer.__new__(RayDAPOTrainer)
+    restored.config = trainer.config
+    restored.global_steps = 7
+    restored.train_dataloader = StatefulDataLoader(list(range(4)), batch_size=1, num_workers=0)
+    restored.train_dataloader.load_state_dict(loader_state)
+    restored._load_trainer_extra_state(str(tmp_path))
+    assert restored.gen_steps == 99
+    batches = [(epoch, int(batch.item())) for epoch, batch in restored._iter_training_batches()]
+    assert batches == [(1, i) for i in range(consumed, 4)] + [(2, i) for i in range(4)]

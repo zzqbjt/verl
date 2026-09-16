@@ -113,7 +113,6 @@ class CounterfactualCreditHeadConfig(BaseConfig):
     hidden_dim: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
-    optimizer_steps_per_batch: int = 2
     save_checkpoint: bool = True
 
     def __post_init__(self):
@@ -135,12 +134,6 @@ class CounterfactualCreditHeadConfig(BaseConfig):
             or self.weight_decay < 0
         ):
             raise ValueError("counterfactual_credit_head.weight_decay must be finite and >= 0.")
-        if (
-            not isinstance(self.optimizer_steps_per_batch, int)
-            or isinstance(self.optimizer_steps_per_batch, bool)
-            or self.optimizer_steps_per_batch < 1
-        ):
-            raise ValueError("counterfactual_credit_head.optimizer_steps_per_batch must be an integer >= 1.")
         if not isinstance(self.save_checkpoint, bool):
             raise ValueError("counterfactual_credit_head.save_checkpoint must be a bool.")
 

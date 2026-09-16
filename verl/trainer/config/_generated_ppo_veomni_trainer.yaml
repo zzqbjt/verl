@@ -76,7 +76,6 @@ actor_rollout_ref:
       hidden_dim: 512
       lr: 0.001
       weight_decay: 0.0
-      optimizer_steps_per_batch: 2
       save_checkpoint: true
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
@@ -613,7 +612,6 @@ algorithm:
     terminal_value_loss_weight: 0.2
     advantage_coef: 0.3
     warmup_ratio: 0.1
-    normalize_batch_std: true
     epsilon: 1.0e-06
     selection_seed: 42
     temperature: 1.0

@@ -134,7 +134,7 @@ def test_monte_carlo_anchor_override_and_policy_token_broadcast():
     torch.testing.assert_close(expanded, torch.tensor([[2.0, 2.0, 4.0, 4.0, 4.0]]))
 
 
-def test_credit_residual_preserves_each_response_advantage_sum_and_normalizes_population_std():
+def test_credit_residual_preserves_each_response_advantage_sum_and_normalizes_batch_rms():
     step_end_mask = torch.tensor([[0, 1, 0, 1, 0], [1, 0, 0, 0, 0]], dtype=torch.bool)
     response_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=torch.bool)
     endpoint_credit = torch.tensor([[0.0, 1.0, 0.0, 3.0, 0.0], [2.0, 0.0, 0.0, 0.0, 0.0]])
@@ -143,7 +143,7 @@ def test_credit_residual_preserves_each_response_advantage_sum_and_normalizes_po
         endpoint_credit,
         step_end_mask,
         response_mask,
-        normalize_batch_std=True,
+        uids=["same-group", "same-group"],
         epsilon=1e-12,
     )
 
@@ -151,6 +151,101 @@ def test_credit_residual_preserves_each_response_advantage_sum_and_normalizes_po
     population_second_moment = residual[response_mask].square().mean()
     torch.testing.assert_close(population_second_moment, torch.tensor(1.0), atol=1e-6, rtol=0)
     assert set(metrics) == {"credit/residual_abs_mean", "credit/residual_scale"}
+
+
+def _credit_group_batch():
+    # Interleave prompt and MC prefix groups, with unequal lengths and row RMS.
+    specifications = [
+        ("prompt-a", 0, 4, 2, 0.1, 0.5),
+        ("prompt-a:mc-branch:7:0:q", 2, 4, 2, 0.1, 0.3),
+        ("prompt-b", 0, 7, 1, -0.8, 0.6),
+        ("prompt-a", 0, 7, 3, -0.4, 0.3),
+        ("prompt-a:mc-branch:7:1:v", 1, 4, 2, -0.5, 0.5),
+        ("prompt-b", 0, 3, 3, 0.4, 0.4),
+        ("prompt-a:mc-branch:7:0:q", 3, 4, 2, -0.1, 0.5),
+        ("prompt-a:mc-branch:7:1:v", 2, 3, 1, -0.1, 0.2),
+    ]
+    # Non-endpoint values must never enter the normalization.
+    credits = torch.full((len(specifications), 8), 999.0, dtype=torch.float64)
+    ends = torch.zeros_like(credits, dtype=torch.bool)
+    active = torch.zeros_like(ends)
+    uids = []
+    for row, (uid, prefix, length, first_length, first_credit, last_credit) in enumerate(specifications):
+        uids.append(uid)
+        active[row, prefix : prefix + length] = True
+        first_end, last_end = prefix + first_length - 1, prefix + length - 1
+        ends[row, first_end] = ends[row, last_end] = True
+        credits[row, first_end] = first_credit
+        credits[row, last_end] = last_credit
+    return credits, ends, active, uids
+
+
+def test_other_prompts_and_mc_groups_contribute_to_the_shared_batch_scale():
+    credits, ends, active, uids = _credit_group_batch()
+    reference, _ = build_credit_residual(credits, ends, active, uids)
+    changed = credits.clone()
+    changed[2] *= 10
+    actual, _ = build_credit_residual(changed, ends, active, uids)
+    assert not torch.allclose(actual[0], reference[0])
+    assert actual[0].abs().max() < reference[0].abs().max()
+
+
+def test_credit_batch_scaling_is_invariant_to_batch_reordering():
+    credits, ends, active, uids = _credit_group_batch()
+    reference, reference_metrics = build_credit_residual(credits, ends, active, uids)
+    permutation = torch.tensor([7, 2, 0, 6, 1, 5, 3, 4])
+    actual, actual_metrics = build_credit_residual(
+        credits[permutation],
+        ends[permutation],
+        active[permutation],
+        [uids[row] for row in permutation.tolist()],
+    )
+    torch.testing.assert_close(actual, reference[permutation])
+    assert actual_metrics == pytest.approx(reference_metrics)
+
+
+def test_credit_batch_scaling_handles_zero_variance_and_singleton_groups():
+    credits = torch.tensor([[0.5, 0.5], [-0.5, -0.5], [-0.5, 0.5]])
+    active = torch.ones_like(credits, dtype=torch.bool)
+    residual, metrics = build_credit_residual(credits, active, active, ["zero", "zero", "singleton"])
+    assert torch.isfinite(residual).all()
+    assert not residual[:2].any()
+    torch.testing.assert_close(residual[2], torch.tensor([-3.0**0.5, 3.0**0.5]), atol=1e-5, rtol=0)
+    assert metrics["credit/residual_scale"] == pytest.approx((0.5 / 6)**0.5)
+
+
+def test_batch_rms_restores_token_weighted_full_batch_formula():
+    credits, ends, active, uids = _credit_group_batch()
+    expanded = expand_step_credit_to_tokens(credits, ends, active)
+    centered = (expanded - (expanded.sum(-1) / active.sum(-1)).unsqueeze(-1)) * active
+    scale = centered[active].square().mean().sqrt()
+    actual, metrics = build_credit_residual(
+        credits, ends, active, uids
+    )
+    torch.testing.assert_close(actual, centered / (scale + 1e-6))
+    assert metrics["credit/residual_scale"] == pytest.approx(scale.item())
+    assert not actual[~active].any()
+    torch.testing.assert_close(actual.sum(-1), torch.zeros_like(actual.sum(-1)), atol=1e-5, rtol=0)
+    different_uids, _ = build_credit_residual(
+        credits, ends, active, ["all"] * len(uids)
+    )
+    torch.testing.assert_close(actual, different_uids)
+
+
+def test_batch_rms_zero_variance():
+    credits = torch.ones(2, 3)
+    active = torch.ones_like(credits, dtype=torch.bool)
+    residual, metrics = build_credit_residual(
+        credits, active, active, ["a", "b"]
+    )
+    assert torch.isfinite(residual).all() and not residual.any()
+    assert metrics["credit/residual_scale"] == 0
+
+
+def test_credit_rejects_uid_count_mismatch():
+    credits, ends, active, uids = _credit_group_batch()
+    with pytest.raises(ValueError, match="uids length"):
+        build_credit_residual(credits, ends, active, uids[:-1])
 
 
 def test_credit_advantage_coefficient_starts_at_zero_and_reaches_maximum():

@@ -1013,7 +1013,9 @@ class DataParallelPPOActor(BasePPOActor):
             start_value_hidden.append(before_hidden[first_step_indices[start_supervision_mask]])
             start_value_targets.append(model_inputs["credit_start_value_targets"].float()[start_supervision_mask])
             terminal_value_hidden.append(after_hidden[last_step_indices[terminal_supervision_mask]])
-            terminal_value_targets.append(model_inputs["credit_terminal_value_targets"].float()[terminal_supervision_mask])
+            terminal_value_targets.append(
+                model_inputs["credit_terminal_value_targets"].float()[terminal_supervision_mask]
+            )
 
             # Policy credit uses known boundaries directly. The legacy direction
             # diagnostic still predicts both sides of every anchor under no_grad,
@@ -1060,47 +1062,50 @@ class DataParallelPPOActor(BasePPOActor):
                 prediction_mask = prediction_mask & boundary_mask
             values = value_batch["fixed_boundary_values"].clone()
             if prediction_mask.any():
-                values[prediction_mask] = self.counterfactual_credit_head(
-                    value_batch["boundary_hidden"][prediction_mask]
-                ).squeeze(-1).float()
+                values[prediction_mask] = (
+                    self.counterfactual_credit_head(value_batch["boundary_hidden"][prediction_mask]).squeeze(-1).float()
+                )
             return values
 
-        # Predictions used by the policy are computed before this batch's probe
-        # update. Known start, anchor-Q/V, and terminal values then replace the
-        # corresponding predictions before adjacent values are differenced.
-        dense_predictions = []
-        anchor_predictions = []
-        direction_credit_targets = []
-        self.counterfactual_credit_head.eval()
-        with torch.no_grad():
-            for value_batch in value_batches:
-                packed_anchor_mask = value_batch["packed_anchor_mask"]
-                before_indices = value_batch["before_indices"]
-                after_indices = value_batch["after_indices"]
-                boundary_values = predict_boundary_values(
-                    value_batch, None if predict_all_steps else value_batch["anchor_boundary_mask"]
-                )
-                start_rows = value_batch["start_mask"]
-                terminal_rows = value_batch["terminal_mask"]
-                start_steps = value_batch["first_step_indices"][start_rows]
-                terminal_steps = value_batch["last_step_indices"][terminal_rows]
-                anchor_predictions.append(
-                    boundary_values[after_indices[packed_anchor_mask]]
-                    - boundary_values[before_indices[packed_anchor_mask]]
-                )
-                direction_credit_targets.append(value_batch["anchor_credit_targets"])
-                endpoint_mask = value_batch["step_end_mask"]
-                dense = torch.zeros(endpoint_mask.shape, dtype=torch.float32, device=endpoint_mask.device)
-                if predict_all_steps:
-                    boundary_values[before_indices[packed_anchor_mask]] = value_batch["anchor_v_targets"]
-                    boundary_values[after_indices[packed_anchor_mask]] = value_batch["anchor_q_targets"]
-                    boundary_values[before_indices[start_steps]] = value_batch["start_targets"][start_rows]
-                    boundary_values[after_indices[terminal_steps]] = value_batch["terminal_targets"][terminal_rows]
-                    dense[endpoint_mask] = boundary_values[after_indices] - boundary_values[before_indices]
-                dense_predictions.append(dense)
+        def evaluate_credit(dense_enabled):
+            dense_predictions = []
+            anchor_predictions = []
+            direction_credit_targets = []
+            self.counterfactual_credit_head.eval()
+            with torch.no_grad():
+                for value_batch in value_batches:
+                    packed_anchor_mask = value_batch["packed_anchor_mask"]
+                    before_indices = value_batch["before_indices"]
+                    after_indices = value_batch["after_indices"]
+                    boundary_values = predict_boundary_values(
+                        value_batch, None if dense_enabled else value_batch["anchor_boundary_mask"]
+                    )
+                    start_rows = value_batch["start_mask"]
+                    terminal_rows = value_batch["terminal_mask"]
+                    start_steps = value_batch["first_step_indices"][start_rows]
+                    terminal_steps = value_batch["last_step_indices"][terminal_rows]
+                    anchor_predictions.append(
+                        boundary_values[after_indices[packed_anchor_mask]]
+                        - boundary_values[before_indices[packed_anchor_mask]]
+                    )
+                    direction_credit_targets.append(value_batch["anchor_credit_targets"])
+                    endpoint_mask = value_batch["step_end_mask"]
+                    dense = torch.zeros(endpoint_mask.shape, dtype=torch.float32, device=endpoint_mask.device)
+                    if dense_enabled:
+                        boundary_values[before_indices[packed_anchor_mask]] = value_batch["anchor_v_targets"]
+                        boundary_values[after_indices[packed_anchor_mask]] = value_batch["anchor_q_targets"]
+                        boundary_values[before_indices[start_steps]] = value_batch["start_targets"][start_rows]
+                        boundary_values[after_indices[terminal_steps]] = value_batch["terminal_targets"][terminal_rows]
+                        dense[endpoint_mask] = boundary_values[after_indices] - boundary_values[before_indices]
+                    dense_predictions.append(dense)
 
-        all_anchor_predictions = torch.cat(anchor_predictions, dim=0)
-        all_direction_targets = torch.cat(direction_credit_targets, dim=0)
+            all_anchor_predictions = torch.cat(anchor_predictions, dim=0)
+            all_direction_targets = torch.cat(direction_credit_targets, dim=0)
+            return dense_predictions, all_anchor_predictions, all_direction_targets
+
+        # Predict policy credit and diagnostics before the single probe update.
+        # Only policy credit substitutes known boundary targets.
+        dense_predictions, all_anchor_predictions, all_direction_targets = evaluate_credit(predict_all_steps)
 
         self.counterfactual_credit_head.train()
         should_update = self.counterfactual_credit_last_global_step != global_step
@@ -1150,9 +1155,6 @@ class DataParallelPPOActor(BasePPOActor):
         active_weights = configured_weights * (global_source_counts > 0)
         active_weights = active_weights / active_weights.sum().clamp_min(torch.finfo(torch.float32).eps)
 
-        head_config = self.config.get("counterfactual_credit_head")
-        optimizer_steps_per_batch = int(head_config.get("optimizer_steps_per_batch", 2))
-
         def compute_probe_losses():
             source_loss_sums = []
             source_absolute_error_sums = []
@@ -1174,17 +1176,14 @@ class DataParallelPPOActor(BasePPOActor):
         metric_source_absolute_error_sums = source_absolute_error_sums.clone()
         has_training_targets = global_source_counts.sum().item() > 0
         if should_update and has_training_targets:
-            for optimizer_step in range(optimizer_steps_per_batch):
-                if optimizer_step > 0:
-                    source_loss_sums, _ = compute_probe_losses()
-                self.counterfactual_credit_optimizer.zero_grad(set_to_none=True)
-                value_bce = (active_weights * source_loss_sums / global_source_counts.clamp_min(1.0)).sum()
-                objective = sum(parameter.sum() * 0.0 for parameter in self.counterfactual_credit_head.parameters())
-                objective = objective + value_bce
-                objective.backward()
-                self._sync_counterfactual_credit_gradients()
-                self.counterfactual_credit_optimizer.step()
-                self.counterfactual_credit_updates += 1
+            self.counterfactual_credit_optimizer.zero_grad(set_to_none=True)
+            value_bce = (active_weights * source_loss_sums / global_source_counts.clamp_min(1.0)).sum()
+            objective = sum(parameter.sum() * 0.0 for parameter in self.counterfactual_credit_head.parameters())
+            objective = objective + value_bce
+            objective.backward()
+            self._sync_counterfactual_credit_gradients()
+            self.counterfactual_credit_optimizer.step()
+            self.counterfactual_credit_updates += 1
             self.counterfactual_credit_last_global_step = global_step
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(metric_source_loss_sums, op=torch.distributed.ReduceOp.SUM)
@@ -1194,9 +1193,7 @@ class DataParallelPPOActor(BasePPOActor):
         if use_dynamic_bsz:
             predictions = restore_dynamic_batch(predictions, batch_idx_list)
         batch_size = predictions.shape[0]
-        mean_value_bce = (
-            active_weights * metric_source_loss_sums / global_source_counts.clamp_min(1.0)
-        ).sum()
+        mean_value_bce = (active_weights * metric_source_loss_sums / global_source_counts.clamp_min(1.0)).sum()
         mean_absolute_error = (
             active_weights * metric_source_absolute_error_sums / global_source_counts.clamp_min(1.0)
         ).sum()
@@ -1213,7 +1210,7 @@ class DataParallelPPOActor(BasePPOActor):
             metric_source_absolute_error_sums / global_source_counts.clamp_min(1.0),
             missing_source_value,
         )
-        return {
+        result = {
             "credit_predictions": predictions,
             "credit_head_value_bce": mean_value_bce.expand(batch_size).clone(),
             "credit_head_value_bce_mc": per_source_value_bce[0].expand(batch_size).clone(),
@@ -1227,6 +1224,7 @@ class DataParallelPPOActor(BasePPOActor):
             "credit_head_direction_majority_baseline": direction_majority_baseline.expand(batch_size).clone(),
             "credit_head_direction_excess": direction_excess.expand(batch_size).clone(),
         }
+        return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(

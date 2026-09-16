@@ -102,9 +102,6 @@ counterfactual_credit_head:
   # AdamW decoupled weight decay
   weight_decay: 0.0
 
-  # Number of detached probe optimizer steps per PPO batch
-  optimizer_steps_per_batch: 2
-
   # Whether to save head and optimizer state in actor checkpoints
   save_checkpoint: true
 

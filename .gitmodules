@@ -1,3 +1,1 @@
-[submodule "recipe"]
-	path = recipe
-	url = https://github.com/verl-project/verl-recipe.git
+# recipe/dapo Python sources are tracked directly by this repository.

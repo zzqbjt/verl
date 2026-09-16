@@ -10,6 +10,12 @@
 
 /pyrightconfig.json
 
+# Track only DAPO Python sources; keep local launchers/configs out of Git.
+/recipe/*
+!/recipe/dapo/
+/recipe/dapo/*
+!/recipe/dapo/*.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

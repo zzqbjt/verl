@@ -102,6 +102,7 @@ def test_counterfactual_rollout_reuses_boundary_values_and_samples_only_required
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
     seen_prompts = []
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 100}})
     seen_full_responses = []
 
     def generate(prompt_ids, response_prefix_lengths):
@@ -169,6 +170,7 @@ def test_middle_steps_keep_both_q_and_v_suffix_rollouts():
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
     seen_prefix_lengths = []
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 100}})
 
     def generate(prompt_ids, response_prefix_lengths):
         assert len(prompt_ids) == 16
@@ -206,6 +208,8 @@ def test_single_step_responses_need_no_counterfactual_suffix_rollouts():
     def fail_generate(*args, **kwargs):
         raise AssertionError(f"single-step responses must not generate suffixes: {args}, {kwargs}")
 
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 100}})
+
     def fail_score(*args, **kwargs):
         raise AssertionError(f"single-step responses must not be rescored: {args}, {kwargs}")
 
@@ -223,7 +227,7 @@ def test_single_step_responses_need_no_counterfactual_suffix_rollouts():
     assert metrics["credit/v_mean"] == 0.5
 
 
-def test_mc_branch_anchor_candidates_exclude_single_step_responses_and_keep_late_steps():
+def test_mc_branch_anchor_candidates_exclude_single_step_responses_and_late_steps():
     supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
     supervisor.config = SparseCounterfactualCreditConfig(
         enabled=True,
@@ -257,7 +261,9 @@ def test_mc_branch_anchor_candidates_exclude_single_step_responses_and_keep_late
     candidates = supervisor._mc_branch_anchor_candidates(step_end_mask, batch.batch["response_mask"])
     assert not candidates[[1, 5, 7]].any()
     assert candidates[[0, 2, 3, 4, 6]].any(dim=-1).all()
-    assert candidates[[2, 3, 6], 2].all()
+    assert not candidates[:, 2].any()
+    assert candidates[0, 1]  # Terminal Q needs no continuation at the exact cap.
+    assert not candidates[3, 1]  # Nonterminal Q must retain continuation budget.
     assert supervisor.mc_branch_eligible_prompt_uids(batch) == {"enough"}
 
 
@@ -459,7 +465,7 @@ def test_counterfactual_suffix_budget_supports_an_optional_stricter_cap():
     assert supervisor._sampling_params(prompt_length=15, response_prefix_length=3)["max_tokens"] == 4
 
 
-def test_counterfactual_suffix_budget_uses_full_response_length_despite_overlong_buffer():
+def test_counterfactual_suffix_budget_subtracts_overlong_buffer():
     supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
     supervisor.config = SparseCounterfactualCreditConfig(max_new_tokens=None)
     supervisor.trainer_config = OmegaConf.create(
@@ -480,6 +486,7 @@ def test_counterfactual_suffix_budget_uses_full_response_length_despite_overlong
     )
     supervisor.rollout_config = OmegaConf.create({"max_model_len": 30})
 
-    assert supervisor._counterfactual_response_limit() == 10
-    assert supervisor._sampling_params(prompt_length=15, response_prefix_length=3)["max_tokens"] == 7
-    assert supervisor._sampling_params(prompt_length=28, response_prefix_length=8)["max_tokens"] == 2
+    assert supervisor._counterfactual_response_limit() == 8
+    assert supervisor._sampling_params(prompt_length=15, response_prefix_length=3)["max_tokens"] == 5
+    assert supervisor._sampling_params(prompt_length=28, response_prefix_length=8)["max_tokens"] == 0
+    assert supervisor._sampling_params(prompt_length=29, response_prefix_length=9)["max_tokens"] == 0

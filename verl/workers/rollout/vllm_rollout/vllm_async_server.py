@@ -513,6 +513,9 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
+        # Tree rollouts must distinguish EOS from a segment-length cut. This
+        # opt-in field leaves the ordinary rollout response schema unchanged.
+        return_finish_reason = sampling_params.pop("return_finish_reason", False)
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
@@ -608,7 +611,10 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields={
+                "global_steps": self.global_steps,
+                **({"finish_reason": finish_reason} if return_finish_reason else {}),
+            },
         )
 
     async def wake_up(self):

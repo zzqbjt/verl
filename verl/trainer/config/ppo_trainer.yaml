@@ -144,10 +144,7 @@ algorithm:
     # Fraction of total actor updates used to linearly warm up the residual coefficient
     warmup_ratio: 0.1
 
-    # Whether to divide centered residuals by their token-weighted population standard deviation
-    normalize_batch_std: true
-
-    # Numerical epsilon for batch residual normalization
+    # Numerical epsilon for fixed full-batch RMS normalization
     epsilon: 1.0e-6
 
     # Deterministic anchor-sampling seed, offset by the trainer global step

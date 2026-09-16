@@ -95,7 +95,6 @@ actor_rollout_ref:
       hidden_dim: 512
       lr: 0.001
       weight_decay: 0.0
-      optimizer_steps_per_batch: 2
       save_checkpoint: true
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
