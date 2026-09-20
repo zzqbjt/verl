@@ -1,0 +1,75 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward:
+  reward_manager:
+    name: dapo
+  reward_kwargs:
+    overlong_buffer_cfg:
+      enable: false
+      len: 0
+      penalty_factor: 0.0
+      log: false
+    max_resp_len: null
+
+algorithm:
+  adv_estimator: spo_tree
+  use_kl_in_reward: false
+  step_split:
+    enabled: false
+  sparse_counterfactual_credit:
+    enabled: false
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: true
+    # Match DAPO: filter by leaf correctness, independently of length penalties.
+    metric: acc
+    max_num_gen_batches: 10
+    fill_shortfall: false
+    adaptive_topup:
+      _target_: verl.trainer.config.AdaptiveTopupConfig
+      enabled: false
+      max_total_n: 0
+      chunk_size: 4
+      selection_seed: 42
+  spo_tree:
+    branching: [4, 2, 2]
+    segment_length: 600
+    normalize_sibling_std: false
+    probability_threshold: 0.9
+    whiten_epsilon: 1.0e-8
+    max_concurrent_requests: 128
+    reward_batch_size: 256
+    seed: 42
+
+actor_rollout_ref:
+  spo_tree: ${algorithm.spo_tree}
+  actor:
+    strategy: fsdp
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    entropy_coeff: 0.0
+    loss_agg_mode: token-mean
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    counterfactual_credit_head:
+      enabled: false
+  rollout:
+    n: 16
+    name: vllm
+    checkpoint_engine:
+      backend: naive
+
+trainer:
+  balance_batch: false

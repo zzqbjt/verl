@@ -10,11 +10,22 @@
 
 /pyrightconfig.json
 
-# Track only DAPO Python sources; keep local launchers/configs out of Git.
+# Track DAPO/PRIME Python sources and Hydra configs, not local launchers or
+# runtime_env.yaml (which can contain credentials). Keep directory exceptions
+# without trailing slashes so Ray's pathspec traversal also includes them.
 /recipe/*
-!/recipe/dapo/
+!/recipe/dapo
 /recipe/dapo/*
 !/recipe/dapo/*.py
+!/recipe/dapo/config
+/recipe/dapo/config/*
+!/recipe/dapo/config/*.yaml
+!/recipe/prime
+/recipe/prime/*
+!/recipe/prime/*.py
+!/recipe/prime/config
+/recipe/prime/config/*
+!/recipe/prime/config/*.yaml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

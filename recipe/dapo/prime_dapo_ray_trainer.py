@@ -141,9 +141,12 @@ class RayPrimeDAPOTrainer(RayDAPOTrainer):
         update_style = str(prime_config.get("update", "before")).lower()
         with marked_timer("prime_reward_model", timing_raw, "purple"):
             if update_style == "before":
-                update_output = self.prime_rm_wg.update_rm(batch)
-                self._merge_prime_metrics(update_output, metrics)
-                score_output = self.prime_rm_wg.compute_rm_score(batch)
+                # Keep both phases on the same worker with a batch-local frozen-ref cache.
+                batch.meta_info["prime_score_after_update"] = True
+                try:
+                    score_output = self.prime_rm_wg.update_rm(batch)
+                finally:
+                    batch.meta_info.pop("prime_score_after_update", None)
                 self._merge_prime_metrics(score_output, metrics)
             elif update_style == "after":
                 # update_rm returns rewards from the forward pass immediately

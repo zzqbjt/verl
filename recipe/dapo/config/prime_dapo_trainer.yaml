@@ -1,0 +1,102 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+# PRIME remains separate from `reward.reward_model`: the latter is Verl's
+# inference-only reward-model service, while this model is updated online.
+prime:
+  enabled: true
+  correctness_key: acc
+  update: before # before: update then score (double forward); after: single forward
+  gamma: 1.0
+  outcome_advantage_coef: 1.0
+  process_advantage_coef: 1.0
+  normalize_advantage: true
+
+  prime_granularity: token
+  prime_norm: batch_norm
+  prime_use_gt: false
+  lambda: 0.0
+  ulysses_sequence_parallel_size: 1
+  use_dynamic_bsz: false
+  mini_batch_size: 128
+  micro_batch_size: null
+  micro_batch_size_per_gpu: 1
+  ppo_max_token_len_per_gpu: 24576
+  forward_max_token_len_per_gpu: 24576
+
+  model:
+    path: ${actor_rollout_ref.model.path}
+    ref_path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    trust_remote_code: ${actor_rollout_ref.model.trust_remote_code}
+    override_config: {}
+    use_remove_padding: true
+    use_fused_kernels: false
+    fused_kernel_options:
+      impl_backend: torch
+    enable_gradient_checkpointing: true
+    beta_train: 0.05
+    loss_type: ce
+    fsdp_config:
+      fsdp_size: -1
+      wrap_policy:
+        min_num_params: 0
+      param_offload: true
+      optimizer_offload: true
+      model_dtype: bfloat16
+    optim:
+      optimizer: AdamW
+      optimizer_impl: torch.optim
+      betas: [0.9, 0.999]
+      override_optimizer_config: null
+      lr: 1.0e-6
+      lr_warmup_steps: -1
+      lr_warmup_steps_ratio: 0.0
+      lr_scheduler_type: constant
+      total_training_steps: -1
+      weight_decay: 0.0
+      grad_clip: 10.0
+
+reward:
+  reward_manager:
+    name: dapo
+  reward_kwargs:
+    overlong_buffer_cfg:
+      enable: false
+      len: 0
+      penalty_factor: 0.0
+      log: false
+    max_resp_len: null
+  reward_model:
+    enable: false
+    enable_resource_pool: false
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: false
+    metric: null
+    max_num_gen_batches: 0
+    fill_shortfall: false
+    adaptive_topup:
+      _target_: verl.trainer.config.AdaptiveTopupConfig
+      enabled: false
+      max_total_n: 0
+      chunk_size: 4
+      selection_seed: 42
+  sparse_counterfactual_credit:
+    enabled: false
+
+trainer:
+  project_name: verl-dapo-prime
+  balance_batch: false
+  use_legacy_worker_impl: enable
