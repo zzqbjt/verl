@@ -21,7 +21,7 @@ from recipe.dapo.spo_tree_core import (
     whiten_advantages,
 )
 from recipe.dapo.spo_tree_rollout import SPOTreeRollout, make_training_batch
-from recipe.dapo.spo_tree_trainer import select_training_trees
+from recipe.dapo.spo_tree_trainer import select_training_trees, tree_metrics
 from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
 from verl.workers.config import FSDPActorConfig
 
@@ -164,23 +164,42 @@ def test_prefix_budget_excludes_question_but_respects_context():
         remaining_budget(prompt_length=10, prefix_length=11, max_response_length=10, max_model_length=20)
 
 
-def test_node_training_masks_ancestors_and_excludes_zero_advantages():
-    tree, _ = _generate()
+@pytest.mark.parametrize("early_stop", [False, True])
+def test_node_training_masks_ancestors_and_keeps_zero_advantages(early_stop):
+    tree, _ = _generate(_Server(early_stop=early_stop))
     _score_alternating(tree)
-    assert all(node.advantage == 0 for node in tree.nodes[1:13])
-    assert len(tree.training_nodes) == 16
+    node_count = 22 if early_stop else 28
+    assert any(node.advantage == 0 for node in tree.nodes[1:])
+    assert tree.training_nodes == tree.nodes[1:]
+    assert len(tree.training_nodes) == node_count
     batch = make_training_batch([tree], SPOTreeConfig(segment_length=2), 0)
     assert len(batch) == 28
-    assert batch.batch["spo_real_rows"].sum() == 16
+    assert batch.batch["spo_real_rows"].sum() == node_count
     for row, node in enumerate(tree.training_nodes):
         assert batch.batch["responses"][row, : len(node.response_ids)].tolist() == node.response_ids
         assert not batch.batch["response_mask"][row, : node.start].any()
         assert batch.batch["response_mask"][row].sum() == len(node.segment_ids)
         assert batch.batch["attention_mask"][row].sum() == len(tree.prompt_ids) + len(node.response_ids)
         assert torch.all(batch.batch["advantages"][row, node.start : len(node.response_ids)] == node.advantage)
-    assert not batch.batch["response_mask"][16:].any()
-    assert not batch.batch["advantages"][16:].any()
-    assert torch.all(batch.batch["attention_mask"][16:].sum(dim=-1) == 2)
+    assert not batch.batch["response_mask"][node_count:].any()
+    assert not batch.batch["advantages"][node_count:].any()
+    assert torch.all(batch.batch["attention_mask"][node_count:].sum(dim=-1) == 2)
+    metrics = tree_metrics([tree], max_response_length=8)
+    assert metrics["spo/trainable_segments_per_prompt"] == node_count
+    assert metrics["spo/segments_per_prompt"] == node_count
+
+
+def test_dynamic_filter_depends_on_leaf_accuracy_not_node_advantages():
+    tree, _ = _generate()
+    # Correctness alone determines eligibility, even before advantages are populated.
+    for index, node in enumerate(tree.leaves):
+        node.correctness = float(index % 2)
+    assert all(node.advantage == 0 for node in tree.nodes)
+    assert select_training_trees([tree], "acc") == ([tree], 1)
+    batch = make_training_batch([tree], SPOTreeConfig(segment_length=2), 0)
+    assert batch.batch["spo_real_rows"].all()
+    assert batch.batch["response_mask"].any(dim=-1).all()
+    assert not batch.batch["advantages"].any()
 
 
 @pytest.mark.parametrize("correctness", [0.0, 1.0])
@@ -393,8 +412,19 @@ def test_actual_actor_backward_keeps_prompt_optimizer_steps_and_frozen_old_polic
     with torch.no_grad():
         old = actor._forward_micro_batch(dict(batch.batch), temperature=1.0, calculate_entropy=False)["log_probs"]
     batch.batch["old_log_probs"] = old.detach().clone()
+    original_forward = actor._forward_micro_batch
+    zero_advantage_rows_seen = []
+
+    def track_forward(inputs, **kwargs):
+        mask = inputs["response_mask"].bool()
+        zero_rows = ((inputs["advantages"] == 0) | ~mask).all(dim=-1) & mask.any(dim=-1)
+        zero_advantage_rows_seen.append(int(zero_rows.sum()))
+        return original_forward(inputs, **kwargs)
+
+    monkeypatch.setattr(actor, "_forward_micro_batch", track_forward)
     initial = model.output.weight.detach().clone()
     metrics = actor.update_policy(batch)
+    assert sum(zero_advantage_rows_seen) == 24  # All 12 internal nodes per prompt reach the actor.
     assert metrics["spo/optimizer_steps"] == 2
     assert not torch.equal(initial, model.output.weight)
     assert all(np.isfinite(value) for value in metrics.values())
@@ -553,6 +583,95 @@ def test_dynamic_sampling_exit_validation_and_checkpoint_cursor(monkeypatch, tmp
     assert state["epoch"] == (0 if step_limit == 1 else 1)
     cursor = torch.load(tmp_path / "global_step_1/data.pt", weights_only=True)
     assert cursor["cursor"] == (2 if step_limit == 1 else 3)
+
+
+def test_step_timing_excludes_validation_but_includes_checkpoint(monkeypatch):
+    from contextlib import contextmanager
+    from unittest.mock import Mock
+
+    import recipe.dapo.spo_tree_trainer as trainer_module
+
+    tree, _ = _generate()
+    _score_alternating(tree)
+    elapsed = 0.0
+    logs = []
+
+    def consume(seconds, result=None):
+        nonlocal elapsed
+        elapsed += seconds
+        return result
+
+    @contextmanager
+    def timer(name, timing, *args):
+        started = elapsed
+        yield
+        timing[name] += elapsed - started
+
+    monkeypatch.setattr(trainer_module, "perf_counter", lambda: elapsed)
+    monkeypatch.setattr(trainer_module, "marked_timer", timer)
+    monkeypatch.setattr(trainer_module, "tqdm", lambda **kwargs: Mock())
+    monkeypatch.setattr(
+        trainer_module,
+        "SPOTreeRollout",
+        lambda *args: SimpleNamespace(
+            prepare_prompts=lambda batch: [tree],
+            generate=lambda trees, **kwargs: consume(3, trees),
+            score=lambda trees: consume(1),
+        ),
+    )
+    monkeypatch.setattr(
+        "verl.utils.tracking.Tracking", lambda **kwargs: SimpleNamespace(log=lambda **kw: logs.append(kw))
+    )
+    trainer = object.__new__(trainer_module.RaySPOTreeTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "project_name": "test",
+                "experiment_name": "test",
+                "logger": [],
+                "total_epochs": 1,
+                "val_before_train": True,
+                "test_freq": 10,
+                "save_freq": 10,
+            },
+            "algorithm": {"filter_groups": {"metric": "acc", "max_num_gen_batches": 10}},
+            "data": {"train_batch_size": 2, "max_response_length": 8},
+        }
+    )
+    trainer.spo_epoch = 0
+    trainer.total_training_steps = 11
+    # Two generation batches per optimizer step; both must contribute to step time.
+    trainer.train_dataloader = [{"input_ids": torch.ones(1, 1, dtype=torch.long)} for _ in range(22)]
+    trainer.tokenizer = trainer.async_rollout_manager = trainer.reward_loop_manager = None
+    trainer.actor_rollout_wg = SimpleNamespace()
+    trainer.checkpoint_manager = SimpleNamespace(
+        sleep_replicas=lambda: None,
+        update_weights=lambda step: consume(2),
+    )
+    trainer._load_checkpoint = lambda: None
+    trainer._train_trees = lambda trees, timing: consume(20, {})
+    trainer._save_checkpoint = Mock(side_effect=lambda: consume(40))
+    trainer._validate = Mock(side_effect=lambda: consume(1000, {"val/acc": 0.5}))
+    trainer._finish = Mock()  # Exit/checkpoint state is covered by the preceding test.
+    trainer.fit()
+
+    training_logs = [log["data"] for log in logs if "timing_s/step" in log["data"]]
+    assert len(training_logs) == 11
+    for step, metrics in enumerate(training_logs, start=1):
+        assert metrics["train/num_gen_batches"] == 2
+        assert metrics["timing_s/gen"] == 6
+        assert metrics["timing_s/reward"] == 2
+        assert metrics["timing_s/update_weights"] == 2
+        if step in (10, 11):
+            assert metrics["timing_s/save_checkpoint"] == 40
+            assert metrics["timing_s/testing"] == 1000
+            assert metrics["timing_s/step"] == 70
+        else:
+            assert "timing_s/testing" not in metrics
+            assert "timing_s/save_checkpoint" not in metrics
+            assert metrics["timing_s/step"] == 30
+    assert trainer._validate.call_count == 3  # Initial, periodic, final.
+    assert trainer._save_checkpoint.call_count == 2
 
 
 def test_distributed_whitening_uses_all_ranks_token_statistics(monkeypatch):

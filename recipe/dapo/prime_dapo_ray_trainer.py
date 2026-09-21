@@ -93,8 +93,8 @@ class RayPrimeDAPOTrainer(RayDAPOTrainer):
             raise ValueError("RayPrimeDAPOTrainer requires prime.enabled=True")
         if self.use_legacy_worker_impl == "disable":
             raise ValueError("DAPO + PRIME requires the legacy FSDP worker implementation")
-        if str(self.config.actor_rollout_ref.actor.strategy).lower() != "fsdp":
-            raise ValueError("DAPO + PRIME currently requires actor.strategy=fsdp")
+        if str(self.config.actor_rollout_ref.actor.strategy).lower() not in {"fsdp", "fsdp2"}:
+            raise ValueError("DAPO + PRIME requires actor.strategy=fsdp or fsdp2")
         if self.config.trainer.balance_batch:
             raise ValueError("DAPO + PRIME currently requires trainer.balance_batch=False")
         sparse_credit = self.config.algorithm.get("sparse_counterfactual_credit", {})

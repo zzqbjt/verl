@@ -89,8 +89,7 @@ def select_training_trees(trees, metric: str):
         values = [node.correctness if metric == "acc" else node.value for node in tree.leaves]
         if len(values) > 1 and any(value != values[0] for value in values[1:]):
             passed += 1
-            if tree.training_nodes:
-                selected.append(tree)
+            selected.append(tree)
     return selected, passed
 
 
@@ -260,6 +259,8 @@ class RaySPOTreeTrainer(RayPPOTrainer):
                     last_saved_step = self.global_steps
                 with marked_timer("update_weights", timing, "red"):
                     self.checkpoint_manager.update_weights(self.global_steps)
+                # Match DAPO: step time includes checkpoint saving, but not validation.
+                step_duration = perf_counter() - step_started
                 test_freq = int(self.config.trainer.test_freq)
                 if final_step or (test_freq > 0 and self.global_steps % test_freq == 0):
                     with marked_timer("testing", timing, "green"):
@@ -268,7 +269,7 @@ class RaySPOTreeTrainer(RayPPOTrainer):
                 metrics.update({f"timing_s/{key}": value for key, value in timing.items()})
                 metrics.update(
                     {
-                        "timing_s/step": perf_counter() - step_started,
+                        "timing_s/step": step_duration,
                         "train/num_gen_batches": num_gen_batches,
                         "train/num_prompt_pass_filter": num_prompt_pass_filter,
                         "spo/generated_tokens": num_generated_tokens,

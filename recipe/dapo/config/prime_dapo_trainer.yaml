@@ -13,6 +13,7 @@ data:
 # inference-only reward-model service, while this model is updated online.
 prime:
   enabled: true
+  strategy: ${actor_rollout_ref.actor.strategy}
   correctness_key: acc
   update: before # before: update then score (double forward); after: single forward
   gamma: 1.0
@@ -52,7 +53,8 @@ prime:
         min_num_params: 0
       param_offload: true
       optimizer_offload: true
-      model_dtype: bfloat16
+      # Keep trainable weights and Adam states in FP32; FSDP computes in BF16.
+      model_dtype: float32
     optim:
       optimizer: AdamW
       optimizer_impl: torch.optim

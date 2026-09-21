@@ -30,8 +30,13 @@ from verl.utils.device import get_device_id, get_device_name, get_nccl_backend
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.fsdp_utils import (
+    MixedPrecisionPolicy,
+    apply_fsdp2,
+    fsdp2_load_full_state_dict,
+    get_fsdp1_wrap_kwargs,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
+    get_shard_placement_fn,
     init_fn,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
@@ -86,9 +91,46 @@ class PRIMERewardModelWorker(Worker):
             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
             assert self.config.mini_batch_size % self.config.micro_batch_size_per_gpu == 0
 
-    def _build_reward_ref_model_optimizer(self, config):
-        # the following line is necessary
+    def _wrap_fsdp_model(self, model, mixed_precision):
+        """Wrap both the online RM and frozen reference with the selected engine."""
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        fsdp_config = self.config.model.fsdp_config
+        strategy = self.config.get("strategy", "fsdp")
+        if strategy == "fsdp":
+            return FSDP(
+                model,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=get_fsdp_wrap_policy(model, config=fsdp_config.wrap_policy),
+                device_id=get_device_id(),
+                **get_fsdp1_wrap_kwargs(self.device_mesh, get_sharding_strategy(self.device_mesh)),
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                forward_prefetch=False,
+                cpu_offload=None,
+            )
+        if strategy == "fsdp2":
+            if MixedPrecisionPolicy is None:
+                raise RuntimeError("PRIME FSDP2 requires PyTorch >= 2.4")
+            fsdp_kwargs = {
+                "mesh": self.device_mesh,
+                "mp_policy": MixedPrecisionPolicy(
+                    param_dtype=mixed_precision.param_dtype,
+                    reduce_dtype=mixed_precision.reduce_dtype,
+                    cast_forward_inputs=True,
+                ),
+                "offload_policy": None,
+                "reshard_after_forward": fsdp_config.get("reshard_after_forward", True),
+                "shard_placement_fn": get_shard_placement_fn(self.device_mesh.shape[-1]),
+            }
+            full_state = model.state_dict()
+            apply_fsdp2(model, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(model, full_state, self.device_mesh, cpu_offload=None)
+            return model
+        raise ValueError(f"Unsupported PRIME strategy: {strategy}; expected fsdp or fsdp2")
+
+    def _build_reward_ref_model_optimizer(self, config):
         from torch.distributed.fsdp import MixedPrecision
 
         from verl.utils.model import print_model_size
@@ -167,27 +209,23 @@ class PRIMERewardModelWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config.wrap_policy)
-
         log_gpu_memory_usage("Before reward model FSDP", logger=None)
-
-        fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             reward_model_config.classifier_dropout = 0.0
             reward_model_config.hidden_dropout = "0"
+            # The frozen reference needs no FP32 optimizer copy. Keep its
+            # storage at the FSDP compute dtype (BF16 by default).
             ref_module = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=copy_local_path_from_hdfs(config.model.ref_path),
-                torch_dtype=torch_dtype,
+                torch_dtype=param_dtype,
                 config=reward_model_config,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
 
-            # some parameters may not in torch_dtype
-            ref_module.to(torch_dtype)
+            ref_module.to(param_dtype)
             apply_monkey_patch(
                 model=ref_module,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
@@ -198,35 +236,11 @@ class PRIMERewardModelWorker(Worker):
             ref_module.requires_grad_(False)
             ref_module.eval()
 
-        reward_module = FSDP(
-            reward_module,
-            param_init_fn=init_fn,
-            use_orig_params=False,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=get_device_id(),
-            sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision,
-            sync_module_states=True,
-            forward_prefetch=False,
-            device_mesh=self.device_mesh,
-            cpu_offload=None,
-        )
+        reward_module = self._wrap_fsdp_model(reward_module, mixed_precision)
 
         log_gpu_memory_usage("After reward FSDP", logger=None)
 
-        ref_module = FSDP(
-            ref_module,
-            param_init_fn=init_fn,
-            use_orig_params=False,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=get_device_id(),
-            sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision,
-            sync_module_states=True,
-            forward_prefetch=False,
-            device_mesh=self.device_mesh,
-            cpu_offload=None,
-        )
+        ref_module = self._wrap_fsdp_model(ref_module, mixed_precision)
 
         reward_optimizer = build_optimizer(reward_module.parameters(), config.model.optim)
 
@@ -276,6 +290,7 @@ class PRIMERewardModelWorker(Worker):
             optimizer=self.reward_optimizer,
             lr_scheduler=self.reward_lr_scheduler,
             tokenizer=self.tokenizer,
+            device_mesh=self.device_mesh,
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

@@ -28,6 +28,7 @@ import torch.nn as nn
 from packaging import version
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
@@ -406,6 +407,28 @@ def fsdp_version(model):
         return 2
     else:
         return 0
+
+
+def get_fsdp1_wrap_kwargs(device_mesh: DeviceMesh, sharding_strategy: ShardingStrategy) -> dict:
+    """Use the replica group for FSDP1 when the shard dimension has size one.
+
+    Passing a (replicas, 1) mesh to HYBRID_SHARD makes PyTorch fall back to
+    NO_SHARD while retaining the singleton shard process group. Its gradient
+    all-reduce would then miss the replicas. An explicit NO_SHARD over the
+    replica mesh keeps full parameters and synchronizes all replica gradients.
+    Other layouts, including genuine hybrid sharding, are left unchanged.
+    """
+    if device_mesh.ndim == 2 and device_mesh.size(1) == 1:
+        device_mesh = device_mesh[device_mesh.mesh_dim_names[0]]
+        sharding_strategy = ShardingStrategy.NO_SHARD
+    return {"device_mesh": device_mesh, "sharding_strategy": sharding_strategy}
+
+
+def reshard_fsdp1_root(model: FSDP) -> None:
+    """Release a root's gathered parameters only when it actually shards them."""
+    handle = model._handle
+    if handle is not None and handle.uses_sharded_strategy:
+        handle.reshard(True)
 
 
 def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):

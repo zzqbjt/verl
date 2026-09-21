@@ -94,7 +94,7 @@ def make_training_batch(trees: list[SPOTree], config: SPOTreeConfig, pad_token_i
     for tree in trees:
         nodes = tree.training_nodes
         if not nodes:
-            raise ValueError("An SPO training prompt must contain a nonzero-advantage node")
+            raise ValueError("An SPO training prompt must contain a generated segment")
         if len(tree.nodes) - 1 > config.max_nodes:
             raise ValueError("Tree exceeds its configured node budget")
         examples.extend((tree, node) for node in nodes)

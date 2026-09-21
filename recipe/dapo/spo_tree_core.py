@@ -80,8 +80,9 @@ class SPOTree:
 
     @property
     def training_nodes(self) -> list[SPONode]:
-        # Filter before whitening: whitening must not resurrect zero-credit nodes.
-        return [node for node in self.nodes[1:] if node.advantage != 0.0]
+        # Select whole prompts by leaf correctness, never fragments by advantage.
+        # Zero-advantage segments remain real samples for whitening and policy loss.
+        return self.nodes[1:]
 
     def backpropagate_values(self, normalize_sibling_std: bool = False) -> None:
         if len(self.nodes) < 2:

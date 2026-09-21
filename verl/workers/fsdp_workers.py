@@ -65,6 +65,7 @@ from verl.utils.fsdp_utils import (
     collect_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp1_wrap_kwargs,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     get_shard_placement_fn,
@@ -75,6 +76,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
     replace_lora_wrapper,
+    reshard_fsdp1_root,
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -607,10 +609,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 param_init_fn=init_fn,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
-                sharding_strategy=sharding_strategy,  # zero3
+                **get_fsdp1_wrap_kwargs(fsdp_mesh, sharding_strategy),
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
-                device_mesh=self.device_mesh,
                 use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
             )
@@ -1153,9 +1154,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
+        # Release gathered root parameters, if the module actually shards them.
         if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-            self.actor.actor_module._handle.reshard(True)
+            reshard_fsdp1_root(self.actor.actor_module)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1188,7 +1189,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = output.to("cpu")
             if self.world_size > 1:
                 if fsdp_version(self.actor.actor_module) == 1:
-                    self.actor.actor_module._handle.reshard(True)
+                    reshard_fsdp1_root(self.actor.actor_module)
                 elif fsdp_version(self.actor.actor_module) == 2:
                     self.actor.actor_module.reshard()
         finally:
@@ -1225,10 +1226,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
+        # Release gathered root parameters, if the module actually shards them.
         if self.world_size > 1:
             if fsdp_version(self.ref_policy.actor_module) == 1:
-                self.ref_policy.actor_module._handle.reshard(True)
+                reshard_fsdp1_root(self.ref_policy.actor_module)
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
 

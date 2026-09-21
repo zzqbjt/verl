@@ -20,10 +20,12 @@ import torch.distributed
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.utils.device import get_device_name
+from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_, fsdp_version
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
@@ -183,10 +185,16 @@ class DataParallelPRIMERewardModel:
 
         if isinstance(self.reward_module, FSDP):
             grad_norm = self.reward_module.clip_grad_norm_(self.config.model.optim.grad_clip)
+        elif fsdp_version(self.reward_module) == 2:
+            grad_norm = fsdp2_clip_grad_norm_(
+                self.reward_module.parameters(), max_norm=self.config.model.optim.grad_clip
+            )
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.reward_module.parameters(), max_norm=self.config.model.optim.grad_clip
             )
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
         self.reward_optimizer.step()
         return grad_norm
 
