@@ -127,6 +127,11 @@ def _distributed_prime_worker(rank, rendezvous, checkpoint_dir):
 
             optimizer = build_optimizer(model.parameters(), config.model.optim)
             rm = DataParallelPRIMERewardModel(config, model, ref, optimizer)
+            worker.reward_module = model
+            worker.ref_module = ref
+            worker.reward_optimizer = optimizer
+            worker._is_offload_param = False
+            worker._is_offload_optimizer = False
             baseline = ToyRewardModel()
             baseline_optimizer = build_optimizer(baseline.parameters(), config.model.optim)
             local_input = torch.tensor([[float(rank + 1), 2.0]])
@@ -138,11 +143,7 @@ def _distributed_prime_worker(rank, rendezvous, checkpoint_dir):
                 with torch.no_grad():
                     model(local_input)
                     ref(local_input)
-                if strategy == "fsdp":
-                    reshard_fsdp1_root(model)
-                else:
-                    model.reshard()
-                    ref.reshard()
+                PRIMERewardModelWorker._release_after_use(worker)
 
                 optimizer.zero_grad()
                 model(local_input).sum().backward()

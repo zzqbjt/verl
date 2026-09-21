@@ -5,8 +5,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from verl import DataProto
 from recipe.prime import prime_dp_rm as module
+from verl import DataProto
 
 
 class ToyModel(torch.nn.Module):
@@ -125,18 +125,24 @@ def test_reference_cache_accepts_locked_input_without_copying_tensors(serialized
     torch.testing.assert_close(q, expected_q)
 
 
-def test_combined_worker_updates_before_scoring_and_loads_models_once(monkeypatch):
+@pytest.mark.parametrize("offload_optimizer", [False, True])
+def test_combined_worker_updates_before_scoring_and_loads_models_once(monkeypatch, offload_optimizer):
     import inspect
     from contextlib import nullcontext
+
     from recipe.prime import prime_fsdp_workers as workers
 
     events = []
     monkeypatch.setattr(workers, "get_device_name", lambda: "cpu")
     monkeypatch.setattr(workers, "get_device_id", lambda: "cpu")
     monkeypatch.setattr(workers.torch.distributed, "barrier", lambda: None)
-    monkeypatch.setattr(workers.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(workers, "get_torch_device", lambda: SimpleNamespace(
+        synchronize=lambda: events.append("synchronize"), empty_cache=lambda: events.append("empty_cache"),
+    ))
     monkeypatch.setattr(workers, "load_fsdp_model_to_gpu", lambda model: events.append("load"))
-    monkeypatch.setattr(workers, "offload_fsdp_model_to_cpu", lambda model: events.append("offload"))
+    monkeypatch.setattr(workers, "offload_fsdp_model_to_cpu", lambda model, **kw: events.append("offload"))
+    monkeypatch.setattr(workers, "load_fsdp_optimizer", lambda **kw: events.append("load_optimizer"))
+    monkeypatch.setattr(workers, "offload_fsdp_optimizer", lambda **kw: events.append("offload_optimizer"))
     monkeypatch.setattr(workers, "compute_dpo_accuracy", lambda *a, **kw: torch.tensor(.5))
     monkeypatch.setattr(workers, "compute_dpo_abs_accuracy", lambda *a, **kw: torch.tensor(.5))
 
@@ -160,15 +166,19 @@ def test_combined_worker_updates_before_scoring_and_loads_models_once(monkeypatc
             return torch.ones(5, 4), torch.ones(5, 4), {}
 
     worker = SimpleNamespace(
-        _is_offload_param=True, _is_offload_optimizer=False,
+        _is_offload_param=True, _is_offload_optimizer=offload_optimizer, reward_optimizer=object(),
         ref_module=object(), reward_module=object(), rm=RM(),
         config=make_rm().config, ulysses_sharding_manager=Manager(),
         reward_lr_scheduler=SimpleNamespace(step=lambda: None, get_last_lr=lambda: [.1]),
     )
+    worker._release_after_use = workers.PRIMERewardModelWorker._release_after_use.__get__(worker)
     data = make_data()
     data.meta_info.update(n=1, prime_score_after_update=True)
     result = inspect.unwrap(workers.PRIMERewardModelWorker.update_rm)(worker, data)
-    assert events == ["load", "load", "cache", "update", "score", "offload", "offload"]
+    expected = ["load", "load"] + (["load_optimizer"] if offload_optimizer else [])
+    expected += ["cache", "update", "score", "offload", "offload"]
+    expected += (["offload_optimizer"] if offload_optimizer else []) + ["synchronize", "empty_cache"]
+    assert events == expected
     torch.testing.assert_close(result.batch["rm_scores"], torch.ones(5, 4))
 
 

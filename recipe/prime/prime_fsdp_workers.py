@@ -26,13 +26,14 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.device import get_device_id, get_device_name, get_nccl_backend
+from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.fsdp_utils import (
     MixedPrecisionPolicy,
     apply_fsdp2,
     fsdp2_load_full_state_dict,
+    fsdp_version,
     get_fsdp1_wrap_kwargs,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
@@ -42,6 +43,7 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
+    reshard_fsdp1_root,
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.profiler import log_gpu_memory_usage
@@ -293,6 +295,30 @@ class PRIMERewardModelWorker(Worker):
             device_mesh=self.device_mesh,
         )
 
+    def _release_after_use(self):
+        """Release RM memory before the colocated actor/vLLM resumes work."""
+        for model in (self.reward_module, self.ref_module):
+            # FSDP2 keeps the root's gathered parameters after inference.
+            # Reshard before offloading so those GPU copies are also released.
+            if fsdp_version(model) == 2:
+                model.reshard()
+            elif fsdp_version(model) == 1:
+                reshard_fsdp1_root(model)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.reward_module, empty_cache=False)
+            offload_fsdp_model_to_cpu(self.ref_module, empty_cache=False)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.reward_optimizer)
+        if self._is_offload_param or self._is_offload_optimizer:
+            # Adam states are allocated lazily on the first update. Emptying
+            # the cache before offloading them leaves that memory unavailable
+            # to vLLM's separate process when it wakes its fixed KV cache.
+            device = get_torch_device()
+            device.synchronize()
+            torch.distributed.barrier()
+            device.empty_cache()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
         data = data.to(get_device_name())
@@ -324,11 +350,7 @@ class PRIMERewardModelWorker(Worker):
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to("cpu")
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.reward_module)
-            offload_fsdp_model_to_cpu(self.ref_module)
-            torch.distributed.barrier()
-            torch.cuda.empty_cache()
+        self._release_after_use()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -381,14 +403,8 @@ class PRIMERewardModelWorker(Worker):
             output = DataProto.from_dict(tensors={"rm_scores": rm_scores}, meta_info={"metrics": metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.reward_module)
-            offload_fsdp_model_to_cpu(self.ref_module)
-            torch.distributed.barrier()
-            torch.cuda.empty_cache()
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.reward_optimizer)
         output = output.to("cpu")
+        self._release_after_use()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -403,8 +419,7 @@ class PRIMERewardModelWorker(Worker):
         )
 
         torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.reward_module)
+        self._release_after_use()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, del_local_after_load=True):
@@ -416,5 +431,4 @@ class PRIMERewardModelWorker(Worker):
         self.checkpoint_manager.load_checkpoint(local_path=local_path, del_local_after_load=del_local_after_load)
 
         torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.reward_module)
+        self._release_after_use()
