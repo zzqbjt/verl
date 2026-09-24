@@ -238,7 +238,7 @@ class SparseCounterfactualCreditSupervisor:
         step_end_mask: torch.Tensor,
         response_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Keep endpoints within the MC budget, reserving a token for nonterminal Q."""
+        """Keep endpoints within the MC budget; require both Q and V when all groups are reused."""
 
         if step_end_mask.ndim != 2 or response_mask.ndim != 2:
             raise ValueError("step_end_mask and response_mask must be rank-2")
@@ -248,7 +248,15 @@ class SparseCounterfactualCreditSupervisor:
         prefix_lengths = response_mask.long().cumsum(dim=-1)
         limit = self._counterfactual_response_limit()
         terminal = endpoints & (endpoints.long().cumsum(dim=-1) == endpoints.sum(dim=-1, keepdim=True))
-        return endpoints & ((prefix_lengths < limit) | (terminal & (prefix_lengths == limit)))
+        candidates = endpoints & ((prefix_lengths < limit) | (terminal & (prefix_lengths == limit)))
+        if (
+            self.config.train_mc_branches
+            and 2 * int(self.config.anchors_per_group) == int(self.config.branch_groups_per_prompt)
+        ):
+            step_number = endpoints.long().cumsum(dim=-1)
+            step_count = endpoints.sum(dim=-1, keepdim=True)
+            candidates &= (step_number > 1) & (step_number < step_count)
+        return candidates
 
     def _mc_branch_anchor_candidates(self, step_end_mask: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
         """Additionally exclude single-step responses when training MC branches."""

@@ -46,6 +46,51 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _rebind_replica_tensor(saved, target):
+    """Rebind a full local FSDP2 tensor without moving offloaded storage to GPU."""
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+
+    if not isinstance(saved, DTensor):
+        return saved
+    if not isinstance(target, DTensor):
+        raise ValueError("Cannot restore a DTensor into a non-DTensor parameter")
+    for tensor in (saved, target):
+        for dim, placement in enumerate(tensor.placements):
+            if not (placement.is_replicate() or (placement.is_shard() and tensor.device_mesh.size(dim) == 1)):
+                raise ValueError("Replica-count resume only supports full local tensors (fsdp_size=1)")
+        if tensor.to_local().shape != tensor.shape:
+            raise ValueError("Replica-count resume requires a full local tensor")
+    if saved.shape != target.shape:
+        raise ValueError(f"Checkpoint tensor shape mismatch: {saved.shape} != {target.shape}")
+    spec = DTensorSpec(target.device_mesh, target.placements, tensor_meta=saved._spec.tensor_meta)
+    return DTensor(saved.to_local(), spec, requires_grad=saved.requires_grad)
+
+
+def _rebind_replica_optimizer(state_dict, optimizer):
+    """Match saved optimizer IDs to live parameters, retaining moments and steps."""
+    groups = state_dict["param_groups"]
+    if len(groups) != len(optimizer.param_groups):
+        raise ValueError("Checkpoint optimizer parameter-group count mismatch")
+
+    def convert(value, parameter):
+        if isinstance(value, dict):
+            return {key: convert(item, parameter) for key, item in value.items()}
+        if isinstance(value, list):
+            return [convert(item, parameter) for item in value]
+        if isinstance(value, tuple):
+            return tuple(convert(item, parameter) for item in value)
+        return _rebind_replica_tensor(value, parameter)
+
+    for saved_group, live_group in zip(groups, optimizer.param_groups, strict=True):
+        if len(saved_group["params"]) != len(live_group["params"]):
+            raise ValueError("Checkpoint optimizer parameter count mismatch")
+        for key, parameter in zip(saved_group["params"], live_group["params"], strict=True):
+            if key in state_dict["state"]:
+                state_dict["state"][key] = convert(state_dict["state"][key], parameter)
+    return state_dict
+
+
 @dataclass
 class FSDPConfig:
     """Configuration for FSDP checkpointing.
@@ -177,6 +222,32 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
 
+        saved_world_size = self.world_size
+        config_path = os.path.join(local_path, "fsdp_config.json")
+        if exists(config_path):
+            with open(copy_to_local(config_path)) as config_file:
+                saved_config = json.load(config_file)
+            saved_world_size = int(saved_config["world_size"])
+            if saved_world_size != self.world_size:
+                if not (
+                    saved_config.get("FSDP_version") == 2
+                    and fsdp_version(self.model) == 2
+                    and saved_config.get("format_version") == 2
+                    and saved_config.get("shard_world_size") == 1
+                    and self.shard_world_size == 1
+                    and 0 < self.world_size < saved_world_size
+                ):
+                    raise ValueError(
+                        "Changing checkpoint world size currently requires FSDP2 format v2, "
+                        "fsdp_size=1 on both sides, and fewer replica ranks"
+                    )
+                log_with_rank(
+                    f"Restoring FSDP2 replicas: {saved_world_size} -> {self.world_size}; "
+                    "preserving full model and optimizer state",
+                    rank=self.rank, logger=logger,
+                )
+        resize_replicas = saved_world_size != self.world_size
+
         # check if the checkpoint_load_contents is valid
         if self.should_load_model:
             assert self.model is not None, "model must be provided when checkpoint_contents.load includes ['model']"
@@ -207,13 +278,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     f"model_world_size_{self.shard_world_size}_rank_{self.shard_rank}.pt",
                 )
                 uses_deduplicated_model = (
-                    self.shard_world_size < self.world_size
+                    self.shard_world_size < saved_world_size
                     and remote_model_path == new_model_path
                 )
                 if uses_deduplicated_model:
                     current_state_dict = self.model.state_dict()
                     persistent_buffer_keys = self._persistent_buffer_keys(current_state_dict)
                     remote_buffer_path = self._model_buffer_checkpoint_path(local_path)
+                    if resize_replicas:
+                        remote_buffer_path = os.path.join(
+                            local_path, f"model_buffers_world_size_{saved_world_size}_rank_{self.rank}.pt"
+                        )
                     if persistent_buffer_keys:
                         if not exists(remote_buffer_path):
                             raise FileNotFoundError(
@@ -230,6 +305,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                         model_state_dict.update(buffer_state_dict)
                         if del_local_after_load and is_non_local(remote_buffer_path):
                             local_paths_to_delete.append(local_buffer_path)
+                if resize_replicas:
+                    current_state_dict = self.model.state_dict()
+                    model_state_dict = {
+                        key: _rebind_replica_tensor(value, current_state_dict[key])
+                        if key in current_state_dict else value
+                        for key, value in model_state_dict.items()
+                    }
                 self.model.load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
                 if del_local_after_load and is_non_local(remote_model_path):
@@ -239,6 +321,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_optim_path = self._resolve_sharded_checkpoint_path(local_path, "optim")
                 local_optim_path = copy_to_local(remote_optim_path)
                 optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                if resize_replicas:
+                    optimizer_state_dict = _rebind_replica_optimizer(optimizer_state_dict, self.optimizer)
                 self.optimizer.load_state_dict(optimizer_state_dict)
                 log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
                 if del_local_after_load and is_non_local(remote_optim_path):
@@ -246,7 +330,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if self.should_load_extra:
             remote_extra_state_path = os.path.join(
-                local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
+                local_path, f"extra_state_world_size_{saved_world_size}_rank_{self.rank}.pt"
             )
             local_extra_state_path = copy_to_local(remote_extra_state_path)
             extra_state_dict = torch.load(local_extra_state_path, weights_only=False)

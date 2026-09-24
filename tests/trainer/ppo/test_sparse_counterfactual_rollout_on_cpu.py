@@ -267,6 +267,95 @@ def test_mc_branch_anchor_candidates_exclude_single_step_responses_and_late_step
     assert supervisor.mc_branch_eligible_prompt_uids(batch) == {"enough"}
 
 
+def test_one_anchor_requires_a_middle_step_before_dynamic_sampling():
+    supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
+    supervisor.config = SparseCounterfactualCreditConfig(
+        enabled=True, anchors_per_group=1, train_mc_branches=True, branch_groups_per_prompt=2
+    )
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 6}})
+
+    two_steps = _make_batch()
+    assert not supervisor.mc_branch_eligible_row_mask(two_steps).any()
+    assert supervisor.mc_branch_eligible_prompt_uids(two_steps) == set()
+
+    three_steps = _make_three_step_batch()
+    candidates = supervisor._mc_branch_anchor_candidates(
+        three_steps.batch["step_end_mask"], three_steps.batch["response_mask"]
+    )
+    assert torch.equal(candidates, torch.tensor([[0, 0, 0, 1, 0, 0]] * 2, dtype=torch.bool))
+    assert supervisor.mc_branch_eligible_prompt_uids(three_steps) == {"same-question"}
+
+    # Without branch reuse, boundary steps remain valid MC-label anchors.
+    supervisor.config = SparseCounterfactualCreditConfig(enabled=True, anchors_per_group=1)
+    assert torch.equal(
+        supervisor._budget_anchor_candidates(
+            three_steps.batch["step_end_mask"], three_steps.batch["response_mask"]
+        ),
+        three_steps.batch["step_end_mask"].bool(),
+    )
+
+
+def test_middle_step_requirement_depends_on_reused_groups_not_anchor_count():
+    supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 6}})
+    three_steps = _make_three_step_batch()
+    step_end_mask = three_steps.batch["step_end_mask"]
+    response_mask = three_steps.batch["response_mask"]
+
+    supervisor.config = SparseCounterfactualCreditConfig(
+        enabled=True, anchors_per_group=2, train_mc_branches=True, branch_groups_per_prompt=4
+    )
+    assert torch.equal(
+        supervisor._mc_branch_anchor_candidates(step_end_mask, response_mask),
+        torch.tensor([[0, 0, 0, 1, 0, 0]] * 2, dtype=torch.bool),
+    )
+
+    supervisor.config = SparseCounterfactualCreditConfig(
+        enabled=True, anchors_per_group=2, train_mc_branches=True, branch_groups_per_prompt=2
+    )
+    assert torch.equal(
+        supervisor._mc_branch_anchor_candidates(step_end_mask, response_mask),
+        step_end_mask.bool(),
+    )
+
+
+def test_one_middle_anchor_produces_both_reused_prefix_groups():
+    supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
+    supervisor.config = SparseCounterfactualCreditConfig(
+        enabled=True, anchors_per_group=1, num_samples=2,
+        train_mc_branches=True, branch_groups_per_prompt=2, selection_seed=7,
+    )
+    supervisor.rollout_config = OmegaConf.create({"max_model_len": 100})
+    supervisor.trainer_config = OmegaConf.create({"data": {"max_response_length": 100}})
+    supervisor.tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=99)
+    batch = _make_three_step_batch()
+    scores = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+    scores[:, -1] = torch.tensor([1.0, 0.0])
+    batch.batch["token_level_scores"] = scores
+    batch.batch["token_level_rewards"] = scores.clone()
+
+    def generate(prompt_ids, response_prefix_lengths):
+        assert len(prompt_ids) == 4
+        assert response_prefix_lengths == [4, 4, 2, 2]
+        return [SimpleNamespace(token_ids=[90 + index]) for index in range(4)]
+
+    supervisor._generate = generate
+    supervisor._score = lambda *args: SimpleNamespace(
+        correctness=torch.tensor([0.0, 1.0, 0.0, 1.0]),
+        rewards=torch.tensor([0.0, 1.0, 0.0, 1.0]),
+    )
+    result = supervisor.collect_targets(batch, global_step=1)
+
+    assert batch.batch["credit_anchor_mask"].sum().item() == 1
+    assert batch.batch["credit_anchor_mask"][:, 3].sum().item() == 1
+    branches = result.training_branches
+    assert branches is not None
+    assert len(branches) == 4
+    group_ids = branches.non_tensor_batch["uid"].tolist()
+    assert {uid.rsplit(":", 1)[-1] for uid in group_ids} == {"q", "v"}
+    assert all(group_ids.count(uid) == 2 for uid in set(group_ids))
+
+
 def test_mc_branch_training_selects_diverse_high_variance_anchors_and_masks_prefixes():
     supervisor = SparseCounterfactualCreditSupervisor.__new__(SparseCounterfactualCreditSupervisor)
     supervisor.config = SparseCounterfactualCreditConfig(
